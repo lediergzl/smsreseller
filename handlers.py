@@ -2050,21 +2050,25 @@ def _find_manual_method_name(account: str | None) -> str | None:
 
 # ── Recuperación tras reinicio del bot ────────────────────────────────────────
 
-def _elapsed_seconds(timestamp: str) -> int:
+def _elapsed_seconds(timestamp) -> int:
     """
     Calcula cuántos segundos pasaron desde `timestamp` (columna updated_at,
     en UTC) hasta ahora. Se usa para reanudar un polling sin resetear su
     timeout desde cero. Si el timestamp falta o es inválido, asume 0
     (peor caso: se le da al usuario el timeout completo de nuevo).
+
+    Con Neon/psycopg2, columnas TIMESTAMPTZ llegan ya como datetime.datetime,
+    no como string (a diferencia de la versión vieja con SQLite) — de ahí el
+    isinstance() antes de intentar parsear un string con fromisoformat.
     """
     if not timestamp:
         return 0
     try:
-        dt = datetime.fromisoformat(timestamp)
+        dt = timestamp if isinstance(timestamp, datetime) else datetime.fromisoformat(timestamp)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
-    except ValueError:
+    except (ValueError, TypeError):
         return 0
 
 
