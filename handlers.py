@@ -1900,7 +1900,10 @@ async def _handle_after_payment(bot, chat_id: int, state: FSMContext, tx_id: int
 
     await _safe_send(
         bot, chat_id,
-        MSG_NUMBER_ASSIGNED.format(number=phone_number, service=service_name),
+        MSG_NUMBER_ASSIGNED.format(
+            number=phone_number, service=service_name,
+            timeout_min=SMS_TIMEOUT_SECONDS // 60,
+        ),
     )
 
     # Iniciar polling de SMS

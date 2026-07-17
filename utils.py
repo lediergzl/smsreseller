@@ -627,7 +627,11 @@ MSG_NUMBER_ASSIGNED = (
     "📱 <b>Tu número virtual:</b>\n"
     "<code>{number}</code>\n\n"
     "👆 Usa este número para verificar tu cuenta de <b>{service}</b>.\n"
-    "⏳ Esperando el código SMS (máx. 10 minutos)..."
+    "⏳ Esperando el código SMS (máx. {timeout_min} minutos)...\n\n"
+    "⚠️ <b>Importante:</b> abre {service} ahora mismo y solicita el código "
+    "SIN cerrar esta conversación ni cambiar de pantalla. Si el código no "
+    "llega dentro del tiempo indicado, el número expira y se te reembolsa "
+    "tu pago (con el descuento de cargo de servicio habitual)."
 )
 
 MSG_CODE_RECEIVED = (
