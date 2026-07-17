@@ -2302,7 +2302,7 @@ async def cb_start_withdraw(call: CallbackQuery, state: FSMContext):
     # Solo el saldo de ORIGEN cripto es retirable a cripto (ver
     # database.Database.balances) — el origen CUP tiene su propio flujo
     # (cb_start_cup_withdraw).
-    balance = await db.get_balance_breakdown(call.from_user.id)["crypto"]
+    balance = (await db.get_balance_breakdown(call.from_user.id))["crypto"]
     balance_available = floor_to_cents(balance)
     if balance_available < WITHDRAWAL_MIN_USD:
         await call.message.answer(
@@ -2668,7 +2668,7 @@ async def cb_start_cup_withdraw(call: CallbackQuery, state: FSMContext):
     # Solo el saldo de ORIGEN CUP es retirable en CUP (ver database.py
     # Database.balances) — el origen cripto tiene su propio flujo
     # (cb_start_withdraw).
-    balance = await db.get_balance_breakdown(call.from_user.id)["cup"]
+    balance = (await db.get_balance_breakdown(call.from_user.id))["cup"]
     balance_available = floor_to_cents(balance)
 
     # Tasa de PAYOUT fijada acá y reutilizada durante TODO el flujo (select
