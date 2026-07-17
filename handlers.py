@@ -27,7 +27,7 @@ from config import ACCOUNT_TYPE_LABELS
 from database import db
 from utils import (
     format_amount, apply_markup, apply_refund_fee, apply_withdrawal_fee, floor_to_cents, format_phone,
-    usd_to_cup, effective_cup_rate, effective_cup_rate_payout,
+    usd_to_cup, effective_cup_rate, effective_cup_rate_payout, format_cup,
     generate_payment_qr,
     is_wrapped_token,
     services_keyboard, countries_keyboard, currencies_keyboard,
