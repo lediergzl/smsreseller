@@ -1900,7 +1900,10 @@ async def _handle_after_payment(bot, chat_id: int, state: FSMContext, tx_id: int
 
     await _safe_send(
         bot, chat_id,
-        MSG_NUMBER_ASSIGNED.format(number=phone_number, service=service_name),
+        MSG_NUMBER_ASSIGNED.format(
+            number=phone_number, service=service_name,
+            timeout_min=SMS_TIMEOUT_SECONDS // 60,
+        ),
     )
 
     # Iniciar polling de SMS
@@ -2664,18 +2667,32 @@ async def cb_start_cup_withdraw(call: CallbackQuery, state: FSMContext):
     # (cb_start_withdraw).
     balance = db.get_balance_breakdown(call.from_user.id)["cup"]
     balance_available = floor_to_cents(balance)
+
+    # Tasa de PAYOUT fijada acá y reutilizada durante TODO el flujo (select
+    # method -> monto -> confirmar), en vez de recalcularla en cada paso:
+    # así el CUP que se le muestra al usuario en la pantalla de monto y en
+    # la confirmación final es siempre el mismo número, sin importar cuánto
+    # tarde en completar el flujo.
+    payout_rate = effective_cup_rate_payout(MANUAL_DEPOSIT_CUP_RATE, MANUAL_DEPOSIT_CUP_MARGIN_PCT)
+    balance_cup = usd_to_cup(balance_available, payout_rate)
+
     if balance_available < WITHDRAWAL_MIN_USD:
+        min_cup = usd_to_cup(WITHDRAWAL_MIN_USD, payout_rate)
         await call.message.answer(
-            f"💰 El mínimo para retirar en CUP es {format_amount(WITHDRAWAL_MIN_USD, 'USD')}. "
-            f"Tu saldo de origen CUP es {format_amount(balance_available, 'USD')}.",
+            f"💰 El mínimo para retirar en CUP es {format_cup(min_cup)}. "
+            f"Tu saldo de origen CUP es {format_cup(balance_cup)}.",
             parse_mode="HTML",
         )
         return
 
-    await state.update_data(cup_withdraw_balance=balance_available)
+    await state.update_data(
+        cup_withdraw_balance=balance_available,
+        cup_withdraw_balance_cup=balance_cup,
+        cup_withdraw_rate=payout_rate,
+    )
     await state.set_state(CupWithdrawFlow.selecting_method)
     await call.message.answer(
-        MSG_CUP_WITHDRAW_SELECT_METHOD.format(balance_cup=format_amount(balance_available, "USD")),
+        MSG_CUP_WITHDRAW_SELECT_METHOD.format(balance_cup=format_cup(balance_cup)),
         parse_mode="HTML",
         reply_markup=cup_withdraw_methods_keyboard(MANUAL_PAYMENT_METHODS),
     )
@@ -2692,14 +2709,14 @@ async def cb_select_cup_withdraw_method(call: CallbackQuery, state: FSMContext):
         return
 
     data = await state.get_data()
-    balance_available = data["cup_withdraw_balance"]
+    balance_cup = data["cup_withdraw_balance_cup"]
 
     await state.update_data(cup_withdraw_method=method_code, cup_withdraw_method_name=method["name"])
     await state.set_state(CupWithdrawFlow.awaiting_amount)
     await call.message.answer(
         MSG_CUP_WITHDRAW_ASK_AMOUNT.format(
             method_name=method["name"],
-            balance_cup=format_amount(balance_available, "USD"),
+            balance_cup=format_cup(balance_cup),
         ),
         parse_mode="HTML",
         reply_markup=cancel_keyboard(),
@@ -2709,18 +2726,25 @@ async def cb_select_cup_withdraw_method(call: CallbackQuery, state: FSMContext):
 @router.message(CupWithdrawFlow.awaiting_amount)
 async def msg_cup_withdraw_amount(message: Message, state: FSMContext):
     data = await state.get_data()
-    balance_available = data["cup_withdraw_balance"]
+    balance_available = data["cup_withdraw_balance"]        # USD, unidad interna del saldo
+    balance_cup        = data["cup_withdraw_balance_cup"]    # mismo saldo, ya convertido a CUP
+    payout_rate         = data["cup_withdraw_rate"]           # fijada en cb_start_cup_withdraw
     text = (message.text or "").strip().lower()
 
     if text in ("todo", "all", "todos"):
         amount = balance_available
     else:
         try:
-            amount = round(float(text.replace(",", ".")), 2)
-        except ValueError:
+            # El usuario escribe el monto en CUP (ver MSG_CUP_WITHDRAW_ASK_AMOUNT);
+            # se convierte a la unidad interna (USD) con la MISMA tasa que se
+            # le mostró en pantalla, para que el CUP que confirme más abajo
+            # coincida con el que escribió acá.
+            amount_cup_requested = round(float(text.replace(",", ".")))
+            amount = round(amount_cup_requested / payout_rate, 2)
+        except (ValueError, ZeroDivisionError):
             await message.answer(
-                "⚠️ Escribe un número válido (ej: 5.50) o <b>todo</b> para "
-                "retirar el saldo CUP completo.",
+                "⚠️ Escribe un número válido en CUP (ej: 5000) o <b>todo</b> "
+                "para retirar el saldo CUP completo.",
                 parse_mode="HTML",
                 reply_markup=cancel_keyboard(),
             )
@@ -2730,33 +2754,40 @@ async def msg_cup_withdraw_amount(message: Message, state: FSMContext):
     # contra floor_to_cents, nunca contra el saldo redondeado hacia arriba.
     if amount <= 0 or amount > balance_available + 1e-9:
         await message.answer(
-            f"⚠️ El monto debe ser mayor a $0 y no superar tu saldo CUP disponible "
-            f"({format_amount(balance_available, 'USD')}).",
+            f"⚠️ El monto debe ser mayor a 0 CUP y no superar tu saldo CUP "
+            f"disponible ({format_cup(balance_cup)}).",
             parse_mode="HTML",
             reply_markup=cancel_keyboard(),
         )
         return
 
     if amount < WITHDRAWAL_MIN_USD:
+        min_cup = usd_to_cup(WITHDRAWAL_MIN_USD, payout_rate)
         await message.answer(
-            f"⚠️ El monto mínimo de retiro es {format_amount(WITHDRAWAL_MIN_USD, 'USD')}.",
+            f"⚠️ El monto mínimo de retiro es {format_cup(min_cup)}.",
             parse_mode="HTML",
             reply_markup=cancel_keyboard(),
         )
         return
 
     net_usd, fee_usd = apply_withdrawal_fee(amount, WITHDRAWAL_FEE_PCT)
+    amount_cup = usd_to_cup(net_usd, payout_rate)   # neto que el usuario recibe en CUP
 
-    # Tasa de PAYOUT (más baja que la de depósito, ver docstring de
-    # effective_cup_rate_payout): acá es el operador quien entrega CUP.
-    payout_rate = effective_cup_rate_payout(MANUAL_DEPOSIT_CUP_RATE, MANUAL_DEPOSIT_CUP_MARGIN_PCT)
-    amount_cup = usd_to_cup(net_usd, payout_rate)
+    # Bruto (lo que se descuenta del saldo CUP) también en CUP, para mostrar
+    # todo en la misma moneda. fee_cup se obtiene por RESTA (no reconvirtiendo
+    # fee_usd por separado) para garantizar gross_cup == fee_cup + amount_cup
+    # incluso con el redondeo a entero de CUP (mismo principio que
+    # apply_withdrawal_fee con USD, ver utils.py).
+    gross_cup = usd_to_cup(amount, payout_rate)
+    fee_cup = gross_cup - amount_cup
 
     await state.update_data(
         cup_withdraw_amount_usd = amount,
         cup_withdraw_fee_usd    = fee_usd,
         cup_withdraw_net_usd    = net_usd,
         cup_withdraw_amount_cup = amount_cup,
+        cup_withdraw_gross_cup  = gross_cup,
+        cup_withdraw_fee_cup    = fee_cup,
         cup_withdraw_rate       = payout_rate,
     )
     await state.set_state(CupWithdrawFlow.awaiting_account)
@@ -2783,10 +2814,10 @@ async def msg_cup_withdraw_account(message: Message, state: FSMContext):
     await state.set_state(CupWithdrawFlow.confirming)
     await message.answer(
         MSG_CUP_WITHDRAW_CONFIRM.format(
-            amount_usd    = format_amount(data["cup_withdraw_amount_usd"], "USD"),
+            amount_cup    = format_cup(data["cup_withdraw_gross_cup"]),
             fee_pct       = f"{WITHDRAWAL_FEE_PCT:.0%}",
-            fee_usd       = format_amount(data["cup_withdraw_fee_usd"], "USD"),
-            amount_cup    = f"{data['cup_withdraw_amount_cup']:,}".replace(",", " "),
+            fee_cup       = format_cup(data["cup_withdraw_fee_cup"]),
+            net_cup       = format_cup(data["cup_withdraw_amount_cup"]),
             method_name   = data["cup_withdraw_method_name"],
             destination   = destination,
         ),

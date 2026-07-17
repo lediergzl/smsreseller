@@ -108,6 +108,17 @@ def apply_refund_fee(amount: float, fee_pct: float) -> float:
     return round(amount * (1 - fee_pct), 8)
 
 
+def format_cup(amount_cup: int) -> str:
+    """
+    Formatea un monto entero de CUP con separador de miles (espacio, no
+    coma: es la convención local) y el sufijo "CUP". Usar SIEMPRE que se
+    muestre saldo/monto de origen CUP al usuario en vez de format_amount
+    con 'USD' — mostrar un monto en CUP con formato/etiqueta de USD es
+    confuso (el usuario paga y retira en CUP real, no en dólares).
+    """
+    return f"{amount_cup:,}".replace(",", " ") + " CUP"
+
+
 def usd_to_cup(amount_usd: float, rate: float) -> int:
     """
     Convierte USD a CUP a la tasa dada, redondeado a entero: nadie
@@ -817,7 +828,7 @@ MSG_CUP_WITHDRAW_SELECT_METHOD = (
 MSG_CUP_WITHDRAW_ASK_AMOUNT = (
     "🇨🇺 <b>{method_name}</b>\n\n"
     "Saldo retirable en CUP: <b>{balance_cup}</b>\n"
-    "¿Cuánto quieres retirar? Escribe el monto en USD (ej: <i>5.50</i>) "
+    "¿Cuánto quieres retirar? Escribe el monto en CUP (ej: <i>5000</i>) "
     "o escribe <b>todo</b> para retirar el saldo CUP completo."
 )
 
@@ -830,12 +841,12 @@ MSG_CUP_WITHDRAW_ASK_ACCOUNT = (
 
 MSG_CUP_WITHDRAW_CONFIRM = (
     "📋 <b>Confirma tu retiro en CUP</b>\n\n"
-    "💵 Retiras de tu saldo CUP: {amount_usd}\n"
-    "➖ Comisión de servicio ({fee_pct}): {fee_usd}\n"
-    "✅ Recibes: <b>{amount_cup} CUP</b>\n"
+    "💵 Retiras de tu saldo CUP: {amount_cup}\n"
+    "➖ Comisión de servicio ({fee_pct}): {fee_cup}\n"
+    "✅ Recibes: <b>{net_cup}</b>\n"
     "🏦 Método: {method_name}\n"
     "📤 Cuenta: <code>{destination}</code>\n\n"
-    "El monto completo ({amount_usd}) se descuenta de tu saldo CUP al "
+    "El monto completo ({amount_cup}) se descuenta de tu saldo CUP al "
     "confirmar. Un administrador hace la transferencia a mano — puede "
     "tardar más que un retiro cripto."
 )
