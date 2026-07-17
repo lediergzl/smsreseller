@@ -1,0 +1,39 @@
+# render.yaml - Blueprint para desplegar el bot en Render como Web Service
+# (plan free). Subilo a la raíz de tu repo y en Render: New -> Blueprint,
+# apuntá a tu repo, y Render arma el servicio solo leyendo este archivo.
+#
+# Las variables marcadas con "sync: false" NO se completan acá (por
+# seguridad, no van al repo): Render te las va a pedir a mano la primera vez
+# desde el dashboard del servicio -> Environment.
+services:
+  - type: web
+    name: otpvirtual-bot
+    runtime: python
+    plan: free
+    region: oregon   # cambiá si tu Neon está en otra región, para menos latencia
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: HEROSMS_API_KEY
+        sync: false
+      - key: HEROSMS_API_URL
+        value: https://hero-sms.com
+      - key: CCPAY_APP_ID
+        sync: false
+      - key: CCPAY_APP_SECRET
+        sync: false
+      - key: CCPAY_API_URL
+        value: https://ccpayment.com/ccpayment/v2
+      - key: DATABASE_URL
+        sync: false   # connection string de Neon (console.neon.tech)
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true   # Render genera un secreto random solo
+      # WEBHOOK_HOST NO se define acá a propósito: main.py ya lo toma de
+      # RENDER_EXTERNAL_URL, que Render inyecta solo en cada web service.
