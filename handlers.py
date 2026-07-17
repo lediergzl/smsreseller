@@ -20,7 +20,7 @@ from config import MARKUP, SERVICES, PAYMENT_TIMEOUT_SECONDS, SMS_TIMEOUT_SECOND
 from config import PAYMENT_POLL_INTERVAL, SMS_POLL_INTERVAL
 from config import ADMIN_CHAT_ID, ADMIN_IDS
 from config import REFUND_FEE_PCT, ABUSE_MAX_STRIKES, ABUSE_WINDOW_HOURS, ABUSE_BLOCK_HOURS
-from config import WITHDRAWAL_FEE_PCT, WITHDRAWAL_ALLOWED_CURRENCIES, DEPOSIT_MIN_USD, WITHDRAWAL_MIN_USD
+from config import WITHDRAWAL_FEE_PCT, WITHDRAWAL_ALLOWED_CURRENCIES, DEPOSIT_MIN_USD, WITHDRAWAL_MIN_USD, CUP_WITHDRAWAL_MIN_USD
 from config import MANUAL_PAYMENT_METHODS, MANUAL_DEPOSIT_MIN_USD, MANUAL_DEPOSIT_MAX_USD, MANUAL_DEPOSIT_CUP_RATE
 from config import MANUAL_DEPOSIT_CUP_MARGIN_PCT, MANUAL_DEPOSIT_CUP_EXPOSURE_ALERT_USD, MANUAL_PURCHASE_MIN_USD
 from config import ACCOUNT_TYPE_LABELS
@@ -594,7 +594,10 @@ async def _send_saldo(user_id: int, answer_func):
     cup_available    = floor_to_cents(breakdown["cup"])
 
     can_withdraw_crypto = crypto_available >= WITHDRAWAL_MIN_USD
-    can_withdraw_cup    = cup_available >= WITHDRAWAL_MIN_USD
+    # cup_available > 0 además del mínimo: con CUP_WITHDRAWAL_MIN_USD en 0
+    # (default), ">= mínimo" solo no alcanza, o un saldo CUP de $0.00
+    # mostraría igual el botón "Retirar en CUP".
+    can_withdraw_cup    = cup_available > 0 and cup_available >= CUP_WITHDRAWAL_MIN_USD
 
     lines = [f"💰 <b>Tu saldo interno:</b> {format_amount(total_available, 'USD')}"]
     if crypto_available > 0 or cup_available > 0:
@@ -616,7 +619,7 @@ async def _send_saldo(user_id: int, answer_func):
         )
     if not can_withdraw_cup and cup_available > 0:
         lines.append(
-            f"\n(Te faltan {format_amount(WITHDRAWAL_MIN_USD - cup_available, 'USD')} "
+            f"\n(Te faltan {format_amount(CUP_WITHDRAWAL_MIN_USD - cup_available, 'USD')} "
             "de origen CUP para poder retirar en CUP.)"
         )
 
@@ -2676,8 +2679,8 @@ async def cb_start_cup_withdraw(call: CallbackQuery, state: FSMContext):
     payout_rate = effective_cup_rate_payout(MANUAL_DEPOSIT_CUP_RATE, MANUAL_DEPOSIT_CUP_MARGIN_PCT)
     balance_cup = usd_to_cup(balance_available, payout_rate)
 
-    if balance_available < WITHDRAWAL_MIN_USD:
-        min_cup = usd_to_cup(WITHDRAWAL_MIN_USD, payout_rate)
+    if balance_available <= 0 or balance_available < CUP_WITHDRAWAL_MIN_USD:
+        min_cup = usd_to_cup(CUP_WITHDRAWAL_MIN_USD, payout_rate)
         await call.message.answer(
             f"💰 El mínimo para retirar en CUP es {format_cup(min_cup)}. "
             f"Tu saldo de origen CUP es {format_cup(balance_cup)}.",
@@ -2750,8 +2753,11 @@ async def msg_cup_withdraw_amount(message: Message, state: FSMContext):
             )
             return
 
-    # Mismo criterio que msg_withdraw_amount (retiro cripto): comparar
-    # contra floor_to_cents, nunca contra el saldo redondeado hacia arriba.
+    # Mismo criterio que msg_withdraw_amount (retiro cripto) para el redondeo
+    # del saldo: comparar contra floor_to_cents, nunca contra el saldo
+    # redondeado hacia arriba. El mínimo en sí es CUP_WITHDRAWAL_MIN_USD,
+    # no WITHDRAWAL_MIN_USD (ver config.py: no aplica la razón de la
+    # comisión de red, acá lo transfiere un admin).
     if amount <= 0 or amount > balance_available + 1e-9:
         await message.answer(
             f"⚠️ El monto debe ser mayor a 0 CUP y no superar tu saldo CUP "
@@ -2761,8 +2767,8 @@ async def msg_cup_withdraw_amount(message: Message, state: FSMContext):
         )
         return
 
-    if amount < WITHDRAWAL_MIN_USD:
-        min_cup = usd_to_cup(WITHDRAWAL_MIN_USD, payout_rate)
+    if amount < CUP_WITHDRAWAL_MIN_USD:
+        min_cup = usd_to_cup(CUP_WITHDRAWAL_MIN_USD, payout_rate)
         await message.answer(
             f"⚠️ El monto mínimo de retiro es {format_cup(min_cup)}.",
             parse_mode="HTML",

@@ -89,6 +89,16 @@ WITHDRAWAL_FEE_PCT: float = float(os.getenv("WITHDRAWAL_FEE_PCT", "0.05"))  # 5%
 # cubre el caso análogo del lado de depósitos).
 WITHDRAWAL_MIN_USD: float = float(os.getenv("WITHDRAWAL_MIN_USD", "1.0"))
 
+# Monto mínimo en USD (unidad interna) para poder retirar saldo de ORIGEN
+# CUP. Deliberadamente separado de WITHDRAWAL_MIN_USD: la razón de ser de
+# ese mínimo es la comisión de red al enviar cripto (ver comentario arriba),
+# y un retiro en CUP no tiene comisión de red — lo transfiere un admin
+# manualmente (ver handlers.cb_admin_approve_cup_withdrawal). Por defecto en
+# 0: no hay motivo para bloquear un retiro CUP chico. Si en el futuro se
+# necesita un piso (p.ej. para evitar spam de retiros de centavos), se puede
+# subir con esta variable sin tocar el mínimo de cripto.
+CUP_WITHDRAWAL_MIN_USD: float = float(os.getenv("CUP_WITHDRAWAL_MIN_USD", "0.0"))
+
 # ── Depósitos (agregar saldo) ──────────────────────────────────────────────────
 # A diferencia de un retiro, un depósito es CCPayment cobrando (no pagando),
 # así que no hay riesgo de "no enough balance for withdrawal" del lado de
