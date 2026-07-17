@@ -2833,6 +2833,8 @@ async def cb_cup_withdraw_confirm(call: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
 
+    cup_amount_str = f"{data['cup_withdraw_amount_cup']:,}".replace(",", " ")
+
     try:
         await call.bot.send_message(
             ADMIN_CHAT_ID,
@@ -2841,7 +2843,7 @@ async def cb_cup_withdraw_confirm(call: CallbackQuery, state: FSMContext):
             f"Método: {method_name}\n"
             f"Cuenta destino: <code>{destination}</code>\n"
             f"Monto: {format_amount(amount_usd, 'USD')} → "
-            f"{f'{data[\"cup_withdraw_amount_cup\"]:,}'.replace(',', ' ')} CUP\n"
+            f"{cup_amount_str} CUP\n"
             f"👤 <code>{user_id}</code>",
             parse_mode="HTML",
             reply_markup=manual_withdrawal_review_keyboard(wd["id"]),
