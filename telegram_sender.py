@@ -30,11 +30,18 @@ CARDS_DIR = "/tmp/otpvirtual_cards"
 PHOTOS_DIR = "/tmp/otpvirtual_profile_photos"
 
 
-def _format_joined_at(raw: str | None) -> str | None:
-    """'2026-07-14 07:12:00' (formato SQLite) -> '14/07/2026'. None si no hay dato
-    o el formato es inesperado (mejor omitir la fila que mostrar algo raro)."""
+def _format_joined_at(raw: "datetime | str | None") -> str | None:
+    """'2026-07-14 07:12:00' o datetime -> '14/07/2026'. None si no hay dato
+    o el formato es inesperado (mejor omitir la fila que mostrar algo raro).
+
+    Con Neon/psycopg2, columnas TIMESTAMPTZ (ver database.py, tabla `users`,
+    campo first_seen) llegan ya como datetime.datetime, no como string (a
+    diferencia de la versión vieja con SQLite). Se soportan ambos casos para
+    no volver a romper si en algún momento cambia la fuente de datos."""
     if not raw:
         return None
+    if isinstance(raw, datetime):
+        return raw.strftime("%d/%m/%Y")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
             return datetime.strptime(raw, fmt).strftime("%d/%m/%Y")
