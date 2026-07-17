@@ -2,37 +2,53 @@
 database.py - Manejo de base de datos PostgreSQL (Neon) para transacciones y
 estado del bot.
 
-MIGRADO DE SQLITE: este módulo antes usaba sqlite3 con un archivo .db local
-(ver git history si hace falta comparar). Se migró a Postgres porque:
-  - Render (donde corre el bot) tiene filesystem EFÍMERO por defecto: un
-    archivo .db local se borraría en cada redeploy/reinicio si no se paga
-    un disco persistente. Postgres vive afuera del contenedor del bot.
-  - Neon ya da backups/point-in-time recovery y branching gestionados, así
-    que el backup casero a mano (ver la versión vieja de backup_task.py)
-    deja de hacer falta.
+MIGRADO A ASYNCPG: este módulo antes usaba `psycopg2` (síncrono/bloqueante)
+por dentro de un pool sincrónico (`SimpleConnectionPool`). El problema real
+que eso causaba: aiogram corre TODO en un único event loop (un solo hilo).
+Cada llamada a `db.algo(...)` desde un handler `async def` se quedaba
+esperando la respuesta de red de Neon de forma bloqueante, y mientras esa
+espera duraba, el event loop entero quedaba congelado — no solo para el
+usuario que disparó esa acción, sino para TODOS los usuarios del bot al
+mismo tiempo (nadie recibía nada hasta que esa query terminara). Esto se
+notaba peor todavía cuando el compute de Neon (plan free) estaba
+"dormido" tras un rato de inactividad: el primer query después de la
+pausa podía tardar varios segundos en despertarlo, y ese tiempo entero
+bloqueaba el bot completo para cualquier otro usuario.
 
-La interfaz pública (nombres de métodos y qué devuelven) se mantuvo IGUAL
-a la versión SQLite a propósito, para no tener que tocar handlers.py,
-outbox.py, telegram_sender.py, etc. Solo cambiaron las tripas: placeholders
-`?` -> `%s`, `cursor.lastrowid` -> `RETURNING id`, y se sacó toda la lógica
-de migración incremental por PRAGMA table_info (no hace falta: una base
-Postgres nueva arranca directo con el esquema completo).
+Con `asyncpg` cada método de esta clase es `async def` y usa un pool
+async (`asyncpg.create_pool`): mientras una query espera la red, el event
+loop queda libre para seguir atendiendo a otros usuarios en paralelo. Cada
+handler que llama a `db.algo(...)` ahora hace `await db.algo(...)`.
+
+DIFERENCIAS DE INTERFAZ respecto a la versión psycopg2 (importante para
+quien toque este archivo más adelante):
+  - TODOS los métodos públicos son ahora `async def` → hay que hacer
+    `await db.metodo(...)` en cada lugar donde se llaman.
+  - Antes de usar `db` por primera vez hay que llamar una vez
+    `await db.connect()` (crea el pool y las tablas). Se llama desde
+    main.py al arrancar. Los scripts sueltos (fix_missing_refund.py, etc.)
+    también deben llamar `await db.connect()` antes de usar `db`.
+  - asyncpg usa placeholders posicionales `$1, $2, ...` en vez de `%s`.
+  - `conn.fetchrow(...)` reemplaza a `cursor.fetchone()`, `conn.fetch(...)`
+    reemplaza a `cursor.fetchall()`. Ambos devuelven `asyncpg.Record`
+    (se convierte a dict normal con `dict(record)`).
+  - No existe `cursor.rowcount`: para saber si un UPDATE afectó alguna
+    fila se parsea el "command tag" que devuelve `conn.execute(...)`
+    (ej. "UPDATE 1") con `_affected_rows(...)`.
 """
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
-import psycopg2
-import psycopg2.extras
-from psycopg2.pool import SimpleConnectionPool
+import asyncpg
 
 import config
 
 logger = logging.getLogger(__name__)
 
-# Statements DDL, uno por uno (evitamos ejecutar un script gigante con ";"
-# porque psycopg2 no garantiza que un solo execute() corra varios statements
-# de forma confiable en todos los casos, a diferencia de sqlite3.executescript).
+# Statements DDL, uno por uno (mismo motivo que en la versión psycopg2: más
+# simple y confiable que confiar en que un solo execute() corra un script
+# gigante con varios ";" de forma correcta).
 _DDL_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS transactions (
@@ -179,40 +195,83 @@ _DDL_STATEMENTS = [
 ]
 
 
+def _affected_rows(command_tag: str) -> int:
+    """
+    asyncpg no expone `cursor.rowcount`: `conn.execute(...)` devuelve un
+    "command tag" de Postgres como "UPDATE 3" o "INSERT 0 1". El número de
+    filas afectadas es siempre el ÚLTIMO token. Se usa donde antes se
+    miraba `cur.rowcount > 0` (ej. set_account_type, set_country).
+    """
+    try:
+        return int(command_tag.split()[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _set_clause(kwargs: dict, start_idx: int = 1) -> tuple[str, list, int]:
+    """
+    Arma dinámicamente "col1 = $1, col2 = $2, ..." a partir de un dict,
+    devolviendo también los valores en el mismo orden y el próximo índice
+    de placeholder libre (para que el llamador pueda seguir numerando,
+    típicamente para el WHERE id = $N). Reemplaza el patrón que antes
+    generaba "col = %s" (los placeholders posicionales `%s` de psycopg2
+    no llevan número, así que no hacía falta llevar este índice).
+    """
+    parts, values, idx = [], [], start_idx
+    for k, v in kwargs.items():
+        parts.append(f"{k} = ${idx}")
+        values.append(v)
+        idx += 1
+    return ", ".join(parts), values, idx
+
+
 class _PooledConnection:
     """
-    Wrapper fino sobre una conexión sacada del pool, pensado para que el
-    resto de este archivo pueda seguir escribiendo
+    Wrapper async sobre una conexión sacada del pool de asyncpg. Se usa
+    como:
 
-        with self._conn() as conn:
-            conn.execute(sql, params)
+        async with self._conn() as conn:
+            row = await conn.fetchrow(sql, *params)
 
-    igual que hacía con sqlite3.Connection. Al salir del `with`: hace commit
-    si no hubo excepción (rollback si la hubo) y SIEMPRE devuelve la
-    conexión al pool (nunca la cierra de verdad, para poder reusarla).
+    Al salir del `async with`: hace commit de la transacción si no hubo
+    excepción (rollback si la hubo) y SIEMPRE devuelve la conexión al
+    pool (nunca la cierra de verdad, para poder reusarla). Mismo
+    contrato que la versión psycopg2, solo que ahora todo es async para
+    no bloquear el event loop mientras se espera la red hacia Neon.
     """
 
-    def __init__(self, pool: SimpleConnectionPool):
+    def __init__(self, pool: asyncpg.Pool):
         self._pool = pool
-        self._conn = pool.getconn()
+        self._conn: Optional[asyncpg.Connection] = None
+        self._tx = None
 
-    def execute(self, sql: str, params=()):
-        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(sql, params)
-        return cur
-
-    def __enter__(self):
+    async def __aenter__(self) -> "_PooledConnection":
+        self._conn = await self._pool.acquire()
+        self._tx = self._conn.transaction()
+        await self._tx.start()
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    async def __aexit__(self, exc_type, exc, tb):
         try:
             if exc_type is None:
-                self._conn.commit()
+                await self._tx.commit()
             else:
-                self._conn.rollback()
+                await self._tx.rollback()
         finally:
-            self._pool.putconn(self._conn)
+            await self._pool.release(self._conn)
         return False
+
+    async def fetchrow(self, sql: str, *params):
+        return await self._conn.fetchrow(sql, *params)
+
+    async def fetch(self, sql: str, *params):
+        return await self._conn.fetch(sql, *params)
+
+    async def fetchval(self, sql: str, *params):
+        return await self._conn.fetchval(sql, *params)
+
+    async def execute(self, sql: str, *params) -> str:
+        return await self._conn.execute(sql, *params)
 
 
 class Database:
@@ -224,23 +283,45 @@ class Database:
                 "en https://console.neon.tech y ponla en el .env / variables de "
                 "entorno de Render."
             )
+        # El pool NO se crea acá: asyncpg.create_pool() es una corrutina y
+        # __init__ no puede ser async. Se crea de verdad en connect(), que
+        # hay que llamar una vez (await db.connect()) antes de usar `db`,
+        # típicamente al arrancar el bot (ver main.py: _startup_sequence).
+        self._pool: Optional[asyncpg.Pool] = None
+
+    async def connect(self):
+        """Crea el pool de conexiones y asegura que las tablas existan.
+        Idempotente: si ya se conectó antes, no hace nada."""
+        if self._pool is not None:
+            return
         # Pool chico: alcanza de sobra para un bot de este tamaño y respeta
         # el límite de conexiones concurrentes del plan free de Neon.
-        self._pool = SimpleConnectionPool(minconn=1, maxconn=5, dsn=self.dsn)
-        self._create_tables()
+        self._pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=5)
+        await self._create_tables()
+        logger.info("Base de datos (Postgres/Neon, asyncpg) inicializada correctamente.")
+
+    async def close(self):
+        """Cierra el pool. Llamar al apagar el bot (ver main.py on_shutdown)."""
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
 
     def _conn(self) -> _PooledConnection:
+        if self._pool is None:
+            raise RuntimeError(
+                "Database.connect() no fue llamado todavía. Hay que hacer "
+                "'await db.connect()' antes de usar cualquier método de `db`."
+            )
         return _PooledConnection(self._pool)
 
-    def _create_tables(self):
-        with self._conn() as conn:
+    async def _create_tables(self):
+        async with self._conn() as conn:
             for stmt in _DDL_STATEMENTS:
-                conn.execute(stmt)
-        logger.info("Base de datos (Postgres/Neon) inicializada correctamente.")
+                await conn.execute(stmt)
 
     # ── Integridad / salud ────────────────────────────────────────────────────
 
-    def integrity_check(self) -> tuple[bool, str]:
+    async def integrity_check(self) -> tuple[bool, str]:
         """
         Con Neon ya no existe un archivo que se pueda corromper localmente
         (eso lo maneja Neon), así que esto pasó a ser un simple chequeo de
@@ -249,15 +330,15 @@ class Database:
         enterarse recién cuando falla una compra real.
         """
         try:
-            with self._conn() as conn:
-                conn.execute("SELECT 1")
+            async with self._conn() as conn:
+                await conn.fetchval("SELECT 1")
             return True, "ok"
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}"
 
     # ── Insertar ──────────────────────────────────────────────────────────────
 
-    def create_transaction(
+    async def create_transaction(
         self,
         user_id: int,
         service: str,
@@ -272,25 +353,23 @@ class Database:
         INSERT INTO transactions
             (user_id, service, service_name, country, country_name,
              cost_herosms, amount_usd, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
         RETURNING id
         """
-        with self._conn() as conn:
-            cur = conn.execute(
-                sql,
-                (user_id, service, service_name, country, country_name,
-                 cost_herosms, amount_usd),
+        async with self._conn() as conn:
+            return await conn.fetchval(
+                sql, user_id, service, service_name, country, country_name,
+                cost_herosms, amount_usd,
             )
-            return cur.fetchone()["id"]
 
     # ── Actualizar campos individuales ────────────────────────────────────────
 
-    def set_order_info(
+    async def set_order_info(
         self, tx_id: int, order_id: str, pay_address: str,
         currency: str, network: str, pay_amount: float,
         token_id: str = None,
     ):
-        self._update(
+        await self._update(
             tx_id,
             order_id=order_id,
             pay_address=pay_address,
@@ -300,13 +379,13 @@ class Database:
             token_id=token_id,
         )
 
-    def set_activation(self, tx_id: int, activation_id: str, phone_number: str):
-        self._update(tx_id, activation_id=activation_id, phone_number=phone_number)
+    async def set_activation(self, tx_id: int, activation_id: str, phone_number: str):
+        await self._update(tx_id, activation_id=activation_id, phone_number=phone_number)
 
-    def set_refund_address(self, tx_id: int, refund_address: str):
-        self._update(tx_id, refund_address=refund_address)
+    async def set_refund_address(self, tx_id: int, refund_address: str):
+        await self._update(tx_id, refund_address=refund_address)
 
-    def set_purchase_proof(
+    async def set_purchase_proof(
         self, tx_id: int, proof_file_id: str = None,
         proof_file_unique_id: str = None, proof_text: str = None,
     ):
@@ -315,14 +394,14 @@ class Database:
         una compra. Ver find_reused_proof para la defensa contra reuso de
         la misma captura en varias órdenes.
         """
-        self._update(
+        await self._update(
             tx_id,
             proof_file_id=proof_file_id,
             proof_file_unique_id=proof_file_unique_id,
             proof_text=proof_text,
         )
 
-    def find_reused_proof(
+    async def find_reused_proof(
         self, proof_file_unique_id: str,
         exclude_tx_id: int = None, exclude_dep_id: int = None,
     ) -> list[dict]:
@@ -336,40 +415,39 @@ class Database:
             return []
 
         matches = []
-        with self._conn() as conn:
-            rows = conn.execute(
+        async with self._conn() as conn:
+            rows = await conn.fetch(
                 "SELECT id, status FROM transactions "
-                "WHERE proof_file_unique_id = %s AND id != %s",
-                (proof_file_unique_id, exclude_tx_id or -1),
-            ).fetchall()
+                "WHERE proof_file_unique_id = $1 AND id != $2",
+                proof_file_unique_id, exclude_tx_id or -1,
+            )
             matches.extend({"kind": "compra", "id": r["id"], "status": r["status"]} for r in rows)
 
-            rows = conn.execute(
+            rows = await conn.fetch(
                 "SELECT id, status FROM manual_deposits "
-                "WHERE proof_file_unique_id = %s AND id != %s",
-                (proof_file_unique_id, exclude_dep_id or -1),
-            ).fetchall()
+                "WHERE proof_file_unique_id = $1 AND id != $2",
+                proof_file_unique_id, exclude_dep_id or -1,
+            )
             matches.extend({"kind": "depósito", "id": r["id"], "status": r["status"]} for r in rows)
 
         return matches
 
-    def set_sms_code(self, tx_id: int, sms_code: str):
-        self._update(tx_id, sms_code=sms_code)
+    async def set_sms_code(self, tx_id: int, sms_code: str):
+        await self._update(tx_id, sms_code=sms_code)
 
-    def set_status(self, tx_id: int, status: str):
-        self._update(tx_id, status=status)
+    async def set_status(self, tx_id: int, status: str):
+        await self._update(tx_id, status=status)
 
-    def _update(self, tx_id: int, **kwargs):
+    async def _update(self, tx_id: int, **kwargs):
         kwargs["updated_at"] = datetime.utcnow()
-        sets = ", ".join(f"{k} = %s" for k in kwargs)
-        values = list(kwargs.values()) + [tx_id]
-        sql = f"UPDATE transactions SET {sets} WHERE id = %s"
-        with self._conn() as conn:
-            conn.execute(sql, values)
+        sets, values, next_idx = _set_clause(kwargs)
+        sql = f"UPDATE transactions SET {sets} WHERE id = ${next_idx}"
+        async with self._conn() as conn:
+            await conn.execute(sql, *values, tx_id)
 
     # ── Usuarios ──────────────────────────────────────────────────────────────
 
-    def register_user(
+    async def register_user(
         self, user_id: int, username: str = None, first_name: str = None,
         last_name: str = None, language_code: str = None, is_premium: bool = None,
     ) -> None:
@@ -384,7 +462,7 @@ class Database:
             user_id, username, first_name, last_name, language_code,
             is_premium, first_seen, last_seen
         )
-        VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
         ON CONFLICT (user_id) DO UPDATE SET
             username      = EXCLUDED.username,
             first_name    = EXCLUDED.first_name,
@@ -394,98 +472,96 @@ class Database:
             last_seen     = NOW()
         """
         try:
-            with self._conn() as conn:
-                conn.execute(sql, (
-                    user_id, username, first_name, last_name, language_code,
+            async with self._conn() as conn:
+                await conn.execute(
+                    sql, user_id, username, first_name, last_name, language_code,
                     int(is_premium) if is_premium is not None else None,
-                ))
+                )
         except Exception as exc:
             logger.error("register_user(%s) error: %s: %s", user_id, type(exc).__name__, exc)
 
-    def set_phone_number(self, user_id: int, phone_number: str) -> None:
+    async def set_phone_number(self, user_id: int, phone_number: str) -> None:
         """
         Guarda el teléfono real del usuario cuando lo comparte de forma
         EXPLÍCITA (botón "compartir contacto" de Telegram). Nunca se pide
         como requisito, solo queda disponible para el admin si el usuario
         decide compartirlo.
         """
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE users SET phone_number = %s, phone_verified_at = NOW() "
-                "WHERE user_id = %s",
-                (phone_number, user_id),
+        async with self._conn() as conn:
+            await conn.execute(
+                "UPDATE users SET phone_number = $1, phone_verified_at = NOW() "
+                "WHERE user_id = $2",
+                phone_number, user_id,
             )
 
-    def get_user_count(self) -> int:
+    async def get_user_count(self) -> int:
         """Total de usuarios distintos que alguna vez corrieron /start."""
-        with self._conn() as conn:
-            row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
-            return int(row["c"] or 0)
+        async with self._conn() as conn:
+            count = await conn.fetchval("SELECT COUNT(*) FROM users")
+            return int(count or 0)
 
-    def get_user(self, user_id: int) -> Optional[dict]:
+    async def get_user(self, user_id: int) -> Optional[dict]:
         """
         Fila cruda de la tabla `users`, o None si el usuario nunca corrió
         /start. Usado por telegram_sender.py para la tarjeta de bienvenida.
         """
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM users WHERE user_id = %s", (user_id,)
-            ).fetchone()
+        async with self._conn() as conn:
+            row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
             return dict(row) if row else None
 
-    def set_account_type(self, user_id: int, account_type: Optional[str]) -> bool:
+    async def set_account_type(self, user_id: int, account_type: Optional[str]) -> bool:
         """
         Asigna el 'Nivel' de cuenta (cliente/reseller/vip). account_type=None
         borra el valor. Devuelve False si el usuario nunca corrió /start.
         """
-        with self._conn() as conn:
-            cur = conn.execute(
-                "UPDATE users SET account_type = %s WHERE user_id = %s",
-                (account_type, user_id),
+        async with self._conn() as conn:
+            tag = await conn.execute(
+                "UPDATE users SET account_type = $1 WHERE user_id = $2",
+                account_type, user_id,
             )
-            return cur.rowcount > 0
+            return _affected_rows(tag) > 0
 
-    def set_country(self, user_id: int, country: Optional[str]) -> bool:
+    async def set_country(self, user_id: int, country: Optional[str]) -> bool:
         """Asigna el país (texto libre). country=None borra el valor."""
-        with self._conn() as conn:
-            cur = conn.execute(
-                "UPDATE users SET country = %s WHERE user_id = %s",
-                (country, user_id),
+        async with self._conn() as conn:
+            tag = await conn.execute(
+                "UPDATE users SET country = $1 WHERE user_id = $2",
+                country, user_id,
             )
-            return cur.rowcount > 0
+            return _affected_rows(tag) > 0
 
-    def count_completed_orders(self, user_id: int) -> int:
+    async def count_completed_orders(self, user_id: int) -> int:
         """Total de compras COMPLETADAS (código OTP recibido y confirmado) del usuario."""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) AS c FROM transactions "
-                "WHERE user_id = %s AND status = 'completed'",
-                (user_id,),
-            ).fetchone()
-            return int(row["c"] or 0)
+        async with self._conn() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM transactions "
+                "WHERE user_id = $1 AND status = 'completed'",
+                user_id,
+            )
+            return int(count or 0)
 
     # ── Saldo interno (wallet virtual) ───────────────────────────────────────
 
     _ORIGIN_COLUMN = {"crypto": "balance_usd", "cup": "balance_usd_cup"}
     EPSILON = 1e-9
 
-    def get_balance(self, user_id: int) -> float:
+    async def get_balance(self, user_id: int) -> float:
         """Saldo TOTAL (cripto + CUP) para mostrar en /saldo y para pagar compras."""
-        b = self.get_balance_breakdown(user_id)
+        b = await self.get_balance_breakdown(user_id)
         return b["total"]
 
-    def get_balance_breakdown(self, user_id: int) -> dict:
+    async def get_balance_breakdown(self, user_id: int) -> dict:
         """Devuelve {"crypto": x, "cup": y, "total": x+y}."""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT balance_usd, balance_usd_cup FROM balances WHERE user_id = %s",
-                (user_id,),
-            ).fetchone()
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT balance_usd, balance_usd_cup FROM balances WHERE user_id = $1",
+                user_id,
+            )
             crypto = float(row["balance_usd"]) if row else 0.0
             cup = float(row["balance_usd_cup"]) if row else 0.0
             return {"crypto": crypto, "cup": cup, "total": crypto + cup}
 
-    def credit_balance(
+    async def credit_balance(
         self, user_id: int, amount_usd: float, tx_id: int = None,
         reason: str = "", origin: str = "crypto",
     ) -> float:
@@ -497,27 +573,27 @@ class Database:
         """
         column = self._ORIGIN_COLUMN.get(origin, "balance_usd")
         amount_usd = round(float(amount_usd), 4)
-        with self._conn() as conn:
-            conn.execute(
+        async with self._conn() as conn:
+            await conn.execute(
                 f"INSERT INTO balances (user_id, {column}, updated_at) "
-                f"VALUES (%s, %s, NOW()) "
+                f"VALUES ($1, $2, NOW()) "
                 f"ON CONFLICT (user_id) DO UPDATE SET "
                 f"{column} = balances.{column} + EXCLUDED.{column}, "
                 f"updated_at = EXCLUDED.updated_at",
-                (user_id, amount_usd),
+                user_id, amount_usd,
             )
-            conn.execute(
+            await conn.execute(
                 "INSERT INTO balance_ledger (user_id, tx_id, delta_usd, origin, reason) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (user_id, tx_id, amount_usd, origin, reason),
+                "VALUES ($1, $2, $3, $4, $5)",
+                user_id, tx_id, amount_usd, origin, reason,
             )
-            row = conn.execute(
-                "SELECT balance_usd, balance_usd_cup FROM balances WHERE user_id = %s",
-                (user_id,),
-            ).fetchone()
+            row = await conn.fetchrow(
+                "SELECT balance_usd, balance_usd_cup FROM balances WHERE user_id = $1",
+                user_id,
+            )
             return float(row["balance_usd"]) + float(row["balance_usd_cup"])
 
-    def debit_balance(
+    async def debit_balance(
         self, user_id: int, amount_usd: float, tx_id: int = None,
         reason: str = "", origin: str = None,
     ) -> bool:
@@ -531,11 +607,11 @@ class Database:
             drenando primero CUP (la menos flexible de las dos).
         """
         amount_usd = round(float(amount_usd), 4)
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT balance_usd, balance_usd_cup FROM balances WHERE user_id = %s",
-                (user_id,),
-            ).fetchone()
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT balance_usd, balance_usd_cup FROM balances WHERE user_id = $1",
+                user_id,
+            )
             crypto_bal = float(row["balance_usd"]) if row else 0.0
             cup_bal = float(row["balance_usd_cup"]) if row else 0.0
 
@@ -545,14 +621,14 @@ class Database:
                 if amount_usd - current > self.EPSILON:
                     return False
                 new_value = 0.0 if amount_usd >= current - self.EPSILON else current - amount_usd
-                conn.execute(
-                    f"UPDATE balances SET {column} = %s, updated_at = NOW() WHERE user_id = %s",
-                    (new_value, user_id),
+                await conn.execute(
+                    f"UPDATE balances SET {column} = $1, updated_at = NOW() WHERE user_id = $2",
+                    new_value, user_id,
                 )
-                conn.execute(
+                await conn.execute(
                     "INSERT INTO balance_ledger (user_id, tx_id, delta_usd, origin, reason) "
-                    "VALUES (%s, %s, %s, %s, %s)",
-                    (user_id, tx_id, -amount_usd, origin, reason),
+                    "VALUES ($1, $2, $3, $4, $5)",
+                    user_id, tx_id, -amount_usd, origin, reason,
                 )
                 return True
 
@@ -566,26 +642,26 @@ class Database:
             new_cup = 0.0 if cup_used >= cup_bal - self.EPSILON else cup_bal - cup_used
             new_crypto = 0.0 if crypto_used >= crypto_bal - self.EPSILON else crypto_bal - crypto_used
 
-            conn.execute(
-                "UPDATE balances SET balance_usd = %s, balance_usd_cup = %s, "
-                "updated_at = NOW() WHERE user_id = %s",
-                (new_crypto, new_cup, user_id),
+            await conn.execute(
+                "UPDATE balances SET balance_usd = $1, balance_usd_cup = $2, "
+                "updated_at = NOW() WHERE user_id = $3",
+                new_crypto, new_cup, user_id,
             )
             if cup_used > self.EPSILON:
-                conn.execute(
+                await conn.execute(
                     "INSERT INTO balance_ledger (user_id, tx_id, delta_usd, origin, reason) "
-                    "VALUES (%s, %s, %s, 'cup', %s)",
-                    (user_id, tx_id, -cup_used, reason),
+                    "VALUES ($1, $2, $3, 'cup', $4)",
+                    user_id, tx_id, -cup_used, reason,
                 )
             if crypto_used > self.EPSILON:
-                conn.execute(
+                await conn.execute(
                     "INSERT INTO balance_ledger (user_id, tx_id, delta_usd, origin, reason) "
-                    "VALUES (%s, %s, %s, 'crypto', %s)",
-                    (user_id, tx_id, -crypto_used, reason),
+                    "VALUES ($1, $2, $3, 'crypto', $4)",
+                    user_id, tx_id, -crypto_used, reason,
                 )
             return True
 
-    def get_purchase_origin_ratios(self, tx: dict) -> dict:
+    async def get_purchase_origin_ratios(self, tx: dict) -> dict:
         """
         Determina en qué proporción hay que devolver un reembolso ligado a
         `tx` entre las bolsas 'crypto' y 'cup', según cómo se pagó
@@ -598,13 +674,13 @@ class Database:
         order_id = tx.get("order_id") or ""
         if order_id.startswith("balance-"):
             tx_id = tx.get("id")
-            with self._conn() as conn:
-                rows = conn.execute(
+            async with self._conn() as conn:
+                rows = await conn.fetch(
                     "SELECT COALESCE(origin, 'crypto') AS origin, SUM(-delta_usd) AS debited "
-                    "FROM balance_ledger WHERE tx_id = %s AND delta_usd < 0 "
+                    "FROM balance_ledger WHERE tx_id = $1 AND delta_usd < 0 "
                     "GROUP BY origin",
-                    (tx_id,),
-                ).fetchall()
+                    tx_id,
+                )
             totals = {r["origin"]: float(r["debited"] or 0) for r in rows}
             grand_total = sum(totals.values())
             if grand_total <= self.EPSILON:
@@ -615,299 +691,286 @@ class Database:
 
     # ── Depósitos (agregar saldo) ────────────────────────────────────────────
 
-    def create_deposit(self, user_id: int, amount_usd: float) -> int:
+    async def create_deposit(self, user_id: int, amount_usd: float) -> int:
         """Crea un registro de depósito inicial (aún sin orden) y devuelve su id."""
-        with self._conn() as conn:
-            cur = conn.execute(
+        async with self._conn() as conn:
+            return await conn.fetchval(
                 "INSERT INTO deposits (user_id, amount_usd, status) "
-                "VALUES (%s, %s, 'pending') RETURNING id",
-                (user_id, amount_usd),
+                "VALUES ($1, $2, 'pending') RETURNING id",
+                user_id, amount_usd,
             )
-            return cur.fetchone()["id"]
 
-    def set_deposit_order_info(
+    async def set_deposit_order_info(
         self, deposit_id: int, order_id: str, pay_address: str,
         currency: str, network: str, pay_amount: float, token_id: str,
     ):
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE deposits SET order_id = %s, pay_address = %s, currency = %s, "
-                "network = %s, pay_amount = %s, token_id = %s, updated_at = NOW() "
-                "WHERE id = %s",
-                (order_id, pay_address, currency, network, pay_amount, token_id, deposit_id),
+        async with self._conn() as conn:
+            await conn.execute(
+                "UPDATE deposits SET order_id = $1, pay_address = $2, currency = $3, "
+                "network = $4, pay_amount = $5, token_id = $6, updated_at = NOW() "
+                "WHERE id = $7",
+                order_id, pay_address, currency, network, pay_amount, token_id, deposit_id,
             )
 
-    def set_deposit_status(self, deposit_id: int, status: str):
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE deposits SET status = %s, updated_at = NOW() WHERE id = %s",
-                (status, deposit_id),
+    async def set_deposit_status(self, deposit_id: int, status: str):
+        async with self._conn() as conn:
+            await conn.execute(
+                "UPDATE deposits SET status = $1, updated_at = NOW() WHERE id = $2",
+                status, deposit_id,
             )
 
-    def get_deposit_by_id(self, deposit_id: int) -> Optional[dict]:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM deposits WHERE id = %s", (deposit_id,)
-            ).fetchone()
+    async def get_deposit_by_id(self, deposit_id: int) -> Optional[dict]:
+        async with self._conn() as conn:
+            row = await conn.fetchrow("SELECT * FROM deposits WHERE id = $1", deposit_id)
             return dict(row) if row else None
 
-    def get_deposit_by_order_id(self, order_id: str) -> Optional[dict]:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM deposits WHERE order_id = %s", (order_id,)
-            ).fetchone()
+    async def get_deposit_by_order_id(self, order_id: str) -> Optional[dict]:
+        async with self._conn() as conn:
+            row = await conn.fetchrow("SELECT * FROM deposits WHERE order_id = $1", order_id)
             return dict(row) if row else None
 
-    def get_pending_deposits(self) -> list[dict]:
+    async def get_pending_deposits(self) -> list[dict]:
         """Depósitos con una orden de pago generada, todavía sin confirmar (recovery al reiniciar)."""
-        with self._conn() as conn:
-            rows = conn.execute(
+        async with self._conn() as conn:
+            rows = await conn.fetch(
                 "SELECT * FROM deposits WHERE status = 'pending' AND order_id IS NOT NULL"
-            ).fetchall()
+            )
             return [dict(r) for r in rows]
 
-    def get_last_completed_deposit(self, user_id: int) -> Optional[dict]:
+    async def get_last_completed_deposit(self, user_id: int) -> Optional[dict]:
         """Depósito COMPLETADO más reciente del usuario (currency/network/token_id), o None."""
-        with self._conn() as conn:
-            row = conn.execute(
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
                 "SELECT currency, network, token_id FROM deposits "
-                "WHERE user_id = %s AND status = 'completed' AND token_id IS NOT NULL "
+                "WHERE user_id = $1 AND status = 'completed' AND token_id IS NOT NULL "
                 "ORDER BY updated_at DESC LIMIT 1",
-                (user_id,),
-            ).fetchone()
+                user_id,
+            )
             return dict(row) if row else None
 
     # ── Depósitos manuales (CUP vía Transfermóvil / EnZona) ──────────────────
 
-    def create_manual_deposit(
+    async def create_manual_deposit(
         self, user_id: int, method: str, amount_usd: float,
         amount_cup: int = None, cup_rate: float = None,
     ) -> dict:
         """Crea el registro y genera su reference_code (REF-000123) a partir del id."""
-        with self._conn() as conn:
-            cur = conn.execute(
+        async with self._conn() as conn:
+            dep_id = await conn.fetchval(
                 "INSERT INTO manual_deposits (user_id, method, amount_usd, amount_cup, cup_rate, status) "
-                "VALUES (%s, %s, %s, %s, %s, 'awaiting_proof') RETURNING id",
-                (user_id, method, amount_usd, amount_cup, cup_rate),
+                "VALUES ($1, $2, $3, $4, $5, 'awaiting_proof') RETURNING id",
+                user_id, method, amount_usd, amount_cup, cup_rate,
             )
-            dep_id = cur.fetchone()["id"]
             reference_code = f"REF-{dep_id:06d}"
-            conn.execute(
-                "UPDATE manual_deposits SET reference_code = %s WHERE id = %s",
-                (reference_code, dep_id),
+            await conn.execute(
+                "UPDATE manual_deposits SET reference_code = $1 WHERE id = $2",
+                reference_code, dep_id,
             )
             return {"id": dep_id, "reference_code": reference_code}
 
-    def set_manual_deposit_proof(
+    async def set_manual_deposit_proof(
         self, dep_id: int, proof_file_id: str = None,
         proof_file_unique_id: str = None, proof_text: str = None,
     ):
-        self._update_manual_deposit(
+        await self._update_manual_deposit(
             dep_id, status="pending_review",
             proof_file_id=proof_file_id,
             proof_file_unique_id=proof_file_unique_id,
             proof_text=proof_text,
         )
 
-    def set_manual_deposit_status(self, dep_id: int, status: str, reviewed_by: int = None):
+    async def set_manual_deposit_status(self, dep_id: int, status: str, reviewed_by: int = None):
         kwargs = {"status": status}
         if reviewed_by is not None:
             kwargs["reviewed_by"] = reviewed_by
-        self._update_manual_deposit(dep_id, **kwargs)
+        await self._update_manual_deposit(dep_id, **kwargs)
 
-    def _update_manual_deposit(self, dep_id: int, **kwargs):
+    async def _update_manual_deposit(self, dep_id: int, **kwargs):
         kwargs["updated_at"] = datetime.utcnow()
-        sets = ", ".join(f"{k} = %s" for k in kwargs)
-        values = list(kwargs.values()) + [dep_id]
-        sql = f"UPDATE manual_deposits SET {sets} WHERE id = %s"
-        with self._conn() as conn:
-            conn.execute(sql, values)
+        sets, values, next_idx = _set_clause(kwargs)
+        sql = f"UPDATE manual_deposits SET {sets} WHERE id = ${next_idx}"
+        async with self._conn() as conn:
+            await conn.execute(sql, *values, dep_id)
 
-    def get_manual_deposit_by_id(self, dep_id: int) -> Optional[dict]:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM manual_deposits WHERE id = %s", (dep_id,)
-            ).fetchone()
+    async def get_manual_deposit_by_id(self, dep_id: int) -> Optional[dict]:
+        async with self._conn() as conn:
+            row = await conn.fetchrow("SELECT * FROM manual_deposits WHERE id = $1", dep_id)
             return dict(row) if row else None
 
-    def get_pending_manual_deposit(self, user_id: int) -> Optional[dict]:
+    async def get_pending_manual_deposit(self, user_id: int) -> Optional[dict]:
         """Solicitud NO resuelta más reciente del usuario (máximo 1 pendiente a la vez)."""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM manual_deposits WHERE user_id = %s "
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM manual_deposits WHERE user_id = $1 "
                 "AND status IN ('awaiting_proof', 'pending_review') "
                 "ORDER BY created_at DESC LIMIT 1",
-                (user_id,),
-            ).fetchone()
+                user_id,
+            )
             return dict(row) if row else None
 
-    def get_pending_manual_deposits_for_review(self) -> list[dict]:
+    async def get_pending_manual_deposits_for_review(self) -> list[dict]:
         """Todas las solicitudes esperando aprobación de un admin (para /pendientes)."""
-        with self._conn() as conn:
-            rows = conn.execute(
+        async with self._conn() as conn:
+            rows = await conn.fetch(
                 "SELECT * FROM manual_deposits WHERE status = 'pending_review' "
                 "ORDER BY created_at ASC"
-            ).fetchall()
+            )
             return [dict(r) for r in rows]
 
-    def get_cup_exposure(self) -> dict:
+    async def get_cup_exposure(self) -> dict:
         """CUP ya aprobado (acreditado) que todavía no se marcó como convertido a USDT real."""
-        with self._conn() as conn:
-            row = conn.execute(
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
                 "SELECT COUNT(*) AS c, COALESCE(SUM(amount_cup),0) AS cup, "
                 "COALESCE(SUM(amount_usd),0) AS usd "
                 "FROM manual_deposits "
                 "WHERE status = 'approved' AND converted_to_usdt = 0"
-            ).fetchone()
+            )
             return {
                 "count": int(row["c"] or 0),
                 "total_cup": int(row["cup"] or 0),
                 "total_usd": float(row["usd"] or 0),
             }
 
-    def get_unconverted_manual_deposits(self) -> list[dict]:
+    async def get_unconverted_manual_deposits(self) -> list[dict]:
         """Detalle de los depósitos aprobados y aún sin convertir (para /exposicion_cup)."""
-        with self._conn() as conn:
-            rows = conn.execute(
+        async with self._conn() as conn:
+            rows = await conn.fetch(
                 "SELECT * FROM manual_deposits "
                 "WHERE status = 'approved' AND converted_to_usdt = 0 "
                 "ORDER BY created_at ASC"
-            ).fetchall()
+            )
             return [dict(r) for r in rows]
 
-    def mark_manual_deposits_converted(self, dep_ids: list[int]):
+    async def mark_manual_deposits_converted(self, dep_ids: list[int]):
         """Marca uno o más depósitos como ya convertidos a USDT real."""
         if not dep_ids:
             return
-        with self._conn() as conn:
-            placeholders = ",".join("%s" for _ in dep_ids)
-            conn.execute(
+        async with self._conn() as conn:
+            placeholders = ",".join(f"${i + 1}" for i in range(len(dep_ids)))
+            await conn.execute(
                 f"UPDATE manual_deposits SET converted_to_usdt = 1, "
                 f"updated_at = NOW() WHERE id IN ({placeholders})",
-                dep_ids,
+                *dep_ids,
             )
 
     # ── Retiros manuales (CUP vía Transfermóvil / EnZona) ────────────────────
 
-    def create_manual_withdrawal(
+    async def create_manual_withdrawal(
         self, user_id: int, method: str, destination: str,
         amount_usd: float, fee_usd: float, net_usd: float,
         amount_cup: int, cup_rate: float,
     ) -> dict:
         """Crea la solicitud y genera su reference_code (WD-000123) a partir del id."""
-        with self._conn() as conn:
-            cur = conn.execute(
+        async with self._conn() as conn:
+            wd_id = await conn.fetchval(
                 "INSERT INTO manual_withdrawals "
                 "(user_id, method, destination, amount_usd, fee_usd, net_usd, "
                 "amount_cup, cup_rate, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending_review') RETURNING id",
-                (user_id, method, destination, amount_usd, fee_usd, net_usd,
-                 amount_cup, cup_rate),
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending_review') RETURNING id",
+                user_id, method, destination, amount_usd, fee_usd, net_usd,
+                amount_cup, cup_rate,
             )
-            wd_id = cur.fetchone()["id"]
             reference_code = f"WD-{wd_id:06d}"
-            conn.execute(
-                "UPDATE manual_withdrawals SET reference_code = %s WHERE id = %s",
-                (reference_code, wd_id),
+            await conn.execute(
+                "UPDATE manual_withdrawals SET reference_code = $1 WHERE id = $2",
+                reference_code, wd_id,
             )
             return {"id": wd_id, "reference_code": reference_code}
 
-    def set_manual_withdrawal_status(self, wd_id: int, status: str, reviewed_by: int = None):
+    async def set_manual_withdrawal_status(self, wd_id: int, status: str, reviewed_by: int = None):
         kwargs = {"status": status, "updated_at": datetime.utcnow()}
         if reviewed_by is not None:
             kwargs["reviewed_by"] = reviewed_by
-        sets = ", ".join(f"{k} = %s" for k in kwargs)
-        values = list(kwargs.values()) + [wd_id]
-        with self._conn() as conn:
-            conn.execute(f"UPDATE manual_withdrawals SET {sets} WHERE id = %s", values)
+        sets, values, next_idx = _set_clause(kwargs)
+        async with self._conn() as conn:
+            await conn.execute(
+                f"UPDATE manual_withdrawals SET {sets} WHERE id = ${next_idx}",
+                *values, wd_id,
+            )
 
-    def get_manual_withdrawal_by_id(self, wd_id: int) -> Optional[dict]:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM manual_withdrawals WHERE id = %s", (wd_id,)
-            ).fetchone()
+    async def get_manual_withdrawal_by_id(self, wd_id: int) -> Optional[dict]:
+        async with self._conn() as conn:
+            row = await conn.fetchrow("SELECT * FROM manual_withdrawals WHERE id = $1", wd_id)
             return dict(row) if row else None
 
-    def get_pending_manual_withdrawal(self, user_id: int) -> Optional[dict]:
+    async def get_pending_manual_withdrawal(self, user_id: int) -> Optional[dict]:
         """Igual que get_pending_manual_deposit pero para retiros: máximo 1 solicitud en curso."""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM manual_withdrawals WHERE user_id = %s "
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM manual_withdrawals WHERE user_id = $1 "
                 "AND status = 'pending_review' ORDER BY created_at DESC LIMIT 1",
-                (user_id,),
-            ).fetchone()
+                user_id,
+            )
             return dict(row) if row else None
 
-    def get_by_id(self, tx_id: int) -> Optional[dict]:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM transactions WHERE id = %s", (tx_id,)
-            ).fetchone()
+    async def get_by_id(self, tx_id: int) -> Optional[dict]:
+        async with self._conn() as conn:
+            row = await conn.fetchrow("SELECT * FROM transactions WHERE id = $1", tx_id)
             return dict(row) if row else None
 
-    def get_by_order_id(self, order_id: str) -> Optional[dict]:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM transactions WHERE order_id = %s", (order_id,)
-            ).fetchone()
+    async def get_by_order_id(self, order_id: str) -> Optional[dict]:
+        async with self._conn() as conn:
+            row = await conn.fetchrow("SELECT * FROM transactions WHERE order_id = $1", order_id)
             return dict(row) if row else None
 
-    def get_user_transactions(self, user_id: int, limit: int = 10) -> list[dict]:
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM transactions WHERE user_id = %s "
-                "ORDER BY created_at DESC LIMIT %s",
-                (user_id, limit),
-            ).fetchall()
+    async def get_user_transactions(self, user_id: int, limit: int = 10) -> list[dict]:
+        async with self._conn() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM transactions WHERE user_id = $1 "
+                "ORDER BY created_at DESC LIMIT $2",
+                user_id, limit,
+            )
             return [dict(r) for r in rows]
 
-    def get_pending_transactions(self) -> list[dict]:
+    async def get_pending_transactions(self) -> list[dict]:
         """Transacciones en estados activos (útil para recovery al reiniciar)."""
-        with self._conn() as conn:
-            rows = conn.execute(
+        async with self._conn() as conn:
+            rows = await conn.fetch(
                 "SELECT * FROM transactions WHERE status IN ('pending', 'paid', 'number_assigned')"
-            ).fetchall()
+            )
             return [dict(r) for r in rows]
 
-    def get_abuse_strikes(self, user_id: int, hours: int) -> int:
+    async def get_abuse_strikes(self, user_id: int, hours: int) -> int:
         """
         Cuenta cuántas veces este usuario recibió un número y la operación
         terminó SIN completarse en las últimas `hours` horas. Usado por
         handlers.cb_new_purchase para bloquear temporalmente abuso.
         """
         cutoff = datetime.utcnow() - timedelta(hours=hours)
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) AS c FROM transactions "
-                "WHERE user_id = %s AND phone_number IS NOT NULL "
+        async with self._conn() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM transactions "
+                "WHERE user_id = $1 AND phone_number IS NOT NULL "
                 "AND status IN ('sms_timeout', 'refunded', 'error') "
-                "AND created_at >= %s",
-                (user_id, cutoff),
-            ).fetchone()
-            return int(row["c"] or 0)
+                "AND created_at >= $2",
+                user_id, cutoff,
+            )
+            return int(count or 0)
 
-    def get_stats(self, days: Optional[int] = None) -> dict:
+    async def get_stats(self, days: Optional[int] = None) -> dict:
         """Métricas agregadas para el comando de admin /stats."""
         where = ""
-        params: list = []
+        cutoff = None
         if days is not None:
-            where = "WHERE created_at >= %s"
-            params.append(datetime.utcnow() - timedelta(days=int(days)))
+            where = "WHERE created_at >= $1"
+            cutoff = datetime.utcnow() - timedelta(days=int(days))
 
-        with self._conn() as conn:
-            status_rows = conn.execute(
+        async with self._conn() as conn:
+            status_params = (cutoff,) if cutoff is not None else ()
+            status_rows = await conn.fetch(
                 f"SELECT status, COUNT(*) AS c FROM transactions {where} GROUP BY status",
-                params,
-            ).fetchall()
+                *status_params,
+            )
             by_status = {r["status"]: r["c"] for r in status_rows}
 
             completed_where = f"{where}{' AND' if where else 'WHERE'} status = 'completed'"
-            revenue_row = conn.execute(
+            revenue_row = await conn.fetchrow(
                 f"SELECT COALESCE(SUM(amount_usd),0) AS revenue, "
                 f"COALESCE(SUM(cost_herosms),0) AS cost, COUNT(*) AS n "
                 f"FROM transactions {completed_where}",
-                params,
-            ).fetchone()
+                *status_params,
+            )
 
         revenue   = float(revenue_row["revenue"] or 0)
         cost      = float(revenue_row["cost"] or 0)
@@ -921,17 +984,17 @@ class Database:
             "avg_ticket_usd":   round(revenue / completed, 2) if completed else 0.0,
         }
 
-    def get_recent_sales(self, limit: int = 10) -> list[dict]:
+    async def get_recent_sales(self, limit: int = 10) -> list[dict]:
         """Últimas ventas completadas de TODOS los usuarios (para /ventas)."""
-        with self._conn() as conn:
-            rows = conn.execute(
+        async with self._conn() as conn:
+            rows = await conn.fetch(
                 "SELECT * FROM transactions WHERE status = 'completed' "
-                "ORDER BY updated_at DESC LIMIT %s",
-                (limit,),
-            ).fetchall()
+                "ORDER BY updated_at DESC LIMIT $1",
+                limit,
+            )
             return [dict(r) for r in rows]
 
-    def get_country_success_stats(self, service: str, min_samples: int = 5) -> dict:
+    async def get_country_success_stats(self, service: str, min_samples: int = 5) -> dict:
         """
         Tasa de éxito por país para un servicio dado (ver docstring de la
         versión anterior en git history para el detalle completo del
@@ -942,12 +1005,12 @@ class Database:
                COUNT(*) AS attempts,
                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed
         FROM transactions
-        WHERE service = %s AND phone_number IS NOT NULL
+        WHERE service = $1 AND phone_number IS NOT NULL
         GROUP BY country
-        HAVING COUNT(*) >= %s
+        HAVING COUNT(*) >= $2
         """
-        with self._conn() as conn:
-            rows = conn.execute(sql, (service, min_samples)).fetchall()
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, service, min_samples)
 
         return {
             r["country"]: {
@@ -960,23 +1023,22 @@ class Database:
 
     # ── Outbox de notificaciones (ver outbox.py) ──────────────────────────────
 
-    def enqueue_outbox(self, chat_id: int, text: str, reply_markup: Optional[str] = None) -> int:
+    async def enqueue_outbox(self, chat_id: int, text: str, reply_markup: Optional[str] = None) -> int:
         """Encola un mensaje ANTES de intentar enviarlo (sobrevive a un crash del proceso)."""
-        with self._conn() as conn:
-            cur = conn.execute(
-                "INSERT INTO outbox (chat_id, text, reply_markup) VALUES (%s, %s, %s) RETURNING id",
-                (chat_id, text, reply_markup),
-            )
-            return cur.fetchone()["id"]
-
-    def mark_outbox_sent(self, outbox_id: int):
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE outbox SET status = 'sent', updated_at = NOW() WHERE id = %s",
-                (outbox_id,),
+        async with self._conn() as conn:
+            return await conn.fetchval(
+                "INSERT INTO outbox (chat_id, text, reply_markup) VALUES ($1, $2, $3) RETURNING id",
+                chat_id, text, reply_markup,
             )
 
-    def mark_outbox_attempt_failed(
+    async def mark_outbox_sent(self, outbox_id: int):
+        async with self._conn() as conn:
+            await conn.execute(
+                "UPDATE outbox SET status = 'sent', updated_at = NOW() WHERE id = $1",
+                outbox_id,
+            )
+
+    async def mark_outbox_attempt_failed(
         self, outbox_id: int, error: str, next_attempt_at, give_up: bool = False,
     ):
         """
@@ -984,25 +1046,25 @@ class Database:
         "YYYY-MM-DD HH:MM:SS" o un datetime (outbox.py manda un string,
         Postgres lo castea solo al insertar en una columna TIMESTAMPTZ).
         """
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE outbox SET attempts = attempts + 1, last_error = %s, "
-                "status = %s, next_attempt_at = %s, updated_at = NOW() WHERE id = %s",
-                (error, "dead" if give_up else "pending", next_attempt_at, outbox_id),
+        async with self._conn() as conn:
+            await conn.execute(
+                "UPDATE outbox SET attempts = attempts + 1, last_error = $1, "
+                "status = $2, next_attempt_at = $3, updated_at = NOW() WHERE id = $4",
+                error, "dead" if give_up else "pending", next_attempt_at, outbox_id,
             )
 
-    def get_due_outbox(self, limit: int = 200) -> list[dict]:
+    async def get_due_outbox(self, limit: int = 200) -> list[dict]:
         """Mensajes 'pending' cuyo próximo intento ya venció, los más viejos primero."""
-        with self._conn() as conn:
-            rows = conn.execute(
+        async with self._conn() as conn:
+            rows = await conn.fetch(
                 "SELECT * FROM outbox WHERE status = 'pending' "
                 "AND next_attempt_at <= NOW() "
-                "ORDER BY created_at ASC LIMIT %s",
-                (limit,),
-            ).fetchall()
+                "ORDER BY created_at ASC LIMIT $1",
+                limit,
+            )
             return [dict(r) for r in rows]
 
-    def get_top_services(self, limit: int = 8, days: Optional[int] = None) -> list[dict]:
+    async def get_top_services(self, limit: int = 8, days: Optional[int] = None) -> list[dict]:
         """Servicios más comprados (solo compras EXITOSAS), de mayor a menor cantidad."""
         sql = """
         SELECT service AS code, service_name AS name, COUNT(*) AS count
@@ -1011,15 +1073,18 @@ class Database:
         """
         params: list = []
         if days is not None:
-            sql += " AND created_at >= %s"
             params.append(datetime.utcnow() - timedelta(days=int(days)))
-        sql += " GROUP BY service, service_name ORDER BY count DESC LIMIT %s"
+            sql += f" AND created_at >= ${len(params)}"
+        sql += " GROUP BY service, service_name ORDER BY count DESC"
         params.append(limit)
+        sql += f" LIMIT ${len(params)}"
 
-        with self._conn() as conn:
-            rows = conn.execute(sql, params).fetchall()
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, *params)
             return [dict(r) for r in rows]
 
 
-# Instancia global compartida
+# Instancia global compartida. OJO: hay que llamar `await db.connect()` una
+# vez (ver main.py) antes de usar cualquier método — acá solo se arma el
+# objeto, todavía sin pool de conexiones.
 db = Database()
