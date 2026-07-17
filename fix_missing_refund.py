@@ -2,8 +2,8 @@
 fix_missing_refund.py - Acredita manualmente como saldo interno un reembolso
 que falló ANTES de que existiera el sistema de saldo interno (wallet virtual).
 
-Uso (ejecutar en el mismo directorio que database.py, config.py y
-sms_reseller.db, es decir junto a tus archivos reales del bot):
+Uso (ejecutar en el mismo directorio que database.py y config.py, con
+DATABASE_URL apuntando a tu base Neon real):
 
     python fix_missing_refund.py <activation_id_o_id_de_tx>
 
@@ -13,36 +13,44 @@ Ejemplo con el caso real:
 Busca la transacción, muestra sus datos, te pregunta si quieres acreditar
 el monto completo o con el mismo descuento (REFUND_FEE_PCT) que se aplica
 normalmente en timeouts de SMS, y recién ahí hace el cambio.
+
+NOTA: este script quedó desactualizado tras la migración de la base a
+Postgres/Neon + asyncpg (ver database.py) — usaba psycopg2 sincrónico con
+placeholders "%s". Esta versión usa `await db.connect()` y placeholders
+"$1, $2, ..." de asyncpg, igual que el resto del bot.
 """
+import asyncio
 import sys
 
 from database import db
 from config import REFUND_FEE_PCT
 
 
-def find_tx(identifier: str):
-    with db._conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM transactions WHERE activation_id = %s", (identifier,)
-        ).fetchone()
+async def find_tx(identifier: str):
+    async with db._conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM transactions WHERE activation_id = $1", identifier
+        )
         if row:
             return dict(row)
         if identifier.isdigit():
-            row = conn.execute(
-                "SELECT * FROM transactions WHERE id = %s", (int(identifier),)
-            ).fetchone()
+            row = await conn.fetchrow(
+                "SELECT * FROM transactions WHERE id = $1", int(identifier)
+            )
             if row:
                 return dict(row)
     return None
 
 
-def main():
+async def main():
     if len(sys.argv) != 2:
         print("Uso: python fix_missing_refund.py <activation_id_o_id_de_tx>")
         sys.exit(1)
 
     identifier = sys.argv[1]
-    tx = find_tx(identifier)
+
+    await db.connect()
+    tx = await find_tx(identifier)
     if not tx:
         print(f"No se encontró ninguna transacción con activation_id/id = {identifier}")
         sys.exit(1)
@@ -79,16 +87,18 @@ def main():
         print("Cancelado, no se hizo ningún cambio.")
         return
 
-    new_balance = db.credit_balance(
+    new_balance = await db.credit_balance(
         tx["user_id"], amount, tx["id"],
         reason=f"Recuperación manual - reembolso fallido tx={tx['id']}",
     )
-    db.set_status(tx["id"], "refunded")
+    await db.set_status(tx["id"], "refunded")
 
     print(f"\n✅ Acreditados {amount:.2f} USD.")
     print(f"   Nuevo saldo del usuario {tx['user_id']}: {new_balance:.2f} USD")
     print("   El usuario ya puede verlo con /saldo en el bot.")
 
+    await db.close()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

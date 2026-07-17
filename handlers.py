@@ -296,7 +296,7 @@ def _tx_summary_line(tx: dict) -> str:
     )
 
 
-def _credit_refund_for_tx(user_id: int, tx: dict, amount_usd: float, tx_id: int, reason: str) -> float:
+async def _credit_refund_for_tx(user_id: int, tx: dict, amount_usd: float, tx_id: int, reason: str) -> float:
     """
     Acredita un reembolso ligado a `tx` respetando su origen (cripto/CUP/
     mixto, ver database.Database.get_purchase_origin_ratios) en vez de
@@ -308,19 +308,19 @@ def _credit_refund_for_tx(user_id: int, tx: dict, amount_usd: float, tx_id: int,
 
     Devuelve el saldo TOTAL (cripto + cup) después de acreditar.
     """
-    ratios = db.get_purchase_origin_ratios(tx)
+    ratios = await db.get_purchase_origin_ratios(tx)
     new_balance = None
     for origin, frac in ratios.items():
         portion = round(amount_usd * frac, 4)
         if portion <= 0:
             continue
-        new_balance = db.credit_balance(
+        new_balance = await db.credit_balance(
             user_id, portion, tx_id, reason=f"{reason} ({origin})", origin=origin,
         )
     if new_balance is None:
         # ratios vacío o todo redondeó a 0 (montos muy chicos): fallback
         # simple, no debería pasar en la práctica.
-        new_balance = db.credit_balance(user_id, amount_usd, tx_id, reason=reason)
+        new_balance = await db.credit_balance(user_id, amount_usd, tx_id, reason=reason)
     return new_balance
 
 
@@ -330,7 +330,7 @@ def _credit_refund_for_tx(user_id: int, tx: dict, amount_usd: float, tx_id: int,
 async def cmd_start(message: Message, state: FSMContext):
     """Punto de entrada principal."""
     await state.clear()
-    db.register_user(
+    await db.register_user(
         message.from_user.id,
         username=message.from_user.username,
         first_name=message.from_user.first_name,
@@ -496,7 +496,7 @@ async def _send_historial(user_id: int, answer_func):
     vez de un `Message`, porque en un callback `call.message.from_user` es
     el BOT (dueño del mensaje con el teclado), no el usuario real -> usar
     `message.from_user.id` ahí daría siempre resultados vacíos/incorrectos."""
-    txns = db.get_user_transactions(user_id, limit=5)
+    txns = await db.get_user_transactions(user_id, limit=5)
     if not txns:
         await answer_func("📋 No tienes transacciones registradas.")
         return
@@ -568,7 +568,7 @@ async def msg_contact_shared(message: Message):
         )
         return
 
-    db.set_phone_number(message.from_user.id, contact.phone_number)
+    await db.set_phone_number(message.from_user.id, contact.phone_number)
     await message.answer(
         "✅ Listo, tu contacto quedó asociado a tu cuenta.",
         reply_markup=ReplyKeyboardRemove(),
@@ -588,7 +588,7 @@ async def _send_saldo(user_id: int, answer_func):
     """Lógica compartida entre /saldo (mensaje) y el botón 'Mi saldo'
     (callback) — mismo motivo que _send_historial: evita depender de
     `message.from_user` cuando el llamador es un callback."""
-    breakdown = db.get_balance_breakdown(user_id)
+    breakdown = await db.get_balance_breakdown(user_id)
     total_available  = floor_to_cents(breakdown["total"])
     crypto_available = floor_to_cents(breakdown["crypto"])
     cup_available    = floor_to_cents(breakdown["cup"])
@@ -665,9 +665,9 @@ async def _send_stats(days: int | None, answer_func):
     admin (ver cb_admin_stats). Sin días -> histórico completo."""
     period_label = f"últimos {days} días" if days else "histórico completo"
 
-    stats = db.get_stats(days=days)
+    stats = await db.get_stats(days=days)
     by_status = stats["by_status"]
-    user_count = db.get_user_count()
+    user_count = await db.get_user_count()
 
     lines = [
         f"📊 <b>Estadísticas</b> ({period_label})\n",
@@ -699,7 +699,7 @@ async def cmd_ventas(message: Message):
 
 async def _send_ventas(limit: int, answer_func):
     """Lógica compartida entre /ventas [n] y el botón '💵 Ventas' del panel admin."""
-    sales = db.get_recent_sales(limit=limit)
+    sales = await db.get_recent_sales(limit=limit)
     if not sales:
         await answer_func("📋 Todavía no hay ventas completadas.")
         return
@@ -723,7 +723,7 @@ async def cmd_pendientes(message: Message):
 
 async def _send_pendientes(answer_func):
     """Lógica compartida entre /pendientes y el botón '🔄 Pendientes' del panel admin."""
-    pending = db.get_pending_transactions()
+    pending = await db.get_pending_transactions()
     if not pending:
         await answer_func("✅ No hay operaciones activas en este momento.")
         return
@@ -755,12 +755,12 @@ async def cmd_detalle(message: Message):
         await message.answer("Uso: <code>/detalle &lt;tx_id&gt;</code>", parse_mode="HTML")
         return
 
-    tx = db.get_by_id(int(args[1]))
+    tx = await db.get_by_id(int(args[1]))
     if not tx:
         await message.answer(f"No existe ninguna transacción con id {args[1]}.")
         return
 
-    user = db.get_user(tx["user_id"])
+    user = await db.get_user(tx["user_id"])
     user_line = f"<code>{tx['user_id']}</code>"
     if user:
         uname = f"@{user['username']}" if user.get("username") else "(sin username)"
@@ -884,7 +884,7 @@ async def cmd_exposicion_cup(message: Message):
 
 async def _send_exposicion_cup(answer_func):
     """Lógica compartida entre /exposicion_cup y el botón '🇨🇺 Exposición CUP' del panel admin."""
-    exposure = db.get_cup_exposure()
+    exposure = await db.get_cup_exposure()
     if exposure["count"] == 0:
         await answer_func("✅ Sin exposición: todo el CUP aprobado ya está marcado como convertido.")
         return
@@ -903,7 +903,7 @@ async def _send_exposicion_cup(answer_func):
             "Considera convertir pronto."
         )
 
-    details = db.get_unconverted_manual_deposits()
+    details = await db.get_unconverted_manual_deposits()
     lines.append("\n<b>Detalle:</b>")
     for d in details[:20]:
         cup_str = f"{d['amount_cup']:,}".replace(",", " ") if d.get("amount_cup") else "?"
@@ -933,7 +933,7 @@ async def cmd_convertido(message: Message):
         )
         return
 
-    db.mark_manual_deposits_converted(ids)
+    await db.mark_manual_deposits_converted(ids)
     await message.answer(f"✅ Marcados como convertidos: {', '.join(str(i) for i in ids)}")
 
 
@@ -970,7 +970,7 @@ async def cmd_set_tipo(message: Message):
         )
         return
 
-    if not db.set_account_type(user_id, tipo):
+    if not await db.set_account_type(user_id, tipo):
         await message.answer(
             f"⚠️ El usuario <code>{user_id}</code> nunca corrió /start, no se pudo asignar.",
             parse_mode="HTML",
@@ -1003,7 +1003,7 @@ async def cmd_set_pais(message: Message):
     pais_raw = args[2].strip()
     pais = None if pais_raw.lower() == "ninguno" else pais_raw
 
-    if not db.set_country(user_id, pais):
+    if not await db.set_country(user_id, pais):
         await message.answer(
             f"⚠️ El usuario <code>{user_id}</code> nunca corrió /start, no se pudo asignar.",
             parse_mode="HTML",
@@ -1028,7 +1028,7 @@ async def cb_new_purchase(call: CallbackQuery, state: FSMContext):
     # revisa acá, ANTES de dejarlo elegir servicio, para no gastar ni una
     # llamada a HeroSMS/CCPayment en un intento que probablemente se
     # abandonará de nuevo.
-    strikes = db.get_abuse_strikes(call.from_user.id, ABUSE_WINDOW_HOURS)
+    strikes = await db.get_abuse_strikes(call.from_user.id, ABUSE_WINDOW_HOURS)
     if strikes >= ABUSE_MAX_STRIKES:
         await call.message.answer(
             f"⏳ <b>Compras temporalmente restringidas</b>\n\n"
@@ -1043,7 +1043,7 @@ async def cb_new_purchase(call: CallbackQuery, state: FSMContext):
     # Mostramos el ranking real de más comprados si ya hay historial;
     # si el bot es nuevo (sin compras completadas todavía) caemos al
     # listado estático de config.SERVICES para no mostrar nada vacío.
-    top = db.get_top_services(limit=8)
+    top = await db.get_top_services(limit=8)
     keyboard = top_services_keyboard(top) if top else services_keyboard(SERVICES)
 
     await call.message.answer(
@@ -1074,8 +1074,8 @@ async def cb_my_profile(call: CallbackQuery):
     criterio que welcome_card.generate_welcome_card)."""
     await _safe_call_answer(call)
     user = call.from_user
-    user_row = db.get_user(user.id)
-    orders_count = db.count_completed_orders(user.id)
+    user_row = await db.get_user(user.id)
+    orders_count = await db.count_completed_orders(user.id)
 
     lines = ["👤 <b>Tu cuenta</b>\n", f"ID: <code>{user.id}</code>"]
     if user.username:
@@ -1099,7 +1099,7 @@ async def cb_my_country(call: CallbackQuery):
     aquí mismo -> solo se muestra el valor actual (o se avisa que aún no
     fue asignado)."""
     await _safe_call_answer(call)
-    user_row = db.get_user(call.from_user.id)
+    user_row = await db.get_user(call.from_user.id)
     country = user_row.get("country") if user_row else None
     if country:
         await call.message.answer(f"🌍 Tu país registrado: <b>{country}</b>", parse_mode="HTML")
@@ -1169,7 +1169,7 @@ async def cb_select_service(call: CallbackQuery, state: FSMContext):
         service_name=service_name,
         countries=countries,
     )
-    success_stats = db.get_country_success_stats(service_code)
+    success_stats = await db.get_country_success_stats(service_code)
     await call.message.answer(
         MSG_SELECT_COUNTRY,
         parse_mode="HTML",
@@ -1224,7 +1224,7 @@ async def cb_select_country(call: CallbackQuery, state: FSMContext):
     await _collapse_selection(call, f"✅ País elegido: {country_name}")
 
     # Crear registro en BD con el precio base en USD
-    tx_id = db.create_transaction(
+    tx_id = await db.create_transaction(
         user_id      = call.from_user.id,
         service      = service_code,
         service_name = service_name,
@@ -1295,7 +1295,7 @@ async def _quote_and_show_currency_menu(
     options.sort(key=lambda o: not o["low_fee"])
 
     if not options:
-        db.set_status(tx_id, "error")
+        await db.set_status(tx_id, "error")
         await message.answer(
             "😔 No pudimos obtener cotizaciones de pago en este momento. "
             "Intenta de nuevo en unos minutos con /start.",
@@ -1306,7 +1306,7 @@ async def _quote_and_show_currency_menu(
     await state.update_data(currency_options=options)
     await state.set_state(PurchaseFlow.selecting_currency)
 
-    balance_usd = db.get_balance(user_id)
+    balance_usd = await db.get_balance(user_id)
     await message.answer(
         MSG_SELECT_CURRENCY.format(price_usd=format_amount(price_usd, "USD")),
         parse_mode="HTML",
@@ -1333,9 +1333,9 @@ async def cb_pay_balance(call: CallbackQuery, state: FSMContext):
     price_usd = data["price_usd"]
     user_id   = call.from_user.id
 
-    ok = db.debit_balance(user_id, price_usd, tx_id, reason=f"Pago con saldo tx={tx_id}")
+    ok = await db.debit_balance(user_id, price_usd, tx_id, reason=f"Pago con saldo tx={tx_id}")
     if not ok:
-        balance = db.get_balance(user_id)
+        balance = await db.get_balance(user_id)
         await call.message.answer(
             f"😕 Tu saldo actual ({format_amount(balance, 'USD')}) ya no alcanza "
             f"para esta compra ({format_amount(price_usd, 'USD')}). Elige otra "
@@ -1346,11 +1346,11 @@ async def cb_pay_balance(call: CallbackQuery, state: FSMContext):
     await _collapse_selection(call, "✅ Pagando con saldo interno...")
 
     order_id = f"balance-{tx_id}"
-    db.set_order_info(
+    await db.set_order_info(
         tx_id, order_id, pay_address="", currency="BALANCE", network="BALANCE",
         pay_amount=price_usd, token_id="BALANCE",
     )
-    db.set_status(tx_id, "paid")
+    await db.set_status(tx_id, "paid")
 
     await state.update_data(
         refund_address = "",
@@ -1363,10 +1363,10 @@ async def cb_pay_balance(call: CallbackQuery, state: FSMContext):
 
     await call.message.answer(
         f"✅ Pagado con saldo interno ({format_amount(price_usd, 'USD')}). "
-        f"Saldo restante: {format_amount(db.get_balance(user_id), 'USD')}.\n"
+        f"Saldo restante: {format_amount(await db.get_balance(user_id), 'USD')}.\n"
         "Obteniendo tu número virtual..."
     )
-    if tx := db.get_by_id(tx_id):
+    if tx := await db.get_by_id(tx_id):
         await _notify_admin(bot=call.bot, text=f"💰 <b>Pago con saldo</b>\n{_tx_summary_line(tx)}")
 
     await _handle_after_payment(call.bot, call.message.chat.id, state, tx_id)
@@ -1401,7 +1401,7 @@ async def cb_select_currency(call: CallbackQuery, state: FSMContext):
     order = await ccpay.create_order(chosen["amount"], token_id, memo=memo)
 
     if not order or not order.get("orderId") or not order.get("payAddress"):
-        db.set_status(tx_id, "error")
+        await db.set_status(tx_id, "error")
         await call.message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
         await state.clear()
         return
@@ -1410,7 +1410,7 @@ async def cb_select_currency(call: CallbackQuery, state: FSMContext):
     pay_address = order["payAddress"]
     pay_amount  = order["payAmount"] or chosen["amount"]
 
-    db.set_order_info(tx_id, order_id, pay_address, currency, network, pay_amount, token_id=token_id)
+    await db.set_order_info(tx_id, order_id, pay_address, currency, network, pay_amount, token_id=token_id)
 
     await _collapse_selection(call, f"✅ Método de pago elegido: {currency_label} (red {network})")
 
@@ -1521,7 +1521,7 @@ async def _start_manual_purchase_payment(message: Message, state: FSMContext, me
     # Se guarda la "orden" directo en la transacción (igual que con cripto:
     # order_id/pay_address/pay_amount/currency), sin crear ningún registro
     # nuevo — el tx_id YA identifica la operación de punta a punta.
-    db.set_order_info(
+    await db.set_order_info(
         tx_id, order_id=f"cup-{tx_id}", pay_address=method["account"],
         currency="CUP", network="MANUAL", pay_amount=amount_cup, token_id="CUP_MANUAL",
     )
@@ -1572,11 +1572,11 @@ async def msg_purchase_manual_proof(message: Message, state: FSMContext):
     # Antes esto no se guardaba en ningún lado (ver docstring de
     # db.set_purchase_proof): quedaba solo como mensaje en el canal de
     # admin, sin poder cruzarlo con otras órdenes.
-    db.set_purchase_proof(
+    await db.set_purchase_proof(
         tx_id, proof_file_id=proof_file_id,
         proof_file_unique_id=proof_file_unique_id, proof_text=proof_text,
     )
-    reused = db.find_reused_proof(proof_file_unique_id, exclude_tx_id=tx_id)
+    reused = await db.find_reused_proof(proof_file_unique_id, exclude_tx_id=tx_id)
 
     await message.answer(
         f"✅ Comprobante recibido (código <code>{reference_code}</code>).\n"
@@ -1585,7 +1585,7 @@ async def msg_purchase_manual_proof(message: Message, state: FSMContext):
         parse_mode="HTML",
     )
 
-    tx = db.get_by_id(tx_id)
+    tx = await db.get_by_id(tx_id)
     method_name = MANUAL_PAYMENT_METHODS.get(data.get("manual_method_code"), {}).get("name", "CUP")
     amount_cup_str = f"{data.get('manual_amount_cup', 0):,}".replace(",", " ")
     caption = (
@@ -1627,7 +1627,7 @@ async def cb_admin_approve_purchase_cup(call: CallbackQuery, fsm_storage):
         return
 
     tx_id = int(call.data.split(":", 1)[1])
-    tx = db.get_by_id(tx_id)
+    tx = await db.get_by_id(tx_id)
     if not tx:
         await _safe_call_answer(call, "No encontrada.", show_alert=True)
         return
@@ -1635,11 +1635,11 @@ async def cb_admin_approve_purchase_cup(call: CallbackQuery, fsm_storage):
         await _safe_call_answer(call, f"Ya estaba en estado '{tx['status']}'.", show_alert=True)
         return
 
-    db.set_status(tx_id, "paid")
+    await db.set_status(tx_id, "paid")
     await _safe_call_answer(call, "Aprobado ✅")
     await _mark_admin_message_resolved(call.message, f"\n\n✅ Aprobado por {call.from_user.id}")
 
-    tx = db.get_by_id(tx_id)
+    tx = await db.get_by_id(tx_id)
     await resume_transaction(call.bot, fsm_storage, tx)
 
 
@@ -1650,7 +1650,7 @@ async def cb_admin_reject_purchase_cup(call: CallbackQuery):
         return
 
     tx_id = int(call.data.split(":", 1)[1])
-    tx = db.get_by_id(tx_id)
+    tx = await db.get_by_id(tx_id)
     if not tx:
         await _safe_call_answer(call, "No encontrada.", show_alert=True)
         return
@@ -1658,7 +1658,7 @@ async def cb_admin_reject_purchase_cup(call: CallbackQuery):
         await _safe_call_answer(call, f"Ya estaba en estado '{tx['status']}'.", show_alert=True)
         return
 
-    db.set_status(tx_id, "error")
+    await db.set_status(tx_id, "error")
     await _safe_call_answer(call, "Rechazado ❌")
     await _mark_admin_message_resolved(call.message, f"\n\n❌ Rechazado por {call.from_user.id}")
 
@@ -1685,7 +1685,7 @@ async def msg_refund_address(message: Message, state: FSMContext):
     if message.text and message.text.strip().lower() != "/skip":
         refund_address = message.text.strip()
 
-    db.set_refund_address(data["tx_id"], refund_address)
+    await db.set_refund_address(data["tx_id"], refund_address)
 
     await state.update_data(
         refund_address          = refund_address,
@@ -1762,7 +1762,7 @@ async def _poll_payment(
         # expiredAt) así que lo único que controlamos es nuestro lado: si
         # para cuando canceló YA había enviado el pago, lo reembolsamos
         # automáticamente en vez de dejarlo sin resolver.
-        tx = db.get_by_id(tx_id)
+        tx = await db.get_by_id(tx_id)
         if tx and tx["status"] == "cancelled":
             await _handle_cancelled_order(bot, chat_id, tx_id, order_id)
             return
@@ -1770,17 +1770,17 @@ async def _poll_payment(
         status = await ccpay.get_order_status(order_id)
 
         if status == ccpay.ORDER_STATUS_COMPLETED:
-            db.set_status(tx_id, "paid")
+            await db.set_status(tx_id, "paid")
             await _safe_send(bot, chat_id, MSG_PAYMENT_CONFIRMED)
-            if tx := db.get_by_id(tx_id):
+            if tx := await db.get_by_id(tx_id):
                 await _notify_admin(bot, f"💰 <b>Pago confirmado</b>\n{_tx_summary_line(tx)}")
             await _handle_after_payment(bot, chat_id, state, tx_id)
             return
 
         if status in (ccpay.ORDER_STATUS_EXPIRED, ccpay.ORDER_STATUS_CANCELLED):
-            db.set_status(tx_id, "expired")
+            await db.set_status(tx_id, "expired")
             await _safe_send(bot, chat_id, MSG_PAYMENT_TIMEOUT)
-            if tx := db.get_by_id(tx_id):
+            if tx := await db.get_by_id(tx_id):
                 await _notify_admin(bot, f"⏰ <b>Pago expirado/cancelado</b>\n{_tx_summary_line(tx)}")
             await state.clear()
             return
@@ -1789,9 +1789,9 @@ async def _poll_payment(
         logger.debug("Pago pendiente (tx=%s, elapsed=%ds)", tx_id, elapsed)
 
     # Tiempo agotado
-    db.set_status(tx_id, "expired")
+    await db.set_status(tx_id, "expired")
     await _safe_send(bot, chat_id, MSG_PAYMENT_TIMEOUT)
-    if tx := db.get_by_id(tx_id):
+    if tx := await db.get_by_id(tx_id):
         await _notify_admin(bot, f"⏰ <b>Pago expirado (timeout)</b>\n{_tx_summary_line(tx)}")
     await state.clear()
 
@@ -1811,14 +1811,14 @@ async def _handle_cancelled_order(bot, chat_id: int, tx_id: int, order_id: str):
         logger.info("Orden %s (tx=%s) cancelada por el usuario, sin pago recibido.", order_id, tx_id)
         return
 
-    tx = db.get_by_id(tx_id)
+    tx = await db.get_by_id(tx_id)
     if not tx:
         return
 
-    new_balance = db.credit_balance(
+    new_balance = await db.credit_balance(
         tx["user_id"], tx["amount_usd"], tx_id, reason=f"Cancelación con pago tx={tx_id}",
     )
-    db.set_status(tx_id, "refunded")
+    await db.set_status(tx_id, "refunded")
 
     await _safe_send(
         bot, chat_id,
@@ -1858,11 +1858,11 @@ async def _handle_after_payment(bot, chat_id: int, state: FSMContext, tx_id: int
         # pagar porque no es una transferencia on-chain, se acredita al
         # instante y sin fricción.
         price_usd = data.get("price_usd", pay_amount)
-        tx_for_origin = db.get_by_id(tx_id) or {}
-        new_balance = _credit_refund_for_tx(
+        tx_for_origin = await db.get_by_id(tx_id) or {}
+        new_balance = await _credit_refund_for_tx(
             chat_id, tx_for_origin, price_usd, tx_id, reason=f"Sin números disponibles tx={tx_id}",
         )
-        db.set_status(tx_id, "refunded")
+        await db.set_status(tx_id, "refunded")
         refund_info = (
             f"Se acreditaron {format_amount(price_usd, 'USD')} a tu saldo interno "
             f"(saldo total: {format_amount(new_balance, 'USD')}). Úsalo en tu "
@@ -1877,7 +1877,7 @@ async def _handle_after_payment(bot, chat_id: int, state: FSMContext, tx_id: int
                 refund_info = refund_info,
             ),
         )
-        if tx := db.get_by_id(tx_id):
+        if tx := await db.get_by_id(tx_id):
             icon = "💸" if refund_ok else "🚨"
             note = "reembolso OK" if refund_ok else "REEMBOLSO FALLÓ - revisar manualmente"
             await _notify_admin(
@@ -1889,8 +1889,8 @@ async def _handle_after_payment(bot, chat_id: int, state: FSMContext, tx_id: int
     activation_id = str(number_info["id"])
     phone_number  = format_phone(number_info["number"])
 
-    db.set_activation(tx_id, activation_id, phone_number)
-    db.set_status(tx_id, "number_assigned")
+    await db.set_activation(tx_id, activation_id, phone_number)
+    await db.set_status(tx_id, "number_assigned")
 
     await state.update_data(
         activation_id = activation_id,
@@ -1944,14 +1944,14 @@ async def _poll_sms(
 
         if status == "ready" and result.get("code"):
             code = result["code"]
-            db.set_sms_code(tx_id, code)
-            db.set_status(tx_id, "completed")
+            await db.set_sms_code(tx_id, code)
+            await db.set_status(tx_id, "completed")
 
             # Confirmar recepción a HeroSMS
             await hero.set_status_done(activation_id)
 
             await _safe_send(bot, chat_id, MSG_CODE_RECEIVED.format(code=code))
-            if tx := db.get_by_id(tx_id):
+            if tx := await db.get_by_id(tx_id):
                 await _notify_admin(
                     bot,
                     f"✅ <b>Venta completada</b>\n{_tx_summary_line(tx)}\n"
@@ -1969,14 +1969,14 @@ async def _poll_sms(
             # este caso caía en el else de abajo y el bot seguía "esperando"
             # en silencio hasta agotar todo SMS_TIMEOUT_SECONDS, sin avisar
             # a nadie de que el número ya estaba muerto.
-            tx = db.get_by_id(tx_id)
+            tx = await db.get_by_id(tx_id)
             user_id = tx["user_id"] if tx else chat_id
             price_usd = float(tx["amount_usd"]) if tx else pay_amount
-            new_balance = _credit_refund_for_tx(
+            new_balance = await _credit_refund_for_tx(
                 user_id, tx or {}, price_usd, tx_id,
                 reason=f"Cancelado externamente en HeroSMS tx={tx_id}",
             )
-            db.set_status(tx_id, "cancelled")
+            await db.set_status(tx_id, "cancelled")
 
             await _safe_send(
                 bot, chat_id,
@@ -1987,7 +1987,7 @@ async def _poll_sms(
                 "sin cargo de servicio.\nÚsalo en tu próxima compra con /start, "
                 "o consulta /saldo.",
             )
-            if tx := db.get_by_id(tx_id):
+            if tx := await db.get_by_id(tx_id):
                 await _notify_admin(
                     bot,
                     f"⚠️ <b>Número cancelado externamente en HeroSMS</b> "
@@ -2009,11 +2009,11 @@ async def _poll_sms(
     # la comisión de red).
     await hero.cancel_number(activation_id)
 
-    tx = db.get_by_id(tx_id)
+    tx = await db.get_by_id(tx_id)
     user_id = tx["user_id"] if tx else chat_id
     price_usd = tx["amount_usd"] if tx else pay_amount
     credit_amount = apply_refund_fee(price_usd, REFUND_FEE_PCT)
-    new_balance = _credit_refund_for_tx(
+    new_balance = await _credit_refund_for_tx(
         user_id, tx or {}, credit_amount, tx_id, reason=f"SMS timeout tx={tx_id}",
     )
     refund_info = (
@@ -2022,13 +2022,13 @@ async def _poll_sms(
         f"{REFUND_FEE_PCT:.0%} de cargo de servicio por el número no utilizado). "
         "Úsalo en tu próxima compra con /start, o consulta /saldo"
     )
-    db.set_status(tx_id, "sms_timeout")
+    await db.set_status(tx_id, "sms_timeout")
 
     await _safe_send(
         bot, chat_id,
         MSG_SMS_TIMEOUT.format(refund_info=refund_info),
     )
-    if tx := db.get_by_id(tx_id):
+    if tx := await db.get_by_id(tx_id):
         await _notify_admin(
             bot, f"💸 <b>Timeout de SMS</b> (acreditado a saldo)\n{_tx_summary_line(tx)}"
         )
@@ -2236,7 +2236,7 @@ async def resume_transaction(bot, storage, tx: dict) -> str:
     # fila fue creada pero ni siquiera tiene país todavía, lo cual en la
     # práctica no debería pasar dado cómo se crea la fila) → no hay nada
     # seguro que recuperar automáticamente.
-    db.set_status(tx_id, "error")
+    await db.set_status(tx_id, "error")
     await _safe_send(
         bot, chat_id,
         "⚠️ El bot se reinició mientras tenías una compra en curso, "
@@ -2299,7 +2299,7 @@ async def cb_start_withdraw(call: CallbackQuery, state: FSMContext):
     # Solo el saldo de ORIGEN cripto es retirable a cripto (ver
     # database.Database.balances) — el origen CUP tiene su propio flujo
     # (cb_start_cup_withdraw).
-    balance = db.get_balance_breakdown(call.from_user.id)["crypto"]
+    balance = await db.get_balance_breakdown(call.from_user.id)["crypto"]
     balance_available = floor_to_cents(balance)
     if balance_available < WITHDRAWAL_MIN_USD:
         await call.message.answer(
@@ -2408,7 +2408,7 @@ async def msg_withdraw_amount(message: Message, state: FSMContext):
     # si la moneda/red con la que el usuario depositó sigue estando entre
     # las permitidas para retiro, se la destaca primero en la lista — es la
     # más probable de tener liquidez real, porque es la que él mismo trajo.
-    last_deposit = db.get_last_completed_deposit(message.from_user.id)
+    last_deposit = await db.get_last_completed_deposit(message.from_user.id)
     last_deposit_token_id = last_deposit["token_id"] if last_deposit else None
 
     options = []
@@ -2528,7 +2528,7 @@ async def cb_withdraw_confirm(call: CallbackQuery, state: FSMContext):
     # Descontar saldo ANTES de llamar a CCPayment: si el proceso muere justo
     # después del POST, preferimos haber descontado ya (y re-acreditar si
     # falla) en vez de arriesgarnos a un doble retiro por reintento manual.
-    ok = db.debit_balance(
+    ok = await db.debit_balance(
         user_id, amount_usd, reason=f"Retiro a {currency} ({network})", origin="crypto",
     )
     if not ok:
@@ -2550,7 +2550,7 @@ async def cb_withdraw_confirm(call: CallbackQuery, state: FSMContext):
     if not sent:
         # Revertir siempre primero: pase lo que pase después, el usuario no
         # pierde saldo por un retiro que no se pudo procesar.
-        db.credit_balance(
+        await db.credit_balance(
             user_id, amount_usd, reason=f"Reversión retiro fallido a {currency}", origin="crypto",
         )
 
@@ -2619,7 +2619,7 @@ async def cb_withdraw_confirm(call: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    new_balance = db.get_balance(user_id)
+    new_balance = await db.get_balance(user_id)
     await call.message.answer(
         MSG_WITHDRAW_SUCCESS.format(
             amount_usd  = format_amount(amount_usd, "USD"),
@@ -2650,7 +2650,7 @@ async def cb_withdraw_confirm(call: CallbackQuery, state: FSMContext):
 async def cb_start_cup_withdraw(call: CallbackQuery, state: FSMContext):
     await _safe_call_answer(call)
 
-    existing = db.get_pending_manual_withdrawal(call.from_user.id)
+    existing = await db.get_pending_manual_withdrawal(call.from_user.id)
     if existing:
         await call.message.answer(
             MSG_CUP_WITHDRAW_ALREADY_PENDING.format(reference_code=existing["reference_code"]),
@@ -2665,7 +2665,7 @@ async def cb_start_cup_withdraw(call: CallbackQuery, state: FSMContext):
     # Solo el saldo de ORIGEN CUP es retirable en CUP (ver database.py
     # Database.balances) — el origen cripto tiene su propio flujo
     # (cb_start_withdraw).
-    balance = db.get_balance_breakdown(call.from_user.id)["cup"]
+    balance = await db.get_balance_breakdown(call.from_user.id)["cup"]
     balance_available = floor_to_cents(balance)
 
     # Tasa de PAYOUT fijada acá y reutilizada durante TODO el flujo (select
@@ -2840,7 +2840,7 @@ async def cb_cup_withdraw_confirm(call: CallbackQuery, state: FSMContext):
     # que el retiro cripto: preferimos haber descontado ya y revertir si el
     # admin rechaza, que arriesgar un doble retiro). origin='cup' estricto:
     # esto NUNCA debe tocar la bolsa cripto del usuario.
-    ok = db.debit_balance(
+    ok = await db.debit_balance(
         user_id, amount_usd, reason=f"Retiro CUP a {method_name}", origin="cup",
     )
     if not ok:
@@ -2852,7 +2852,7 @@ async def cb_cup_withdraw_confirm(call: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    wd = db.create_manual_withdrawal(
+    wd = await db.create_manual_withdrawal(
         user_id, method_code, destination,
         amount_usd=amount_usd, fee_usd=data["cup_withdraw_fee_usd"],
         net_usd=data["cup_withdraw_net_usd"], amount_cup=data["cup_withdraw_amount_cup"],
@@ -2896,7 +2896,7 @@ async def cb_admin_approve_cup_withdrawal(call: CallbackQuery):
         return
 
     wd_id = int(call.data.split(":", 1)[1])
-    wd = db.get_manual_withdrawal_by_id(wd_id)
+    wd = await db.get_manual_withdrawal_by_id(wd_id)
     if not wd:
         await _safe_call_answer(call, "No encontrado.", show_alert=True)
         return
@@ -2904,7 +2904,7 @@ async def cb_admin_approve_cup_withdrawal(call: CallbackQuery):
         await _safe_call_answer(call, f"Ya estaba en estado '{wd['status']}'.", show_alert=True)
         return
 
-    db.set_manual_withdrawal_status(wd_id, "approved", reviewed_by=call.from_user.id)
+    await db.set_manual_withdrawal_status(wd_id, "approved", reviewed_by=call.from_user.id)
 
     await _safe_call_answer(call, "Aprobado ✅")
     await _mark_admin_message_resolved(call.message, f"\n\n✅ Aprobado por {call.from_user.id}")
@@ -2925,7 +2925,7 @@ async def cb_admin_reject_cup_withdrawal(call: CallbackQuery):
         return
 
     wd_id = int(call.data.split(":", 1)[1])
-    wd = db.get_manual_withdrawal_by_id(wd_id)
+    wd = await db.get_manual_withdrawal_by_id(wd_id)
     if not wd:
         await _safe_call_answer(call, "No encontrado.", show_alert=True)
         return
@@ -2936,11 +2936,11 @@ async def cb_admin_reject_cup_withdrawal(call: CallbackQuery):
     # Se había descontado el saldo CUP al confirmar (buena fe) -> revertir
     # siempre primero, igual que el retiro cripto fallido: el usuario no
     # pierde saldo por un retiro que el admin no pudo/quiso ejecutar.
-    db.credit_balance(
+    await db.credit_balance(
         wd["user_id"], wd["amount_usd"], reason=f"Reversión retiro CUP rechazado wd={wd_id}",
         origin="cup",
     )
-    db.set_manual_withdrawal_status(wd_id, "rejected", reviewed_by=call.from_user.id)
+    await db.set_manual_withdrawal_status(wd_id, "rejected", reviewed_by=call.from_user.id)
 
     await _safe_call_answer(call, "Rechazado ❌")
     await _mark_admin_message_resolved(call.message, f"\n\n❌ Rechazado por {call.from_user.id}")
@@ -2994,7 +2994,7 @@ async def msg_deposit_amount(message: Message, state: FSMContext):
         )
         return
 
-    deposit_id = db.create_deposit(message.from_user.id, amount)
+    deposit_id = await db.create_deposit(message.from_user.id, amount)
 
     await message.answer("🔍 Consultando monedas disponibles y cotización actual...")
 
@@ -3020,7 +3020,7 @@ async def msg_deposit_amount(message: Message, state: FSMContext):
     options.sort(key=lambda o: not o["low_fee"])
 
     if not options:
-        db.set_deposit_status(deposit_id, "error")
+        await db.set_deposit_status(deposit_id, "error")
         await message.answer(
             "😔 No pudimos obtener cotizaciones de pago en este momento. "
             "Intenta de nuevo en unos minutos con /saldo.",
@@ -3066,7 +3066,7 @@ async def cb_select_deposit_currency(call: CallbackQuery, state: FSMContext):
         chosen["amount"], token_id, memo=f"Deposito-{deposit_id}",
     )
     if not order or not order.get("orderId") or not order.get("payAddress"):
-        db.set_deposit_status(deposit_id, "error")
+        await db.set_deposit_status(deposit_id, "error")
         await call.message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
         await state.clear()
         return
@@ -3075,7 +3075,7 @@ async def cb_select_deposit_currency(call: CallbackQuery, state: FSMContext):
     pay_address = order["payAddress"]
     pay_amount  = order["payAmount"] or chosen["amount"]
 
-    db.set_deposit_order_info(
+    await db.set_deposit_order_info(
         deposit_id, order_id, pay_address, currency, network, pay_amount, token_id,
     )
 
@@ -3140,7 +3140,7 @@ async def _poll_deposit(
         await asyncio.sleep(PAYMENT_POLL_INTERVAL)
         elapsed += PAYMENT_POLL_INTERVAL
 
-        dep = db.get_deposit_by_id(deposit_id)
+        dep = await db.get_deposit_by_id(deposit_id)
         if dep and dep["status"] == "cancelled":
             await _handle_cancelled_deposit(bot, chat_id, deposit_id, order_id)
             return
@@ -3153,28 +3153,28 @@ async def _poll_deposit(
             return
 
         if status in (ccpay.ORDER_STATUS_EXPIRED, ccpay.ORDER_STATUS_CANCELLED):
-            db.set_deposit_status(deposit_id, "expired")
+            await db.set_deposit_status(deposit_id, "expired")
             await _safe_send(bot, chat_id, MSG_DEPOSIT_TIMEOUT)
             await state.clear()
             return
 
         logger.debug("Depósito pendiente (id=%s, elapsed=%ds)", deposit_id, elapsed)
 
-    db.set_deposit_status(deposit_id, "expired")
+    await db.set_deposit_status(deposit_id, "expired")
     await _safe_send(bot, chat_id, MSG_DEPOSIT_TIMEOUT)
     await state.clear()
 
 
 async def _credit_deposit(bot, chat_id: int, deposit_id: int):
     """Acredita el saldo de un depósito confirmado y avisa al usuario/admin."""
-    dep = db.get_deposit_by_id(deposit_id)
+    dep = await db.get_deposit_by_id(deposit_id)
     if not dep or dep["status"] == "completed":
         return  # ya procesado (evita doble crédito si se llama dos veces)
 
-    new_balance = db.credit_balance(
+    new_balance = await db.credit_balance(
         dep["user_id"], dep["amount_usd"], reason=f"Depósito confirmado id={deposit_id}",
     )
-    db.set_deposit_status(deposit_id, "completed")
+    await db.set_deposit_status(deposit_id, "completed")
 
     await _safe_send(
         bot, chat_id,
@@ -3216,7 +3216,7 @@ async def _handle_cancelled_deposit(bot, chat_id: int, deposit_id: int, order_id
 async def cb_start_manual_deposit(call: CallbackQuery, state: FSMContext):
     await _safe_call_answer(call)
 
-    existing = db.get_pending_manual_deposit(call.from_user.id)
+    existing = await db.get_pending_manual_deposit(call.from_user.id)
     if existing:
         await call.message.answer(
             MSG_MANUAL_DEPOSIT_ALREADY_PENDING.format(
@@ -3291,7 +3291,7 @@ async def msg_manual_deposit_amount(message: Message, state: FSMContext):
 
     effective_rate = effective_cup_rate(MANUAL_DEPOSIT_CUP_RATE, MANUAL_DEPOSIT_CUP_MARGIN_PCT)
     amount_cup = usd_to_cup(amount, effective_rate)
-    dep = db.create_manual_deposit(
+    dep = await db.create_manual_deposit(
         message.from_user.id, method_code, amount,
         amount_cup=amount_cup, cup_rate=effective_rate,
     )
@@ -3343,18 +3343,18 @@ async def msg_manual_deposit_proof(message: Message, state: FSMContext):
     proof_file_unique_id = message.photo[-1].file_unique_id
     proof_text = None
 
-    db.set_manual_deposit_proof(
+    await db.set_manual_deposit_proof(
         dep_id, proof_file_id=proof_file_id,
         proof_file_unique_id=proof_file_unique_id, proof_text=proof_text,
     )
-    reused = db.find_reused_proof(proof_file_unique_id, exclude_dep_id=dep_id)
+    reused = await db.find_reused_proof(proof_file_unique_id, exclude_dep_id=dep_id)
 
     await message.answer(
         MSG_MANUAL_DEPOSIT_PROOF_RECEIVED.format(reference_code=reference_code),
         parse_mode="HTML",
     )
 
-    dep = db.get_manual_deposit_by_id(dep_id)
+    dep = await db.get_manual_deposit_by_id(dep_id)
     cup_str = f"{dep['amount_cup']:,}".replace(",", " ") if dep.get("amount_cup") else "?"
     caption = (
         _reused_proof_warning(reused) +
@@ -3392,7 +3392,7 @@ async def cb_admin_approve_manual(call: CallbackQuery):
         return
 
     dep_id = int(call.data.split(":", 1)[1])
-    dep = db.get_manual_deposit_by_id(dep_id)
+    dep = await db.get_manual_deposit_by_id(dep_id)
     if not dep:
         await _safe_call_answer(call, "No encontrado.", show_alert=True)
         return
@@ -3400,11 +3400,11 @@ async def cb_admin_approve_manual(call: CallbackQuery):
         await _safe_call_answer(call, f"Ya estaba en estado '{dep['status']}'.", show_alert=True)
         return
 
-    new_balance = db.credit_balance(
+    new_balance = await db.credit_balance(
         dep["user_id"], dep["amount_usd"], reason=f"Depósito manual aprobado id={dep_id}",
         origin="cup",
     )
-    db.set_manual_deposit_status(dep_id, "approved", reviewed_by=call.from_user.id)
+    await db.set_manual_deposit_status(dep_id, "approved", reviewed_by=call.from_user.id)
 
     await _safe_call_answer(call, "Aprobado ✅")
     await _mark_admin_message_resolved(call.message, f"\n\n✅ Aprobado por {call.from_user.id}")
@@ -3417,7 +3417,7 @@ async def cb_admin_approve_manual(call: CallbackQuery):
         ),
     )
 
-    exposure = db.get_cup_exposure()
+    exposure = await db.get_cup_exposure()
     if exposure["total_usd"] >= MANUAL_DEPOSIT_CUP_EXPOSURE_ALERT_USD:
         cup_str = f"{exposure['total_cup']:,}".replace(",", " ")
         await _notify_admin(
@@ -3436,7 +3436,7 @@ async def cb_admin_reject_manual(call: CallbackQuery):
         return
 
     dep_id = int(call.data.split(":", 1)[1])
-    dep = db.get_manual_deposit_by_id(dep_id)
+    dep = await db.get_manual_deposit_by_id(dep_id)
     if not dep:
         await _safe_call_answer(call, "No encontrado.", show_alert=True)
         return
@@ -3444,7 +3444,7 @@ async def cb_admin_reject_manual(call: CallbackQuery):
         await _safe_call_answer(call, f"Ya estaba en estado '{dep['status']}'.", show_alert=True)
         return
 
-    db.set_manual_deposit_status(dep_id, "rejected", reviewed_by=call.from_user.id)
+    await db.set_manual_deposit_status(dep_id, "rejected", reviewed_by=call.from_user.id)
 
     await _safe_call_answer(call, "Rechazado ❌")
     await _mark_admin_message_resolved(call.message, f"\n\n❌ Rechazado por {call.from_user.id}")
@@ -3493,7 +3493,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         # usuario vía get_pending_manual_deposit.
         dep_id = data.get("manual_deposit_id")
         if dep_id:
-            db.set_manual_deposit_status(dep_id, "cancelled")
+            await db.set_manual_deposit_status(dep_id, "cancelled")
         await state.clear()
         await call.message.answer("✅ Depósito CUP cancelado.")
         return
@@ -3502,7 +3502,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         # No se acreditó/cobró nada hasta que un admin aprueba el
         # comprobante, así que cancelar acá nunca deja nada a medio tocar.
         if tx_id:
-            db.set_status(tx_id, "error")
+            await db.set_status(tx_id, "error")
         await state.clear()
         await call.message.answer("✅ Compra cancelada. No se generó ningún cargo.")
         return
@@ -3514,7 +3514,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         # había llegado, se acredita igual (ver _handle_cancelled_deposit).
         deposit_id = data.get("deposit_id")
         if deposit_id:
-            db.set_deposit_status(deposit_id, "cancelled")
+            await db.set_deposit_status(deposit_id, "cancelled")
         await state.clear()
         await call.message.answer(
             "✅ Depósito cancelado.\n"
@@ -3535,11 +3535,11 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
             result = await hero.get_status(act_id)
             if result.get("status") == "ready" and result.get("code"):
                 code = result["code"]
-                db.set_sms_code(tx_id, code)
-                db.set_status(tx_id, "completed")
+                await db.set_sms_code(tx_id, code)
+                await db.set_status(tx_id, "completed")
                 await hero.set_status_done(act_id)
                 await call.message.answer(MSG_CODE_RECEIVED.format(code=code), parse_mode="HTML")
-                if tx := db.get_by_id(tx_id):
+                if tx := await db.get_by_id(tx_id):
                     await _notify_admin(
                         bot=call.bot,
                         text=f"✅ <b>Venta completada</b> (código llegó justo al cancelar)\n{_tx_summary_line(tx)}",
@@ -3558,7 +3558,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         # llamarlo, en vez de comernos un rechazo seguro. El crédito al
         # usuario NO espera: se acredita de inmediato más abajo, de buena
         # fe, y solo la llamada real a HeroSMS se retrasa.
-        tx_for_wait = db.get_by_id(tx_id) if tx_id else None
+        tx_for_wait = await db.get_by_id(tx_id) if tx_id else None
         elapsed_since_assigned = _elapsed_seconds(tx_for_wait["updated_at"]) if tx_for_wait else HEROSMS_MIN_CANCEL_WAIT_SECONDS
         remaining_wait = max(0, HEROSMS_MIN_CANCEL_WAIT_SECONDS - elapsed_since_assigned)
 
@@ -3567,7 +3567,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
                 await asyncio.sleep(wait_s)
             ok = await hero.cancel_number(activation_id)
             if not ok:
-                if tx2 := db.get_by_id(tx_id_):
+                if tx2 := await db.get_by_id(tx_id_):
                     await _notify_admin(
                         bot=call.bot,
                         text=f"🚨 <b>Cancelación con problemas</b>\n{_tx_summary_line(tx2)}\n"
@@ -3585,11 +3585,11 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         if tx_id:
             price_usd = data.get("price_usd") or 0
             credit_amount = apply_refund_fee(price_usd, REFUND_FEE_PCT)
-            new_balance = _credit_refund_for_tx(
+            new_balance = await _credit_refund_for_tx(
                 call.from_user.id, tx_for_wait or {}, credit_amount, tx_id,
                 reason=f"Cancelación manual tx={tx_id}",
             )
-            db.set_status(tx_id, "refunded")
+            await db.set_status(tx_id, "refunded")
             await call.message.answer(
                 f"💰 Se acreditaron {format_amount(credit_amount, 'USD')} a tu saldo "
                 f"interno (saldo total: {format_amount(new_balance, 'USD')}; se retiene "
@@ -3606,12 +3606,12 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         # habías pagado, te reembolsa automáticamente (ver
         # _handle_cancelled_order). Así evitamos que la tarea vieja siga
         # corriendo sobre datos de estado ya vaciados.
-        db.set_status(tx_id, "cancelled")
+        await db.set_status(tx_id, "cancelled")
 
     elif tx_id:
         # Cancelado antes de generar una orden de pago (eligiendo
         # servicio/país/moneda): no hubo cargo, no hay nada que reembolsar.
-        db.set_status(tx_id, "error")
+        await db.set_status(tx_id, "error")
 
     await state.clear()
     await call.message.answer(

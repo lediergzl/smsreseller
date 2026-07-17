@@ -73,7 +73,7 @@ async def recover_pending_transactions(bot: Bot, storage):
     Al reiniciar el bot, revisa transacciones que quedaron en estados
     intermedios (pending, paid, number_assigned) y las REANUDA automáticamente.
     """
-    pending = db.get_pending_transactions()
+    pending = await db.get_pending_transactions()
     if not pending:
         return
 
@@ -96,12 +96,12 @@ async def recover_pending_transactions(bot: Bot, storage):
                 f"soporte indicando este ID: <code>{tx['id']}</code>",
                 reply_markup=outbox.retry_keyboard(),
             )
-            db.set_status(tx["id"], "error")
+            await db.set_status(tx["id"], "error")
 
 
 async def recover_pending_deposits(bot: Bot, storage):
     """Análoga a recover_pending_transactions pero para depósitos pendientes."""
-    pending = db.get_pending_deposits()
+    pending = await db.get_pending_deposits()
     if not pending:
         return
 
@@ -123,7 +123,7 @@ async def recover_pending_deposits(bot: Bot, storage):
                 "Si ya habías pagado y no se acreditó, contacta al soporte "
                 f"indicando este ID: <code>{dep['id']}</code>",
             )
-            db.set_deposit_status(dep["id"], "error")
+            await db.set_deposit_status(dep["id"], "error")
 
 
 def _build_bot_and_dispatcher():
@@ -148,7 +148,11 @@ async def _startup_sequence(bot: Bot, storage):
     webhook (on_startup) como desde el modo polling local."""
     logger = logging.getLogger(__name__)
 
-    ok, detail = db.integrity_check()
+    # Crea el pool de conexiones (asyncpg) y asegura que las tablas existan.
+    # Tiene que correr antes que cualquier otro uso de `db` en este arranque.
+    await db.connect()
+
+    ok, detail = await db.integrity_check()
     if not ok:
         logger.error("¡La base de datos no respondió al chequeo de conectividad!: %s", detail)
         if config.ADMIN_CHAT_ID:
@@ -209,6 +213,7 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
         await bot.session.close()
         await hero.close_session()
         await ccpay.close_session()
+        await db.close()
 
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
@@ -244,6 +249,7 @@ async def _run_polling(bot: Bot, dp: Dispatcher, storage):
         await bot.session.close()
         await hero.close_session()
         await ccpay.close_session()
+        await db.close()
 
 
 def main():

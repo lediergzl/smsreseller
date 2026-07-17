@@ -30,18 +30,11 @@ CARDS_DIR = "/tmp/otpvirtual_cards"
 PHOTOS_DIR = "/tmp/otpvirtual_profile_photos"
 
 
-def _format_joined_at(raw: "datetime | str | None") -> str | None:
-    """'2026-07-14 07:12:00' o datetime -> '14/07/2026'. None si no hay dato
-    o el formato es inesperado (mejor omitir la fila que mostrar algo raro).
-
-    Con Neon/psycopg2, columnas TIMESTAMPTZ (ver database.py, tabla `users`,
-    campo first_seen) llegan ya como datetime.datetime, no como string (a
-    diferencia de la versión vieja con SQLite). Se soportan ambos casos para
-    no volver a romper si en algún momento cambia la fuente de datos."""
+def _format_joined_at(raw: str | None) -> str | None:
+    """'2026-07-14 07:12:00' (formato SQLite) -> '14/07/2026'. None si no hay dato
+    o el formato es inesperado (mejor omitir la fila que mostrar algo raro)."""
     if not raw:
         return None
-    if isinstance(raw, datetime):
-        return raw.strftime("%d/%m/%Y")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
             return datetime.strptime(raw, fmt).strftime("%d/%m/%Y")
@@ -75,16 +68,16 @@ async def _download_profile_photo(bot: Bot, user_id: int) -> str | None:
         return None
 
 
-def _build_user_stats(user_id: int, username: str | None, first_name: str | None,
-                       photo_path: str | None) -> UserStats:
+async def _build_user_stats(user_id: int, username: str | None, first_name: str | None,
+                             photo_path: str | None) -> UserStats:
     """Arma el UserStats leyendo SOLO datos que existen de verdad en la DB.
     'Tipo' (account_type) y 'País' (country) vienen de la tabla `users` y
     quedan en None hasta que un admin los asigna con /set_tipo o /set_pais
     (ver handlers.py) — mientras tanto la tarjeta simplemente no muestra
     esas filas (ver welcome_card.generate_welcome_card)."""
-    breakdown = db.get_balance_breakdown(user_id)
-    orders_count = db.count_completed_orders(user_id)
-    user_row = db.get_user(user_id)
+    breakdown = await db.get_balance_breakdown(user_id)
+    orders_count = await db.count_completed_orders(user_id)
+    user_row = await db.get_user(user_id)
     joined_at = _format_joined_at(user_row.get("first_seen")) if user_row else None
 
     return UserStats(
@@ -117,7 +110,7 @@ async def send_welcome_card(bot: Bot, message: Message, caption: str,
     card_path = None
     try:
         photo_path = await _download_profile_photo(bot, user.id)
-        stats = _build_user_stats(user.id, user.username, user.first_name, photo_path)
+        stats = await _build_user_stats(user.id, user.username, user.first_name, photo_path)
         card_path = generate_welcome_card(stats, out_dir=CARDS_DIR)
 
         await message.answer_photo(
