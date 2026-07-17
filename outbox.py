@@ -63,7 +63,7 @@ async def notify(bot, chat_id: int, text: str, reply_markup: InlineKeyboardMarku
     quedó delegada acá.
     """
     markup_json = reply_markup.model_dump_json() if reply_markup else None
-    outbox_id = db.enqueue_outbox(chat_id, text, markup_json)
+    outbox_id = await db.enqueue_outbox(chat_id, text, markup_json)
     return await _attempt_send(bot, outbox_id, chat_id, text, reply_markup)
 
 
@@ -73,7 +73,7 @@ async def _attempt_send(
 ) -> bool:
     try:
         await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=reply_markup)
-        db.mark_outbox_sent(outbox_id)
+        await db.mark_outbox_sent(outbox_id)
         return True
     except Exception as exc:
         give_up = attempts_so_far + 1 >= OUTBOX_MAX_ATTEMPTS
@@ -83,7 +83,7 @@ async def _attempt_send(
             "outbox: envío falló (id=%s chat=%s intento=%d/%d, próximo en %ds): %s",
             outbox_id, chat_id, attempts_so_far + 1, OUTBOX_MAX_ATTEMPTS, delay, exc,
         )
-        db.mark_outbox_attempt_failed(outbox_id, str(exc), next_attempt_at, give_up)
+        await db.mark_outbox_attempt_failed(outbox_id, str(exc), next_attempt_at, give_up)
         if give_up:
             await _alert_admin_dead_message(bot, outbox_id, chat_id, text)
         return False
@@ -115,7 +115,7 @@ async def flush_pending(bot):
     arrancar, ANTES de entrar al polling, para que esos avisos salgan cuanto
     antes en vez de esperar el primer tick de retry_loop.
     """
-    due = db.get_due_outbox(limit=200)
+    due = await db.get_due_outbox(limit=200)
     if not due:
         return
     logger.info("outbox: reintentando %d mensaje(s) pendiente(s) de antes del reinicio.", len(due))
@@ -141,7 +141,7 @@ async def retry_loop(bot):
     while True:
         await asyncio.sleep(OUTBOX_RETRY_INTERVAL_SECONDS)
         try:
-            due = db.get_due_outbox()
+            due = await db.get_due_outbox()
             for row in due:
                 reply_markup = (
                     InlineKeyboardMarkup.model_validate_json(row["reply_markup"])
