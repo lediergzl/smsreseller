@@ -45,7 +45,7 @@ async def db_health_loop(bot: Bot):
     interval_seconds = config.DB_PING_INTERVAL_MINUTES * 60
     while True:
         try:
-            ok, detail = db.integrity_check()
+            ok, detail = await db.integrity_check()
             if not ok:
                 logger.error("Chequeo de conectividad a la base falló: %s", detail)
                 await _notify_admin(
