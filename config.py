@@ -315,6 +315,25 @@ REFERRAL_HOLD_HOURS: float = float(os.getenv("REFERRAL_HOLD_HOURS", "24"))
 # carga extra en la base de datos.
 REFERRAL_RELEASE_INTERVAL: int = int(os.getenv("REFERRAL_RELEASE_INTERVAL", str(3600)))
 
+# ── Canal de comunidad (captación, no venta todavía) ──────────────────────────
+# Objetivo: quedarse con una audiencia PROPIA (no depender solo de Telegram
+# encontrando el bot de nuevo) para poder anunciar después lo que sea -otro
+# producto, una promo, lo que surja- sin tener que decidirlo ya. Un canal
+# (broadcast, NO grupo) a propósito: cero moderación posible porque nadie
+# puede escribir, encaja con "que funcione casi solo". Si queda vacío, el
+# bot simplemente no muestra el botón/aviso -no rompe nada, es opt-in del
+# lado del admin (crear el canal) antes de activarse del lado del bot.
+COMMUNITY_CHANNEL_URL: str = os.getenv("COMMUNITY_CHANNEL_URL", "")
+
+# chat_id NUMÉRICO del canal (ej. -1001234567890), NO la URL. Hace falta
+# aparte de la URL porque Telegram manda actualizaciones de tipo
+# "chat_member" identificando el chat por id, no por link -sin esto no hay
+# forma de detectar automáticamente cuándo alguien se une (ver
+# handlers.on_channel_member_update). Para obtenerlo: agregar el bot como
+# admin del canal, mandar cualquier mensaje al canal, y mirar el update
+# que le llega al bot (o usar @userinfobot / @RawDataBot en el canal).
+COMMUNITY_CHANNEL_CHAT_ID: int = int(os.getenv("COMMUNITY_CHANNEL_CHAT_ID", "0") or 0)
+
 # ── Administración / Reportes ─────────────────────────────────────────────────
 # Chat/canal donde el bot manda alertas en tiempo real (pago confirmado, venta
 # completada, reembolsos, timeouts). Usa el ID de un canal o grupo privado

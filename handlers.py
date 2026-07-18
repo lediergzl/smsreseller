@@ -9,7 +9,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import StorageKey
-from aiogram.types import Message, CallbackQuery, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, ChatMemberUpdated
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 import herosms_api as hero
@@ -25,6 +25,7 @@ from config import MANUAL_DEPOSIT_MIN_USD, MANUAL_DEPOSIT_MAX_USD, MANUAL_DEPOSI
 from config import MANUAL_DEPOSIT_CUP_MARGIN_PCT, MANUAL_DEPOSIT_CUP_EXPOSURE_ALERT_USD, MANUAL_PURCHASE_MIN_USD
 from config import ACCOUNT_TYPE_LABELS
 from config import REFERRAL_BONUS_PCT, REFERRAL_MIN_PURCHASE_USD, REFERRAL_HOLD_HOURS, REFERRAL_RELEASE_INTERVAL
+from config import COMMUNITY_CHANNEL_CHAT_ID, COMMUNITY_CHANNEL_URL
 from database import db
 from utils import (
     format_amount, format_cup, apply_markup, apply_refund_fee, apply_withdrawal_fee, floor_to_cents, format_phone,
@@ -38,7 +39,7 @@ from utils import (
     withdraw_start_keyboard, withdraw_currencies_keyboard, withdraw_confirm_keyboard,
     deposit_currencies_keyboard,
     manual_payment_methods_keyboard, manual_deposit_review_keyboard,
-    purchase_cup_review_keyboard,
+    purchase_cup_review_keyboard, refund_request_review_keyboard, channel_invite_keyboard,
     cup_withdraw_methods_keyboard, cup_withdraw_confirm_keyboard, manual_withdrawal_review_keyboard,
     MSG_WELCOME, MSG_SELECT_SERVICE, MSG_SELECT_COUNTRY, MSG_SELECT_CURRENCY,
     MSG_PAYMENT_INSTRUCTIONS, MSG_WRAPPED_TOKEN_WARNING,
@@ -58,6 +59,9 @@ from utils import (
     MSG_CUP_WITHDRAW_CONFIRM, MSG_CUP_WITHDRAW_SUBMITTED, MSG_CUP_WITHDRAW_APPROVED,
     MSG_CUP_WITHDRAW_REJECTED, MSG_CUP_WITHDRAW_ALREADY_PENDING,
     MSG_REFERRAL_INFO, MSG_REFERRAL_NEW_SIGNUP, MSG_REFERRAL_BONUS_EARNED,
+    MSG_REFUND_REQUEST_RECEIVED, MSG_REFUND_ALREADY_OPEN, MSG_REFUND_NOT_ELIGIBLE,
+    MSG_REFUND_APPROVED, MSG_REFUND_DENIED,
+    MSG_CHANNEL_INVITE,
 )
 
 logger = logging.getLogger(__name__)
@@ -351,6 +355,62 @@ async def _maybe_credit_referral_bonus(bot, tx_id: int):
         await db.register_referral_bonus_pending(referrer_id, buyer_id, tx_id, bonus)
     except Exception as exc:
         logger.error("No se pudo registrar bono de referido pendiente para tx=%s: %s", tx_id, exc)
+
+
+async def _maybe_prompt_channel_join(bot, tx_id: int):
+    """
+    Nudge de captación al canal de comunidad (ver config.COMMUNITY_CHANNEL_URL
+    y MSG_CHANNEL_INVITE), disparado en el mismo momento que
+    _maybe_credit_referral_bonus (primera compra completada del usuario) por
+    ser el punto de mayor confianza. A propósito NO depende de si hay
+    referidor -a diferencia del bono, esto es para TODOS los usuarios, no
+    solo los que llegaron invitados: el objetivo es captar a cada uno que
+    pasa por el bot, tenga o no referidor (ver discusión de negocio: "cada
+    usuario que llega lo tenemos que captar").
+
+    Se manda como MUCHO una vez por usuario (channel_invite_sent_at) para no
+    ser invasivo -el botón del menú principal (main_menu_keyboard) ya queda
+    siempre visible como recordatorio pasivo, sin límite.
+    """
+    if not COMMUNITY_CHANNEL_URL:
+        return
+    try:
+        tx = await db.get_by_id(tx_id)
+        if not tx:
+            return
+        buyer_id = tx["user_id"]
+        if await db.count_completed_orders(buyer_id) != 1:
+            return  # no es la primera compra completada -ya tuvo su chance
+
+        buyer = await db.get_user(buyer_id)
+        if buyer and buyer.get("channel_joined_at"):
+            return  # ya está en el canal, no hace falta invitarlo
+        if buyer and buyer.get("channel_invite_sent_at"):
+            return  # ya se le mandó el nudge antes, no repetir
+
+        await _safe_send(
+            bot, buyer_id, MSG_CHANNEL_INVITE, reply_markup=channel_invite_keyboard(),
+        )
+        await db.mark_channel_invite_sent(buyer_id)
+    except Exception as exc:
+        logger.error("No se pudo mandar el nudge de canal para tx=%s: %s", tx_id, exc)
+
+
+@router.chat_member(F.chat.id == COMMUNITY_CHANNEL_CHAT_ID)
+async def on_channel_member_update(event: ChatMemberUpdated):
+    """
+    Confirmación REAL (no un botón que se pudo tocar sin llegar a unirse)
+    de que alguien se unió al canal de comunidad -Telegram manda este
+    update cuando el bot es ADMIN del canal (ver config.COMMUNITY_CHANNEL_CHAT_ID,
+    hay que setearlo con el chat_id numérico real, y agregar el bot como
+    admin del canal, o este handler nunca dispara). Si el filtro de arriba
+    no matchea (COMMUNITY_CHANNEL_CHAT_ID en 0 porque no se configuró
+    todavía), este handler simplemente nunca se registra para ningún chat
+    real -no rompe nada, solo queda inactivo.
+    """
+    new_status = event.new_chat_member.status
+    if new_status in ("member", "administrator", "creator"):
+        await db.mark_channel_joined(event.new_chat_member.user.id)
 
 
 async def _release_referrals_loop(bot):
@@ -720,7 +780,176 @@ async def msg_contact_shared(message: Message):
 
 
 
-@router.message(Command("historial"))
+async def _hero_live_status_line(tx: dict) -> str:
+    """
+    Chequeo EN VIVO del estado de una activación contra HeroSMS, en texto
+    listo para mostrar (usado por /detalle y por la revisión de admin de
+    /reembolso -ver cmd_reembolso). Centralizado acá para que ambos
+    lugares muestren exactamente el mismo criterio: si HeroSMS dice
+    'ready' con código, el número se entregó bien; si dice 'cancelled' o
+    'error', hubo un problema real de nuestro lado.
+    """
+    if not tx.get("activation_id"):
+        return "📟 <b>HeroSMS:</b> todavía no se pidió número (activation_id vacío)."
+    try:
+        hero_status = await hero.get_status(tx["activation_id"])
+        hero_desc = {
+            "ready": f"✅ Código ya disponible: {hero_status.get('code')}",
+            "pending": "⏳ Esperando que llegue el SMS",
+            "cancelled": "❌ Activación cancelada en HeroSMS",
+            "error": f"⚠️ Error al consultar: {hero_status.get('error')}",
+        }.get(hero_status.get("status"), f"❓ {hero_status.get('status')}")
+        return f"📟 <b>HeroSMS ahora mismo:</b> {hero_desc}"
+    except Exception as exc:
+        return f"📟 <b>HeroSMS ahora mismo:</b> ⚠️ error al consultar ({exc})"
+
+
+@router.message(Command("reembolso"))
+async def cmd_reembolso(message: Message):
+    """
+    /reembolso <tx_id> [motivo] — solicita reembolso de una compra YA
+    completada (número entregado). No es automático ni instantáneo: solo
+    crea un registro en `refund_requests` y lo manda a revisión del admin
+    (ver cb_admin_approve_refund_request / cb_admin_deny_refund_request).
+
+    Política -ver MSG_REFUND_DENIED-: solo se aprueba si HeroSMS confirma
+    un problema real del número (nunca entregó código, activación
+    cancelada). Si el código llegó bien, el reclamo es contra el servicio
+    destino, no reembolsable acá. Por eso se adjunta el estado EN VIVO de
+    HeroSMS (_hero_live_status_line) al mensaje del admin, para que la
+    decisión no dependa únicamente de lo que diga el usuario.
+    """
+    args = (message.text or "").split(maxsplit=2)
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer(
+            "Uso: <code>/reembolso &lt;id_de_tx&gt; &lt;motivo&gt;</code>\n"
+            "El id de tx lo ves en /historial.",
+            parse_mode="HTML",
+        )
+        return
+
+    tx_id = int(args[1])
+    reason = args[2].strip() if len(args) > 2 else "(sin motivo indicado)"
+
+    tx = await db.get_by_id(tx_id)
+    if not tx or tx["user_id"] != message.from_user.id or tx["status"] != "completed":
+        await message.answer(MSG_REFUND_NOT_ELIGIBLE, parse_mode="HTML")
+        return
+
+    # Snapshot EN VIVO en el momento del pedido: si el admin tarda en
+    # revisar, este texto queda fijo tal cual estaba al pedir el
+    # reembolso, en vez de depender de que HeroSMS lo siga mostrando igual
+    # más tarde (una activación vieja puede dejar de ser consultable).
+    hero_line = await _hero_live_status_line(tx)
+
+    request_id = await db.create_refund_request(tx_id, message.from_user.id, reason, hero_line)
+    if request_id is None:
+        await message.answer(MSG_REFUND_ALREADY_OPEN.format(tx_id=tx_id), parse_mode="HTML")
+        return
+
+    await message.answer(MSG_REFUND_REQUEST_RECEIVED.format(tx_id=tx_id), parse_mode="HTML")
+
+    buyer = await db.get_user(message.from_user.id)
+    caption = (
+        f"💸 <b>Solicitud de reembolso #{request_id}</b>\n"
+        f"{_user_label(message.from_user.id, buyer.get('username') if buyer else None)}\n"
+        f"{_tx_summary_line(tx)}\n"
+        f"📝 Motivo del cliente: {reason}\n"
+        f"{hero_line}\n\n"
+        "⚖️ <b>Política:</b> aprobar SOLO si HeroSMS confirma un problema "
+        "real (cancelada / nunca entregó código). Si el código se entregó "
+        "bien, denegar -el reclamo es contra el servicio destino, no "
+        "contra el número."
+    )
+    try:
+        await message.bot.send_message(
+            ADMIN_CHAT_ID, caption, parse_mode="HTML",
+            reply_markup=refund_request_review_keyboard(request_id),
+        )
+    except Exception as exc:
+        logger.error("No se pudo notificar al admin la solicitud de reembolso #%s: %s", request_id, exc)
+
+
+@router.callback_query(F.data.startswith("rfnd_ok:"))
+async def cb_admin_approve_refund_request(call: CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await _safe_call_answer(call, "No autorizado.", show_alert=True)
+        return
+
+    request_id = int(call.data.split(":", 1)[1])
+    req = await db.get_refund_request(request_id)
+    if not req:
+        await _safe_call_answer(call, "No encontrada.", show_alert=True)
+        return
+    if req["status"] != "requested":
+        await _safe_call_answer(call, f"Ya estaba en estado '{req['status']}'.", show_alert=True)
+        return
+
+    tx = await db.get_by_id(req["tx_id"])
+    if not tx or tx["status"] != "completed":
+        # La tx cambió de estado por otro camino mientras la solicitud
+        # esperaba revisión (ej. otro reembolso ya la resolvió) -no
+        # duplicar el crédito.
+        await db.set_refund_request_status(request_id, "denied", call.from_user.id)
+        await _safe_call_answer(call, "La tx ya no está 'completed', no se aprueba.", show_alert=True)
+        await _mark_admin_message_resolved(
+            call.message, f"\n\n⚠️ Auto-denegado: tx ya no estaba 'completed' (revisó {call.from_user.id})",
+        )
+        return
+
+    # Mismo cargo de servicio que cualquier otro reembolso manual post-
+    # entrega (ver la cancelación manual más abajo en este archivo): ya se
+    # entregó un número real y se consumió costo de HeroSMS, así que se
+    # retiene REFUND_FEE_PCT en vez de devolver el 100%.
+    price_usd = float(tx.get("amount_usd") or 0)
+    credit_amount = apply_refund_fee(price_usd, REFUND_FEE_PCT)
+    new_balance = await _credit_refund_for_tx(
+        req["user_id"], tx, credit_amount, req["tx_id"],
+        reason=f"Reembolso aprobado (solicitud #{request_id})",
+    )
+    await db.set_status(req["tx_id"], "refunded")
+    await db.set_refund_request_status(request_id, "approved", call.from_user.id)
+
+    await _safe_call_answer(call, "Aprobado ✅")
+    await _mark_admin_message_resolved(call.message, f"\n\n✅ Aprobado por {call.from_user.id}")
+
+    await _safe_send(
+        call.bot, req["user_id"],
+        MSG_REFUND_APPROVED.format(
+            tx_id=req["tx_id"], credit_amount=format_amount(credit_amount, "USD"),
+            new_balance=format_amount(new_balance, "USD"), fee_pct=f"{REFUND_FEE_PCT:.0%}",
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("rfnd_no:"))
+async def cb_admin_deny_refund_request(call: CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await _safe_call_answer(call, "No autorizado.", show_alert=True)
+        return
+
+    request_id = int(call.data.split(":", 1)[1])
+    req = await db.get_refund_request(request_id)
+    if not req:
+        await _safe_call_answer(call, "No encontrada.", show_alert=True)
+        return
+    if req["status"] != "requested":
+        await _safe_call_answer(call, f"Ya estaba en estado '{req['status']}'.", show_alert=True)
+        return
+
+    # tx.status queda intacto ('completed'): un reembolso denegado no debe
+    # afectar en nada el bono de referido pendiente (ver
+    # database.release_pending_referrals, que solo mira tx.status) ni
+    # ningún otro conteo basado en el estado real de la compra.
+    await db.set_refund_request_status(request_id, "denied", call.from_user.id)
+
+    await _safe_call_answer(call, "Denegado ❌")
+    await _mark_admin_message_resolved(call.message, f"\n\n❌ Denegado por {call.from_user.id}")
+
+    await _safe_send(
+        call.bot, req["user_id"],
+        MSG_REFUND_DENIED.format(tx_id=req["tx_id"]),
+    )
 async def cmd_historial(message: Message):
     """Muestra las últimas 5 transacciones del usuario."""
     await _send_historial(message.from_user.id, message.answer)
@@ -996,20 +1225,7 @@ async def cmd_detalle(message: Message):
             lines.append("💳 <b>CCPay:</b> sin order_id registrado.")
 
     # ── Chequeo en vivo del SMS contra HeroSMS ─────────────────────────────
-    if tx.get("activation_id"):
-        try:
-            hero_status = await hero.get_status(tx["activation_id"])
-            hero_desc = {
-                "ready": f"✅ Código ya disponible: {hero_status.get('code')}",
-                "pending": "⏳ Esperando que llegue el SMS",
-                "cancelled": "❌ Activación cancelada en HeroSMS",
-                "error": f"⚠️ Error al consultar: {hero_status.get('error')}",
-            }.get(hero_status.get("status"), f"❓ {hero_status.get('status')}")
-            lines.append(f"📟 <b>HeroSMS ahora mismo:</b> {hero_desc}")
-        except Exception as exc:
-            lines.append(f"📟 <b>HeroSMS ahora mismo:</b> ⚠️ error al consultar ({exc})")
-    else:
-        lines.append("📟 <b>HeroSMS:</b> todavía no se pidió número (activation_id vacío).")
+    lines.append(await _hero_live_status_line(tx))
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -2234,6 +2450,7 @@ async def _poll_sms(
                     f"📱 {tx.get('phone_number') or '—'}",
                 )
             await _maybe_credit_referral_bonus(bot, tx_id)
+            await _maybe_prompt_channel_join(bot, tx_id)
             await state.clear()
             return
 
@@ -3874,6 +4091,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
                         text=f"✅ <b>Venta completada</b> (código llegó justo al cancelar)\n{_tx_summary_line(tx)}",
                     )
                 await _maybe_credit_referral_bonus(call.bot, tx_id)
+                await _maybe_prompt_channel_join(call.bot, tx_id)
                 code_arrived = True
 
         if code_arrived:

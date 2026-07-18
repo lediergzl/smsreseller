@@ -204,6 +204,14 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
             url=webhook_url,
             secret_token=config.WEBHOOK_SECRET or None,
             drop_pending_updates=False,
+            # Sin esto, Telegram NO manda updates de tipo chat_member por
+            # default (a diferencia de message, callback_query, etc.), así
+            # que on_channel_member_update nunca dispararía y
+            # channel_joined_at quedaría siempre vacío. resolve_used_update_types()
+            # arma la lista automáticamente en base a los handlers ya
+            # registrados en el router (incluye chat_member porque ya lo
+            # registraste ahí).
+            allowed_updates=dp.resolve_used_update_types(),
         )
         logger.info("Webhook configurado en %s", webhook_url)
         await _startup_sequence(bot, storage)

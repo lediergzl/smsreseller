@@ -213,6 +213,18 @@ _DDL_STATEMENTS = [
     # para no arrastrar un número que se pueda desincronizar del real.
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id BIGINT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT UNIQUE",
+    # channel_joined_at / channel_invite_sent_at: soporte de captación al
+    # canal de comunidad (ver config.COMMUNITY_CHANNEL_URL). channel_joined_at
+    # se llena solo, vía el update "chat_member" de Telegram (ver
+    # handlers.on_channel_member_update) -NO hay forma de confirmarlo
+    # preguntándole al usuario, Telegram no expone "¿este user_id es
+    # miembro de este canal?" sin que el bot sea admin del canal y reciba
+    # ese evento. channel_invite_sent_at es solo para no mandar la
+    # invitación explícita más de una vez por usuario (ver
+    # handlers._maybe_prompt_channel_join); el botón del menú principal no
+    # cuenta -ese siempre está visible, esto es aparte del nudge puntual.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS channel_joined_at TIMESTAMPTZ",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS channel_invite_sent_at TIMESTAMPTZ",
     "CREATE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code)",
     "CREATE INDEX IF NOT EXISTS idx_users_referrer_id    ON users(referrer_id)",
     """
@@ -238,6 +250,38 @@ _DDL_STATEMENTS = [
     "ALTER TABLE referrals ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed'",
     "ALTER TABLE referrals ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ",
     "CREATE INDEX IF NOT EXISTS idx_referrals_status ON referrals(status)",
+    # ── Solicitudes de reembolso post-entrega ────────────────────────────────
+    # Cubre el caso donde el número YA se entregó (tx.status='completed') y
+    # el cliente igual pide reembolso. A propósito es una tabla APARTE en
+    # vez de reusar transactions.status para los estados intermedios
+    # ('requested'/'denied'): tx.status ya se usa en todos lados (recovery
+    # de /pendientes, iconos de /historial, abuse strikes, el hold de
+    # referidos) asumiendo un set fijo de valores -meter estados nuevos ahí
+    # rompería esas lecturas. Solo cuando se APRUEBA un reembolso tocamos
+    # tx.status (-> 'refunded', igual que cualquier otro reembolso), momento
+    # en el que todas esas lecturas YA saben qué hacer con ese valor.
+    """
+    CREATE TABLE IF NOT EXISTS refund_requests (
+        id                    BIGSERIAL PRIMARY KEY,
+        tx_id                 BIGINT NOT NULL,
+        user_id               BIGINT NOT NULL,
+        reason                TEXT,
+        status                TEXT NOT NULL DEFAULT 'requested',
+        hero_status_snapshot  TEXT,
+        reviewed_by           BIGINT,
+        reviewed_at           TIMESTAMPTZ,
+        created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_refund_requests_tx ON refund_requests(tx_id)",
+    "CREATE INDEX IF NOT EXISTS idx_refund_requests_status ON refund_requests(status)",
+    # Como mucho UNA solicitud abierta ('requested') por tx a la vez -evita
+    # que el usuario spamee /reembolso y genere varios mensajes duplicados
+    # al admin para la misma compra mientras la primera sigue sin revisar.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_refund_requests_one_open
+    ON refund_requests(tx_id) WHERE status = 'requested'
+    """,
 ]
 
 
@@ -650,6 +694,29 @@ class Database:
             )
             return _affected_rows(tag) > 0
 
+    async def mark_channel_joined(self, user_id: int) -> None:
+        """
+        Llamado desde handlers.on_channel_member_update cuando Telegram
+        confirma (vía evento chat_member del canal) que este user_id se
+        unió al canal de comunidad. No pisa un valor ya guardado -si el
+        usuario se va y vuelve, nos interesa la PRIMERA vez que se unió,
+        no la última.
+        """
+        async with self._conn() as conn:
+            await conn.execute(
+                "UPDATE users SET channel_joined_at = NOW() "
+                "WHERE user_id = $1 AND channel_joined_at IS NULL",
+                user_id,
+            )
+
+    async def mark_channel_invite_sent(self, user_id: int) -> None:
+        """Registra que ya se le mandó el nudge puntual (ver _maybe_prompt_channel_join), para no repetirlo."""
+        async with self._conn() as conn:
+            await conn.execute(
+                "UPDATE users SET channel_invite_sent_at = NOW() WHERE user_id = $1",
+                user_id,
+            )
+
     async def get_referral_stats(self, user_id: int) -> dict:
         """
         Estadísticas para /referidos: cuántos usuarios entraron con su
@@ -749,6 +816,61 @@ class Database:
             )
             released.append({**r, "new_balance": new_balance})
         return released
+
+    # ── Solicitudes de reembolso post-entrega ────────────────────────────────
+    # Ver DDL de refund_requests arriba para el motivo de ser tabla aparte.
+    # Flujo: create_refund_request (usuario) -> admin ve el mensaje con
+    # botones -> set_refund_request_status('approved'/'denied'). Aprobar
+    # SIGUE requiriendo que el caller (handlers.py) acredite el saldo y
+    # llame a set_status(tx_id, 'refunded') -esta capa solo lleva la
+    # auditoría de la solicitud en sí, no mueve plata.
+
+    async def create_refund_request(
+        self, tx_id: int, user_id: int, reason: str, hero_status_snapshot: str = None,
+    ) -> Optional[int]:
+        """
+        Crea la solicitud si no hay ya una abierta ('requested') para esa
+        tx (ver índice único idx_refund_requests_one_open). Devuelve el id
+        nuevo, o None si ya había una abierta -el caller (handlers.py)
+        distingue ese caso para avisarle al usuario en vez de duplicar el
+        aviso al admin.
+        """
+        async with self._conn() as conn:
+            try:
+                row = await conn.fetchrow(
+                    "INSERT INTO refund_requests (tx_id, user_id, reason, hero_status_snapshot) "
+                    "VALUES ($1, $2, $3, $4) RETURNING id",
+                    tx_id, user_id, reason, hero_status_snapshot,
+                )
+                return int(row["id"])
+            except asyncpg.UniqueViolationError:
+                return None
+
+    async def get_open_refund_request_for_tx(self, tx_id: int) -> Optional[dict]:
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM refund_requests WHERE tx_id = $1 AND status = 'requested'",
+                tx_id,
+            )
+            return dict(row) if row else None
+
+    async def get_refund_request(self, request_id: int) -> Optional[dict]:
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM refund_requests WHERE id = $1", request_id,
+            )
+            return dict(row) if row else None
+
+    async def set_refund_request_status(
+        self, request_id: int, status: str, reviewed_by: int,
+    ) -> None:
+        """status: 'approved' o 'denied'."""
+        async with self._conn() as conn:
+            await conn.execute(
+                "UPDATE refund_requests SET status = $1, reviewed_by = $2, reviewed_at = NOW() "
+                "WHERE id = $3",
+                status, reviewed_by, request_id,
+            )
 
     # ── Saldo interno (wallet virtual) ───────────────────────────────────────
 

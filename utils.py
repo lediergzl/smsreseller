@@ -10,6 +10,8 @@ import qrcode
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from config import COMMUNITY_CHANNEL_URL
+
 logger = logging.getLogger(__name__)
 
 
@@ -365,6 +367,31 @@ def purchase_cup_review_keyboard(tx_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def channel_invite_keyboard() -> InlineKeyboardMarkup:
+    """Botón único para el nudge puntual (ver MSG_CHANNEL_INVITE). Solo se
+    llama si config.COMMUNITY_CHANNEL_URL está seteado -mismo chequeo que
+    main_menu_keyboard, ver handlers._maybe_prompt_channel_join."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📢 Unirme al canal", url=COMMUNITY_CHANNEL_URL)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def refund_request_review_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    """
+    Botones de aprobar/denegar una solicitud de reembolso post-entrega
+    (callback_data "rfnd_*", keyed por refund_requests.id -NO por tx_id,
+    porque una misma tx puede tener más de una solicitud a lo largo del
+    tiempo si una denegada se vuelve a abrir después- ver
+    handlers.cb_admin_approve_refund_request / cb_admin_deny_refund_request).
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Aprobar reembolso", callback_data=f"rfnd_ok:{request_id}")
+    builder.button(text="❌ Denegar", callback_data=f"rfnd_no:{request_id}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 def withdraw_start_keyboard() -> InlineKeyboardMarkup:
     """Botón para iniciar un retiro de saldo interno a cripto desde /saldo."""
     builder = InlineKeyboardBuilder()
@@ -467,6 +494,15 @@ def main_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
     sistemas que no existen aún, ver database.py; un botón que no hace
     nada es peor que no tenerlo).
 
+    El botón "📢 Canal oficial" (si config.COMMUNITY_CHANNEL_URL está
+    seteado) es la captación pasiva: queda siempre a la vista en TODOS
+    lados donde se muestra este menú, sin mandar ningún mensaje extra ni
+    requerir que un admin postee nada -es la opción de "poco esfuerzo".
+    Es un botón de URL (abre Telegram directo), no callback_data, así que
+    no hay forma de contar clicks desde acá -la confirmación real de quién
+    se unió llega por separado vía el evento chat_member del canal (ver
+    handlers.on_channel_member_update).
+
     Grilla de 3 columnas (en vez de 2) para que se vea más compacto,
     estilo "app menu" (ver referencia: teclado de Cwallet). Si `is_admin`
     es True, se agrega un botón extra que abre el panel de administrador
@@ -480,11 +516,14 @@ def main_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
     builder.button(text="🌍 Mi país",          callback_data="my_country")
     builder.button(text="🔗 Invitar amigos",   callback_data="my_referrals")
     builder.button(text="🆘 Soporte",          callback_data="support")
+    rows = [3, 3, 1]
+    if COMMUNITY_CHANNEL_URL:
+        builder.button(text="📢 Canal oficial", url=COMMUNITY_CHANNEL_URL)
+        rows = [3, 3, 2]
     if is_admin:
         builder.button(text="🛠️ Panel admin", callback_data="admin_panel")
-        builder.adjust(3, 3, 1, 1)
-    else:
-        builder.adjust(3, 3, 1)
+        rows.append(1)
+    builder.adjust(*rows)
     return builder.as_markup()
 
 
@@ -905,4 +944,62 @@ MSG_REFERRAL_BONUS_EARNED = (
     "Bono acreditado: {bonus_usd}\n"
     "Saldo actual: {new_balance}\n\n"
     "Consulta /referidos o /saldo."
+)
+
+# ── Canal de comunidad ────────────────────────────────────────────────────────
+# Nudge puntual (una sola vez, ver database.mark_channel_invite_sent) que se
+# manda justo después de la primera compra completada -el momento de mayor
+# confianza posible, recién tuvo una experiencia buena. El botón "📢 Canal
+# oficial" del menú principal (ver utils.main_menu_keyboard) ya está siempre
+# visible; esto es un empujón adicional en el mejor momento, no un reemplazo.
+MSG_CHANNEL_INVITE = (
+    "📢 Antes de que sigas, unite a nuestro canal -ahí vas a enterarte "
+    "primero de lo nuevo (servicios, países, promos) sin tener que estar "
+    "pendiente del bot.\n\n"
+    "Es de solo lectura, nadie te va a escribir ni vas a recibir spam."
+)
+
+# ── Solicitud de reembolso post-entrega ──────────────────────────────────────
+# A diferencia de un reembolso automático (timeout de SMS, cancelación antes
+# de completar), esto cubre el caso donde el número YA se entregó y el
+# código YA llegó, pero el cliente igual pide reembolso (ej. "no me sirvió
+# en el servicio destino"). Política: solo se aprueba si HeroSMS confirma un
+# problema real del número (cancelado/no entregado); si el código se
+# entregó bien, el reclamo es contra el servicio destino, no contra
+# nosotros -ver handlers.cmd_reembolso / cb_admin_approve_refund_request.
+
+MSG_REFUND_REQUEST_RECEIVED = (
+    "📨 <b>Solicitud de reembolso recibida</b> (tx <code>{tx_id}</code>).\n"
+    "Un administrador la va a revisar. Te avisamos apenas se resuelva.\n\n"
+    "Recuerda: solo se aprueban reembolsos cuando el número tuvo un "
+    "problema real de nuestro lado (nunca llegó el código, activación "
+    "cancelada, etc.). Si el número funcionó pero el servicio donde lo "
+    "usaste lo rechazó, ese reclamo no es reembolsable aquí."
+)
+
+MSG_REFUND_ALREADY_OPEN = (
+    "⚠️ Ya tienes una solicitud de reembolso abierta para la tx "
+    "<code>{tx_id}</code>. Espera a que se resuelva antes de abrir otra."
+)
+
+MSG_REFUND_NOT_ELIGIBLE = (
+    "❌ Esa transacción no es elegible para reembolso (o no existe / no es "
+    "tuya). Solo se puede pedir reembolso de una compra ya <b>completada</b> "
+    "(número entregado). Usa /historial para ver el estado de tus compras."
+)
+
+MSG_REFUND_APPROVED = (
+    "💸 <b>Reembolso aprobado</b> (tx <code>{tx_id}</code>).\n"
+    "Se confirmó un problema con el número de nuestro lado.\n"
+    "Se acreditaron {credit_amount} a tu saldo interno "
+    "(saldo total: {new_balance}; se retiene un {fee_pct} de cargo de "
+    "servicio). Consulta /saldo."
+)
+
+MSG_REFUND_DENIED = (
+    "❌ <b>Reembolso denegado</b> (tx <code>{tx_id}</code>).\n"
+    "El número se entregó correctamente y el código llegó sin problemas "
+    "de nuestro lado. Si el servicio donde lo usaste lo rechazó, ese es "
+    "un problema de ese servicio, no del número -no es reembolsable aquí.\n\n"
+    "Si crees que es un error, contacta al soporte indicando este ID."
 )
