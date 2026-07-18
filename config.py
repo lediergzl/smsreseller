@@ -293,6 +293,28 @@ REFERRAL_BONUS_PCT: float = float(os.getenv("REFERRAL_BONUS_PCT", "0.10"))  # 10
 # de CUP sin querer.
 REFERRAL_MIN_PURCHASE_USD: float = float(os.getenv("REFERRAL_MIN_PURCHASE_USD", "0.20"))
 
+# Horas de "período de gracia" antes de que un bono de referido se
+# acredite de verdad al saldo del referidor. Cierra el hueco donde el
+# bono se pagaba al instante al completarse la compra, pero esa compra
+# podía terminar reembolsada (timeout de SMS, cancelación, reembolso
+# manual futuro) sin que el bono ya cobrado se revirtiera. Con esto, el
+# bono queda en `referrals.status = 'pending'` hasta que pasan estas
+# horas Y la tx sigue 'completed' -ver database.release_pending_referrals
+# y el loop handlers._release_referrals_loop-. 24h es suficiente para
+# cubrir timeouts de SMS y reclamos típicos sin que el referidor note
+# la demora (ver MSG_REFERRAL_NEW_SIGNUP, que ya avisa "bono automático"
+# sin prometer que sea instantáneo).
+REFERRAL_HOLD_HOURS: float = float(os.getenv("REFERRAL_HOLD_HOURS", "24"))
+
+# Cada cuántos segundos handlers._release_referrals_loop revisa si hay
+# bonos 'pending' que ya cumplieron REFERRAL_HOLD_HOURS. No hace falta
+# que sea muy frecuente -a diferencia de PAYMENT_POLL_INTERVAL/
+# SMS_POLL_INTERVAL, que sí necesitan reaccionar rápido a algo que el
+# usuario está esperando en pantalla, acá nadie está mirando el reloj.
+# Default 1 hora: suficiente resolución para un umbral de 24h sin generar
+# carga extra en la base de datos.
+REFERRAL_RELEASE_INTERVAL: int = int(os.getenv("REFERRAL_RELEASE_INTERVAL", str(3600)))
+
 # ── Administración / Reportes ─────────────────────────────────────────────────
 # Chat/canal donde el bot manda alertas en tiempo real (pago confirmado, venta
 # completada, reembolsos, timeouts). Usa el ID de un canal o grupo privado

@@ -227,6 +227,17 @@ _DDL_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)",
     "CREATE INDEX IF NOT EXISTS idx_referrals_referred ON referrals(referred_id)",
+    # status/released_at: soporte del "período de gracia" antirreembolso
+    # (ver config.REFERRAL_HOLD_HOURS). DEFAULT 'completed' a propósito:
+    # las filas que ya existían antes de este ALTER fueron acreditadas al
+    # instante por el código viejo, así que hay que tratarlas como ya
+    # liquidadas, NO como pendientes -si el default fuera 'pending', el
+    # loop de liberación las re-evaluaría y, en el peor caso, volvería a
+    # acreditar un bono que ya se pagó hace tiempo. Las filas nuevas
+    # pasan 'pending' explícito desde register_referral_bonus_pending.
+    "ALTER TABLE referrals ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed'",
+    "ALTER TABLE referrals ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ",
+    "CREATE INDEX IF NOT EXISTS idx_referrals_status ON referrals(status)",
 ]
 
 
@@ -642,8 +653,9 @@ class Database:
     async def get_referral_stats(self, user_id: int) -> dict:
         """
         Estadísticas para /referidos: cuántos usuarios entraron con su
-        enlace (`invited`), a cuántos ya se les pagó bono (`paid`, hecho
-        vía `referrals`) y el total ganado en USD.
+        enlace (`invited`), a cuántos ya se les pagó bono (`paid`, solo
+        status='completed' -pending/cancelled no cuentan como pagado, ver
+        release_pending_referrals) y el total ganado en USD.
         """
         async with self._conn() as conn:
             invited = await conn.fetchval(
@@ -651,7 +663,7 @@ class Database:
             )
             row = await conn.fetchrow(
                 "SELECT COUNT(*) AS paid, COALESCE(SUM(bonus_usd), 0) AS total_bonus "
-                "FROM referrals WHERE referrer_id = $1",
+                "FROM referrals WHERE referrer_id = $1 AND status = 'completed'",
                 user_id,
             )
             return {
@@ -660,27 +672,83 @@ class Database:
                 "total_bonus": float(row["total_bonus"]),
             }
 
-    async def register_referral_bonus(
+    async def register_referral_bonus_pending(
         self, referrer_id: int, referred_id: int, tx_id: int, bonus_usd: float,
-    ) -> float:
+    ) -> None:
         """
-        Registra el bono en `referrals` (auditoría/estadísticas de
-        /referidos) y lo acredita al saldo del referidor con origen
-        'crypto' (retirable, igual que una recarga cripto). Devuelve el
-        nuevo saldo TOTAL del referidor. Pensado para llamarse UNA sola
-        vez por usuario referido -ver handlers._maybe_credit_referral_bonus,
-        que solo dispara en la primera compra completada del referido.
+        Registra el bono en `referrals` con status='pending' pero NO
+        acredita saldo todavía -a diferencia de la versión vieja de este
+        método (instant-pay), que dejaba una ventana de estafa: el
+        referidor cobraba el bono y después la compra se reembolsaba
+        (timeout de SMS, cancelación, etc.) sin que el bono ya cobrado se
+        revirtiera. El crédito real ocurre en release_pending_referrals(),
+        tras config.REFERRAL_HOLD_HOURS, y solo si la tx sigue
+        'completed'. Pensado para llamarse UNA sola vez por usuario
+        referido -ver handlers._maybe_credit_referral_bonus.
         """
         async with self._conn() as conn:
             await conn.execute(
-                "INSERT INTO referrals (referrer_id, referred_id, tx_id, bonus_usd) "
-                "VALUES ($1, $2, $3, $4)",
+                "INSERT INTO referrals (referrer_id, referred_id, tx_id, bonus_usd, status) "
+                "VALUES ($1, $2, $3, $4, 'pending')",
                 referrer_id, referred_id, tx_id, bonus_usd,
             )
-        return await self.credit_balance(
-            referrer_id, bonus_usd, tx_id,
-            reason=f"Bono de referido (usuario {referred_id})", origin="crypto",
-        )
+
+    async def release_pending_referrals(self, hold_hours: float) -> list[dict]:
+        """
+        Revisa bonos 'pending' con más de `hold_hours` de antigüedad
+        (contadas desde referrals.created_at, o sea desde que se completó
+        la compra que los disparó). Para cada uno:
+          - si la tx sigue 'completed' -> se acredita el bono al saldo del
+            referidor (origen 'crypto', retirable) y se marca 'completed'.
+          - si la tx terminó en cualquier otro estado (ej. 'refunded',
+            'sms_timeout') -> se marca 'cancelled' sin acreditar nada.
+
+        Devuelve la lista de bonos efectivamente acreditados en esta
+        pasada (dicts con referrer_id/referred_id/tx_id/bonus_usd), para
+        que el caller (ver handlers._release_referrals_loop, que sí tiene
+        acceso al `bot`) pueda notificar a cada referidor. Pensado para
+        llamarse periódicamente desde un loop en background, no desde un
+        handler de usuario.
+        """
+        to_credit: list[dict] = []
+        async with self._conn() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT r.id, r.referrer_id, r.referred_id, r.tx_id, r.bonus_usd,
+                       t.status AS tx_status
+                FROM referrals r
+                JOIN transactions t ON t.id = r.tx_id
+                WHERE r.status = 'pending'
+                  AND r.created_at < NOW() - ($1 * INTERVAL '1 hour')
+                """,
+                hold_hours,
+            )
+            for row in rows:
+                if row["tx_status"] == "completed":
+                    await conn.execute(
+                        "UPDATE referrals SET status = 'completed', released_at = NOW() "
+                        "WHERE id = $1",
+                        row["id"],
+                    )
+                    to_credit.append(dict(row))
+                else:
+                    await conn.execute(
+                        "UPDATE referrals SET status = 'cancelled', released_at = NOW() "
+                        "WHERE id = $1",
+                        row["id"],
+                    )
+
+        # credit_balance abre su propia conexión del pool -se hace fuera
+        # del `async with` de arriba para no anidar conexiones/pedir dos
+        # del pool al mismo tiempo en la misma tarea.
+        released = []
+        for r in to_credit:
+            new_balance = await self.credit_balance(
+                r["referrer_id"], r["bonus_usd"], r["tx_id"],
+                reason=f"Bono de referido (usuario {r['referred_id']})", origin="crypto",
+            )
+            released.append({**r, "new_balance": new_balance})
+        return released
 
     # ── Saldo interno (wallet virtual) ───────────────────────────────────────
 

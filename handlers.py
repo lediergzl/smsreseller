@@ -24,7 +24,7 @@ from config import WITHDRAWAL_FEE_PCT, WITHDRAWAL_ALLOWED_CURRENCIES, DEPOSIT_MI
 from config import MANUAL_DEPOSIT_MIN_USD, MANUAL_DEPOSIT_MAX_USD, MANUAL_DEPOSIT_CUP_RATE
 from config import MANUAL_DEPOSIT_CUP_MARGIN_PCT, MANUAL_DEPOSIT_CUP_EXPOSURE_ALERT_USD, MANUAL_PURCHASE_MIN_USD
 from config import ACCOUNT_TYPE_LABELS
-from config import REFERRAL_BONUS_PCT, REFERRAL_MIN_PURCHASE_USD
+from config import REFERRAL_BONUS_PCT, REFERRAL_MIN_PURCHASE_USD, REFERRAL_HOLD_HOURS, REFERRAL_RELEASE_INTERVAL
 from database import db
 from utils import (
     format_amount, format_cup, apply_markup, apply_refund_fee, apply_withdrawal_fee, floor_to_cents, format_phone,
@@ -315,9 +315,17 @@ async def _maybe_credit_referral_bonus(bot, tx_id: int):
     lugares donde eso pasa (_poll_sms y el chequeo de último momento en
     cb_new_purchase_cancel). Cualquier error queda solo logueado: la
     entrega del número al comprador ya fue exitosa en este punto y esta
-    lógica no debe poder romperla ni duplicarla (register_referral_bonus
+    lógica no debe poder romperla ni duplicarla (register_referral_bonus_pending
     solo se llama una vez por tx, ya que count_completed_orders == 1 solo
     es cierto en la tx que acaba de completarse por primera vez).
+
+    IMPORTANTE: esto NO acredita el bono todavía, solo lo deja anotado
+    como 'pending'. El crédito real (y el aviso al referidor con
+    MSG_REFERRAL_BONUS_EARNED) ocurre más tarde en _release_referrals_loop,
+    después de config.REFERRAL_HOLD_HOURS y solo si la compra no terminó
+    reembolsada -ver database.release_pending_referrals para el motivo
+    (evitar que el referidor cobre un bono de una compra que se reembolsa
+    después).
     """
     try:
         tx = await db.get_by_id(tx_id)
@@ -340,16 +348,38 @@ async def _maybe_credit_referral_bonus(bot, tx_id: int):
         if bonus <= 0:
             return
 
-        new_balance = await db.register_referral_bonus(referrer_id, buyer_id, tx_id, bonus)
-        await _safe_send(
-            bot, referrer_id,
-            MSG_REFERRAL_BONUS_EARNED.format(
-                bonus_usd=format_amount(bonus, "USD"),
-                new_balance=format_amount(new_balance, "USD"),
-            ),
-        )
+        await db.register_referral_bonus_pending(referrer_id, buyer_id, tx_id, bonus)
     except Exception as exc:
-        logger.error("No se pudo acreditar bono de referido para tx=%s: %s", tx_id, exc)
+        logger.error("No se pudo registrar bono de referido pendiente para tx=%s: %s", tx_id, exc)
+
+
+async def _release_referrals_loop(bot):
+    """
+    Loop en background (arrancar UNA vez al iniciar el bot, ej. junto a
+    backup_task.db_health_loop) que cada REFERRAL_RELEASE_INTERVAL
+    segundos llama a db.release_pending_referrals(REFERRAL_HOLD_HOURS)
+    para acreditar los bonos 'pending' que ya cumplieron el período de
+    gracia y siguen ligados a una compra 'completed'. Notifica a cada
+    referidor recién acreditado con el mismo mensaje que antes se mandaba
+    al instante (MSG_REFERRAL_BONUS_EARNED), solo que ahora llega cuando
+    el bono ya es definitivo. No se registra con create_task por-tx como
+    _poll_sms/_poll_payment porque no depende de una tx puntual: corre
+    indefinidamente para toda la tabla `referrals`.
+    """
+    while True:
+        try:
+            released = await db.release_pending_referrals(REFERRAL_HOLD_HOURS)
+            for r in released:
+                await _safe_send(
+                    bot, r["referrer_id"],
+                    MSG_REFERRAL_BONUS_EARNED.format(
+                        bonus_usd=format_amount(r["bonus_usd"], "USD"),
+                        new_balance=format_amount(r["new_balance"], "USD"),
+                    ),
+                )
+        except Exception as exc:
+            logger.error("Error liberando bonos de referido pendientes: %s", exc)
+        await asyncio.sleep(REFERRAL_RELEASE_INTERVAL)
 
 
 async def _credit_refund_for_tx(user_id: int, tx: dict, amount_usd: float, tx_id: int, reason: str) -> float:
