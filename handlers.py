@@ -1171,11 +1171,26 @@ async def _send_saldo(user_id: int, answer_func):
     # mostraría igual el botón "Retirar en CUP".
     can_withdraw_cup    = cup_available > 0 and cup_available >= CUP_WITHDRAWAL_MIN_USD
 
+    # El origen CUP se muestra en CUP real, no en su equivalente interno en
+    # USD (ver utils.format_cup: mostrar un monto de origen CUP con
+    # etiqueta USD confunde a quien compró/paga siempre en CUP y nunca
+    # piensa en dólares). Misma tasa de PAYOUT que usa el retiro real
+    # (cb_start_cup_withdraw, ver más abajo) -así el número que se ve acá
+    # es el mismo que el usuario después efectivamente puede retirar, no
+    # una conversión aparte que podría no coincidir.
+    payout_rate = effective_cup_rate_payout(MANUAL_DEPOSIT_CUP_RATE, MANUAL_DEPOSIT_CUP_MARGIN_PCT)
+    cup_available_cup = usd_to_cup(cup_available, payout_rate)
+    cup_min_cup        = usd_to_cup(CUP_WITHDRAWAL_MIN_USD, payout_rate)
+
+    # El total sigue en USD -es la unidad interna que combina ambos
+    # orígenes para gastar en una compra (ver MSG más abajo)-, pero ya NO
+    # es lo primero ni lo único que ve el usuario: el desglose por origen,
+    # en su moneda real, es lo que evita la confusión.
     lines = [f"💰 <b>Tu saldo interno:</b> {format_amount(total_available, 'USD')}"]
     if crypto_available > 0 or cup_available > 0:
         lines.append(
             f"   ↳ Origen cripto (retirable a cripto): {format_amount(crypto_available, 'USD')}\n"
-            f"   ↳ Origen CUP (retirable en CUP): {format_amount(cup_available, 'USD')}"
+            f"   ↳ Origen CUP (retirable en CUP): {format_cup(cup_available_cup)}"
         )
     lines.append(
         "\nSe aplica automáticamente como opción de pago en tu próxima compra "
@@ -1191,7 +1206,7 @@ async def _send_saldo(user_id: int, answer_func):
         )
     if not can_withdraw_cup and cup_available > 0:
         lines.append(
-            f"\n(Te faltan {format_amount(CUP_WITHDRAWAL_MIN_USD - cup_available, 'USD')} "
+            f"\n(Te faltan {format_cup(cup_min_cup - cup_available_cup)} "
             "de origen CUP para poder retirar en CUP.)"
         )
 

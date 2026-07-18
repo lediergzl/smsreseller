@@ -571,6 +571,9 @@ def main_persistent_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
         rows.append([KeyboardButton(text="🛠️ Panel admin")])
 
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+
+
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
     """
     Panel de administrador en forma de grilla, mismo estilo que
     main_menu_keyboard: acceso rápido a los comandos administrativos más
