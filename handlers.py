@@ -21,7 +21,7 @@ from config import PAYMENT_POLL_INTERVAL, SMS_POLL_INTERVAL
 from config import ADMIN_CHAT_ID, ADMIN_IDS
 from config import REFUND_FEE_PCT, ABUSE_MAX_STRIKES, ABUSE_WINDOW_HOURS, ABUSE_BLOCK_HOURS
 from config import WITHDRAWAL_FEE_PCT, WITHDRAWAL_ALLOWED_CURRENCIES, DEPOSIT_MIN_USD, WITHDRAWAL_MIN_USD, CUP_WITHDRAWAL_MIN_USD
-from config import MANUAL_PAYMENT_METHODS, MANUAL_DEPOSIT_MIN_USD, MANUAL_DEPOSIT_MAX_USD, MANUAL_DEPOSIT_CUP_RATE
+from config import MANUAL_DEPOSIT_MIN_USD, MANUAL_DEPOSIT_MAX_USD, MANUAL_DEPOSIT_CUP_RATE
 from config import MANUAL_DEPOSIT_CUP_MARGIN_PCT, MANUAL_DEPOSIT_CUP_EXPOSURE_ALERT_USD, MANUAL_PURCHASE_MIN_USD
 from config import ACCOUNT_TYPE_LABELS
 from database import db
@@ -1019,6 +1019,105 @@ async def cmd_set_pais(message: Message):
     )
 
 
+@router.message(Command("metodos"))
+async def cmd_metodos(message: Message):
+    """Lista los métodos de pago manual (CUP) configurados, activos e inactivos."""
+    if not _is_admin_dm(message):
+        return
+
+    methods = await db.get_payment_methods(active_only=False)
+    if not methods:
+        await message.answer(
+            "No hay métodos de pago configurados todavía.\n"
+            "Usa <code>/set_metodo code | nombre | cuenta</code> para agregar uno.",
+            parse_mode="HTML",
+        )
+        return
+
+    lines = ["🇨🇺 <b>Métodos de pago manual (CUP)</b>\n"]
+    for code, m in methods.items():
+        estado = "🟢" if m["active"] else "🔴"
+        lines.append(
+            f"{estado} <code>{code}</code> · {m['name']}\n"
+            f"    Cuenta: <code>{m['account']}</code>"
+        )
+    lines.append(
+        "\nEditar/crear: <code>/set_metodo code | nombre | cuenta</code>\n"
+        "Desactivar: <code>/quitar_metodo code</code>"
+    )
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("set_metodo"))
+async def cmd_set_metodo(message: Message):
+    """
+    Crea o actualiza un método de pago manual (tarjeta/cuenta CUP). Antes
+    esto vivía hardcodeado en config.MANUAL_PAYMENT_METHODS y requería
+    editar código y redeployar para cambiar una cuenta; ahora es una fila
+    en la tabla `payment_methods` (ver database.upsert_payment_method) y
+    el cambio se aplica al instante, sin tocar código.
+    """
+    if not _is_admin_dm(message):
+        return
+
+    # code | nombre | cuenta  (el nombre puede tener espacios, por eso "|"
+    # como separador en vez de split() a secas)
+    raw = (message.text or "").split(maxsplit=1)[1:]
+    parts = [p.strip() for p in (raw[0].split("|") if raw else [])]
+    if len(parts) != 3 or not all(parts):
+        await message.answer(
+            "Uso: <code>/set_metodo code | nombre | cuenta</code>\n"
+            "Ej: <code>/set_metodo transfermovil | Transferencia (CUP) | "
+            "Tarjeta 9234 XXXX XXXX 1234</code>\n\n"
+            "Si <code>code</code> ya existe, actualiza nombre/cuenta y lo "
+            "reactiva si estaba desactivado. Ve /metodos para ver los que hay.",
+            parse_mode="HTML",
+        )
+        return
+
+    code, name, account = parts
+    code = code.lower().replace(" ", "_")
+
+    await db.upsert_payment_method(code, name, account, updated_by=message.from_user.id)
+    await message.answer(
+        f"✅ Método <code>{code}</code> guardado:\n"
+        f"Nombre: {name}\n"
+        f"Cuenta: <code>{account}</code>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("quitar_metodo"))
+async def cmd_quitar_metodo(message: Message):
+    """
+    Desactiva un método de pago (no lo borra: transacciones y retiros
+    viejos que ya lo usaron siguen mostrando su nombre correctamente, ver
+    handlers._find_manual_method_name). Deja de ofrecerse a usuarios
+    nuevos hasta que se reactive con /set_metodo.
+    """
+    if not _is_admin_dm(message):
+        return
+
+    args = (message.text or "").split()[1:]
+    if len(args) != 1:
+        await message.answer(
+            "Uso: <code>/quitar_metodo code</code>\nVe /metodos para ver los códigos.",
+            parse_mode="HTML",
+        )
+        return
+
+    code = args[0].lower().replace(" ", "_")
+    if not await db.set_payment_method_active(code, active=False):
+        await message.answer(f"⚠️ No existe el método <code>{code}</code>.", parse_mode="HTML")
+        return
+
+    await message.answer(
+        f"✅ Método <code>{code}</code> desactivado. Ya no se ofrece a usuarios nuevos "
+        "(reactivalo con /set_metodo si te equivocaste).",
+        parse_mode="HTML",
+    )
+
+
 # ── Menú principal (callback) ─────────────────────────────────────────────────
 
 @router.callback_query(F.data == "new_purchase")
@@ -1315,7 +1414,7 @@ async def _quote_and_show_currency_menu(
         parse_mode="HTML",
         reply_markup=currencies_keyboard(
             options, balance_usd=balance_usd, price_usd=price_usd,
-            manual_cup_available=bool(MANUAL_PAYMENT_METHODS),
+            manual_cup_available=bool(await db.get_payment_methods()),
         ),
     )
     return True
@@ -1470,21 +1569,22 @@ async def cb_select_currency(call: CallbackQuery, state: FSMContext):
 async def cb_pay_cup(call: CallbackQuery, state: FSMContext):
     await _safe_call_answer(call)
 
-    if not MANUAL_PAYMENT_METHODS:
+    methods = await db.get_payment_methods()
+    if not methods:
         await call.message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
         return
 
     await _collapse_selection(call, "✅ Pagando en CUP")
 
-    if len(MANUAL_PAYMENT_METHODS) == 1:
-        method_code = next(iter(MANUAL_PAYMENT_METHODS))
+    if len(methods) == 1:
+        method_code = next(iter(methods))
         await _start_manual_purchase_payment(call.message, state, method_code)
         return
 
     await state.set_state(PurchaseFlow.selecting_manual_method)
     await call.message.answer(
         "🇨🇺 Elige con qué vas a transferir:",
-        reply_markup=manual_payment_methods_keyboard(MANUAL_PAYMENT_METHODS),
+        reply_markup=manual_payment_methods_keyboard(methods),
     )
 
 
@@ -1492,13 +1592,14 @@ async def cb_pay_cup(call: CallbackQuery, state: FSMContext):
 async def cb_select_purchase_manual_method(call: CallbackQuery, state: FSMContext):
     await _safe_call_answer(call)
     method_code = call.data.split(":", 1)[1]
-    method_name = MANUAL_PAYMENT_METHODS.get(method_code, {}).get("name", method_code)
+    methods = await db.get_payment_methods()
+    method_name = methods.get(method_code, {}).get("name", method_code)
     await _collapse_selection(call, f"✅ Transferencia elegida: {method_name}")
     await _start_manual_purchase_payment(call.message, state, method_code)
 
 
 async def _start_manual_purchase_payment(message: Message, state: FSMContext, method_code: str):
-    method = MANUAL_PAYMENT_METHODS.get(method_code)
+    method = (await db.get_payment_methods()).get(method_code)
     if not method:
         await message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
         await state.clear()
@@ -1589,7 +1690,8 @@ async def msg_purchase_manual_proof(message: Message, state: FSMContext):
     )
 
     tx = await db.get_by_id(tx_id)
-    method_name = MANUAL_PAYMENT_METHODS.get(data.get("manual_method_code"), {}).get("name", "CUP")
+    methods = await db.get_payment_methods()
+    method_name = methods.get(data.get("manual_method_code"), {}).get("name", "CUP")
     amount_cup_str = f"{data.get('manual_amount_cup', 0):,}".replace(",", " ")
     caption = (
         _reused_proof_warning(reused) +
@@ -2041,17 +2143,22 @@ async def _poll_sms(
     await state.clear()
 
 
-def _find_manual_method_name(account: str | None) -> str | None:
+async def _find_manual_method_name(account: str | None) -> str | None:
     """
-    Busca en MANUAL_PAYMENT_METHODS cuál método tiene esta cuenta/tarjeta
-    (guardada como pay_address en la tx, ver _start_manual_purchase_payment)
-    para recuperar su nombre legible (ej. 'Transfermóvil (CUP)') al reanudar
-    una compra CUP tras un reinicio, ya que el método_code en sí no se
-    persiste en la tabla `transactions`. None si no hay match.
+    Busca entre los métodos de pago (ver database.get_payment_methods, antes
+    era el dict estático config.MANUAL_PAYMENT_METHODS) cuál tiene esta
+    cuenta/tarjeta (guardada como pay_address en la tx, ver
+    _start_manual_purchase_payment) para recuperar su nombre legible (ej.
+    'Transfermóvil (CUP)') al reanudar una compra CUP tras un reinicio, ya
+    que el método_code en sí no se persiste en la tabla `transactions`.
+    None si no hay match — incluye métodos inactivos (active_only=False),
+    para que una tx vieja que usó una tarjeta ya dada de baja siga
+    mostrando su nombre en vez de "CUP" genérico.
     """
     if not account:
         return None
-    for method in MANUAL_PAYMENT_METHODS.values():
+    methods = await db.get_payment_methods(active_only=False)
+    for method in methods.values():
         if method.get("account") == account:
             return method.get("name")
     return None
@@ -2196,7 +2303,7 @@ async def resume_transaction(bot, storage, tx: dict) -> str:
             return "manual_review_resumed_awaiting_admin"
 
         reference_code = f"REF-{tx_id:06d}"
-        method_name = _find_manual_method_name(tx.get("pay_address")) or "CUP"
+        method_name = await _find_manual_method_name(tx.get("pay_address")) or "CUP"
         await state.update_data(
             manual_amount_cup      = tx.get("pay_amount"),
             manual_reference_code  = reference_code,
@@ -2664,7 +2771,7 @@ async def cb_start_cup_withdraw(call: CallbackQuery, state: FSMContext):
         )
         return
 
-    if not MANUAL_PAYMENT_METHODS:
+    if not await db.get_payment_methods():
         await call.message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
         return
 
@@ -2700,7 +2807,7 @@ async def cb_start_cup_withdraw(call: CallbackQuery, state: FSMContext):
     await call.message.answer(
         MSG_CUP_WITHDRAW_SELECT_METHOD.format(balance_cup=format_cup(balance_cup)),
         parse_mode="HTML",
-        reply_markup=cup_withdraw_methods_keyboard(MANUAL_PAYMENT_METHODS),
+        reply_markup=cup_withdraw_methods_keyboard(await db.get_payment_methods()),
     )
 
 
@@ -2708,7 +2815,7 @@ async def cb_start_cup_withdraw(call: CallbackQuery, state: FSMContext):
 async def cb_select_cup_withdraw_method(call: CallbackQuery, state: FSMContext):
     await _safe_call_answer(call)
     method_code = call.data.split(":", 1)[1]
-    method = MANUAL_PAYMENT_METHODS.get(method_code)
+    method = (await db.get_payment_methods()).get(method_code)
     if not method:
         await call.message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
         await state.clear()
@@ -3251,7 +3358,7 @@ async def cb_start_manual_deposit(call: CallbackQuery, state: FSMContext):
         )
         return
 
-    if not MANUAL_PAYMENT_METHODS:
+    if not await db.get_payment_methods():
         await call.message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
         return
 
@@ -3259,7 +3366,7 @@ async def cb_start_manual_deposit(call: CallbackQuery, state: FSMContext):
     await call.message.answer(
         MSG_MANUAL_DEPOSIT_SELECT_METHOD,
         parse_mode="HTML",
-        reply_markup=manual_payment_methods_keyboard(MANUAL_PAYMENT_METHODS),
+        reply_markup=manual_payment_methods_keyboard(await db.get_payment_methods()),
     )
 
 
@@ -3267,7 +3374,7 @@ async def cb_start_manual_deposit(call: CallbackQuery, state: FSMContext):
 async def cb_select_manual_method(call: CallbackQuery, state: FSMContext):
     await _safe_call_answer(call)
     method_code = call.data.split(":", 1)[1]
-    method = MANUAL_PAYMENT_METHODS.get(method_code)
+    method = (await db.get_payment_methods()).get(method_code)
     if not method:
         await call.message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
         await state.clear()
@@ -3312,7 +3419,19 @@ async def msg_manual_deposit_amount(message: Message, state: FSMContext):
     data = await state.get_data()
     method_code = data["manual_method"]
     method_name = data["manual_method_name"]
-    method = MANUAL_PAYMENT_METHODS[method_code]
+    method = await db.get_payment_method(method_code)
+    if not method or not method["active"]:
+        # Puede pasar ahora que las cuentas son editables en caliente por el
+        # admin (ver database.get_payment_method): el usuario eligió el
+        # método hace un rato y mientras tanto el admin lo desactivó o
+        # cambió de código. Mejor pedirle que arranque de nuevo que
+        # mostrarle una cuenta vieja o crashear con un KeyError.
+        await message.answer(
+            "⚠️ Ese método de pago ya no está disponible. Usa /start para elegir otro.",
+            parse_mode="HTML",
+        )
+        await state.clear()
+        return
 
     effective_rate = effective_cup_rate(MANUAL_DEPOSIT_CUP_RATE, MANUAL_DEPOSIT_CUP_MARGIN_PCT)
     amount_cup = usd_to_cup(amount, effective_rate)
@@ -3381,11 +3500,12 @@ async def msg_manual_deposit_proof(message: Message, state: FSMContext):
 
     dep = await db.get_manual_deposit_by_id(dep_id)
     cup_str = f"{dep['amount_cup']:,}".replace(",", " ") if dep.get("amount_cup") else "?"
+    dep_method = await db.get_payment_method(dep["method"])
     caption = (
         _reused_proof_warning(reused) +
         f"🇨🇺 <b>Nuevo depósito CUP a revisar</b>\n"
         f"Código: <code>{reference_code}</code>\n"
-        f"Método: {MANUAL_PAYMENT_METHODS.get(dep['method'], {}).get('name', dep['method'])}\n"
+        f"Método: {(dep_method or {}).get('name', dep['method'])}\n"
         f"Monto: {format_amount(dep['amount_usd'], 'USD')} ≈ {cup_str} CUP "
         f"(tasa {dep.get('cup_rate') or '?'})\n"
         f"👤 <code>{dep['user_id']}</code>"

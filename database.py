@@ -192,6 +192,18 @@ _DDL_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_outbox_status       ON outbox(status)",
     "CREATE INDEX IF NOT EXISTS idx_outbox_next_attempt  ON outbox(next_attempt_at)",
+    """
+    CREATE TABLE IF NOT EXISTS payment_methods (
+        code        TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        account     TEXT NOT NULL,
+        active      BOOLEAN NOT NULL DEFAULT TRUE,
+        sort_order  INTEGER NOT NULL DEFAULT 0,
+        updated_by  BIGINT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
 ]
 
 
@@ -1067,6 +1079,76 @@ class Database:
                 limit,
             )
             return [dict(r) for r in rows]
+
+    # ── Métodos de pago manual (CUP) ────────────────────────────────────────
+    # Reemplaza el antiguo config.MANUAL_PAYMENT_METHODS (dict hardcodeado):
+    # ahora el admin agrega/actualiza/desactiva tarjetas desde el propio bot
+    # (ver handlers.cmd_metodos / cmd_set_metodo / cmd_quitar_metodo), sin
+    # tocar código ni redeployar cada vez que cambia una cuenta.
+
+    async def get_payment_methods(self, active_only: bool = True) -> dict:
+        """
+        {code: {"name":..., "account":..., "active":..., "sort_order":...}},
+        mismo shape que antes tenía el dict estático
+        config.MANUAL_PAYMENT_METHODS — los call sites existentes solo leen
+        "name" y "account", así que los campos de más no rompen nada.
+        Ordenado por sort_order y luego code, para que el orden de los
+        botones sea predecible y el admin lo pueda controlar con
+        /set_metodo.
+        """
+        sql = "SELECT * FROM payment_methods"
+        if active_only:
+            sql += " WHERE active = TRUE"
+        sql += " ORDER BY sort_order ASC, code ASC"
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql)
+            return {r["code"]: dict(r) for r in rows}
+
+    async def get_payment_method(self, code: str) -> Optional[dict]:
+        async with self._conn() as conn:
+            row = await conn.fetchrow("SELECT * FROM payment_methods WHERE code = $1", code)
+            return dict(row) if row else None
+
+    async def upsert_payment_method(
+        self, code: str, name: str, account: str,
+        updated_by: Optional[int] = None, sort_order: Optional[int] = None,
+    ) -> None:
+        """
+        Crea el método si no existe, o actualiza nombre/cuenta si ya existe.
+        Siempre lo deja activo: corregir una tarjeta con /set_metodo también
+        sirve para reactivar una que se había desactivado con
+        /quitar_metodo.
+        """
+        async with self._conn() as conn:
+            await conn.execute(
+                """
+                INSERT INTO payment_methods (code, name, account, sort_order, updated_by)
+                VALUES ($1, $2, $3, COALESCE($4, 0), $5)
+                ON CONFLICT (code) DO UPDATE SET
+                    name       = EXCLUDED.name,
+                    account    = EXCLUDED.account,
+                    active     = TRUE,
+                    sort_order = COALESCE($4, payment_methods.sort_order),
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = NOW()
+                """,
+                code, name, account, sort_order, updated_by,
+            )
+
+    async def set_payment_method_active(self, code: str, active: bool) -> bool:
+        """
+        Desactiva (o reactiva) un método sin borrarlo — así una tarjeta
+        vieja deja de ofrecerse a usuarios nuevos pero sigue existiendo
+        para resolver el nombre en transacciones/retiros históricos que ya
+        la usaron (ver handlers._find_manual_method_name). Devuelve False
+        si el code no existe.
+        """
+        async with self._conn() as conn:
+            tag = await conn.execute(
+                "UPDATE payment_methods SET active = $1, updated_at = NOW() WHERE code = $2",
+                active, code,
+            )
+            return _affected_rows(tag) > 0
 
     async def get_top_services(self, limit: int = 8, days: Optional[int] = None) -> list[dict]:
         """Servicios más comprados (solo compras EXITOSAS), de mayor a menor cantidad."""
