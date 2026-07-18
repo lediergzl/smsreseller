@@ -1739,9 +1739,18 @@ async def _start_manual_purchase_payment(message: Message, state: FSMContext, me
     # Se guarda la "orden" directo en la transacción (igual que con cripto:
     # order_id/pay_address/pay_amount/currency), sin crear ningún registro
     # nuevo — el tx_id YA identifica la operación de punta a punta.
+    #
+    # amount_usd=billed_usd (no price_usd): si el piso de MANUAL_PURCHASE_MIN_USD
+    # se aplicó, el cliente está pagando billed_usd de verdad en CUP, no el
+    # precio base del número. transactions.amount_usd tiene que reflejar
+    # eso para que un reembolso posterior (timeout de SMS, cancelación
+    # externa en HeroSMS) le devuelva lo que realmente pagó, y para que el
+    # bono de referido (ver _maybe_credit_referral_bonus) se calcule sobre
+    # el monto real cobrado y no sobre el precio pre-piso.
     await db.set_order_info(
         tx_id, order_id=f"cup-{tx_id}", pay_address=method["account"],
         currency="CUP", network="MANUAL", pay_amount=amount_cup, token_id="CUP_MANUAL",
+        amount_usd=billed_usd,
     )
 
     # Aviso inmediato al admin de que hay un pago CUP en camino, ANTES de

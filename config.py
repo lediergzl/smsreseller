@@ -282,7 +282,16 @@ REFERRAL_BONUS_PCT: float = float(os.getenv("REFERRAL_BONUS_PCT", "0.10"))  # 10
 # bono. Mismo motivo que MANUAL_PURCHASE_MIN_USD: una compra de pocos
 # centavos generaría un bono de fracciones de centavo, que no vale ni el
 # mensaje de notificación al referidor.
-REFERRAL_MIN_PURCHASE_USD: float = float(os.getenv("REFERRAL_MIN_PURCHASE_USD", "0.50"))
+#
+# IMPORTANTE: por defecto queda POR DEBAJO de MANUAL_PURCHASE_MIN_USD
+# (0.30) a propósito. CUP es el mercado donde el bono de referidos sí es
+# tangible (ver discusión de REFERRAL_BONUS_PCT): con MANUAL_PURCHASE_MIN_USD
+# como piso de cobro, toda compra pagada en CUP factura como mínimo $0.30,
+# así que un REFERRAL_MIN_PURCHASE_USD >= 0.30 dejaría a ESE mercado sin
+# bono -justo el que más lo necesita para motivar a compartir. Si se sube
+# este valor por env var, hay que subirlo con cuidado de no pisar el piso
+# de CUP sin querer.
+REFERRAL_MIN_PURCHASE_USD: float = float(os.getenv("REFERRAL_MIN_PURCHASE_USD", "0.20"))
 
 # ── Administración / Reportes ─────────────────────────────────────────────────
 # Chat/canal donde el bot manda alertas en tiempo real (pago confirmado, venta

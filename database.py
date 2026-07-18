@@ -402,10 +402,20 @@ class Database:
     async def set_order_info(
         self, tx_id: int, order_id: str, pay_address: str,
         currency: str, network: str, pay_amount: float,
-        token_id: str = None,
+        token_id: str = None, amount_usd: float = None,
     ):
-        await self._update(
-            tx_id,
+        """
+        `amount_usd` es opcional y normalmente NO hace falta (el precio ya
+        quedó fijado en create_transaction). Existe para el caso de pago
+        manual en CUP: ahí el monto realmente cobrado puede ser MAYOR al
+        precio base por el piso MANUAL_PURCHASE_MIN_USD (ver
+        handlers._start_manual_purchase_payment). Sin este ajuste,
+        transactions.amount_usd se quedaba con el precio pre-piso y
+        cualquier cosa que dependiera de él después -reembolsos por
+        timeout/cancelación, y el bono de referido- calculaba sobre un
+        monto menor al que el cliente pagó de verdad.
+        """
+        kwargs = dict(
             order_id=order_id,
             pay_address=pay_address,
             currency=currency,
@@ -413,6 +423,9 @@ class Database:
             pay_amount=pay_amount,
             token_id=token_id,
         )
+        if amount_usd is not None:
+            kwargs["amount_usd"] = amount_usd
+        await self._update(tx_id, **kwargs)
 
     async def set_activation(self, tx_id: int, activation_id: str, phone_number: str):
         await self._update(tx_id, activation_id=activation_id, phone_number=phone_number)
