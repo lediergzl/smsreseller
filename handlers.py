@@ -3,6 +3,7 @@ handlers.py - Controladores de comandos y callbacks con FSM de aiogram 3.x
 """
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
@@ -11,6 +12,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, ChatMemberUpdated
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import herosms_api as hero
 import ccpay_api as ccpay
@@ -41,6 +44,7 @@ from utils import (
     manual_payment_methods_keyboard, manual_deposit_review_keyboard,
     purchase_cup_review_keyboard, refund_request_review_keyboard, channel_invite_keyboard,
     cup_withdraw_methods_keyboard, cup_withdraw_confirm_keyboard, manual_withdrawal_review_keyboard,
+    anuncio_confirm_keyboard,
     MSG_WELCOME, MSG_SELECT_SERVICE, MSG_SELECT_COUNTRY, MSG_SELECT_CURRENCY,
     MSG_PAYMENT_INSTRUCTIONS, MSG_WRAPPED_TOKEN_WARNING,
     MSG_PAYMENT_CONFIRMED, MSG_NUMBER_ASSIGNED,
@@ -62,6 +66,7 @@ from utils import (
     MSG_REFUND_REQUEST_RECEIVED, MSG_REFUND_ALREADY_OPEN, MSG_REFUND_NOT_ELIGIBLE,
     MSG_REFUND_APPROVED, MSG_REFUND_DENIED,
     MSG_CHANNEL_INVITE,
+    MSG_ANUNCIO_ASK_CONTENT,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,6 +108,17 @@ class ManualDepositFlow(StatesGroup):
     selecting_method = State()   # Usuario eligiendo Transfermóvil/EnZona
     awaiting_amount  = State()   # Usuario escribiendo cuánto quiere depositar (USD)
     awaiting_proof   = State()   # Bot esperando foto/texto del comprobante
+
+
+class AnuncioFlow(StatesGroup):
+    """
+    /anunciar (solo admins, ver config.ADMIN_IDS): publicar un mensaje en
+    COMMUNITY_CHANNEL_CHAT_ID. Dos pasos nada más -contenido y confirmación-
+    porque a diferencia de los flujos de compra/retiro acá no hay nada que
+    reservar ni cobrar mientras se piensa el mensaje.
+    """
+    awaiting_content = State()  # Esperando el texto (+ botones opcionales) del anuncio
+    confirming        = State()  # Preview mostrado, esperando confirmación final
 
 
 class CupWithdrawFlow(StatesGroup):
@@ -411,6 +427,103 @@ async def on_channel_member_update(event: ChatMemberUpdated):
     new_status = event.new_chat_member.status
     if new_status in ("member", "administrator", "creator"):
         await db.mark_channel_joined(event.new_chat_member.user.id)
+
+
+_ANUNCIO_BUTTON_LINE = re.compile(r"^\[(.+?)\]\((https?://\S+)\)\s*$", re.MULTILINE)
+
+
+def _parse_anuncio_buttons(texto: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    """
+    Extrae líneas '[Texto](url)' al final del mensaje de /anunciar y arma
+    un teclado inline con un botón por línea. El resto del texto (con el
+    HTML que ya soporta parse_mode=HTML en todo el bot) queda intacto.
+    Sin líneas de botón, devuelve (texto, None) -mensaje simple.
+    """
+    matches = _ANUNCIO_BUTTON_LINE.findall(texto)
+    if not matches:
+        return texto.strip(), None
+
+    texto_limpio = _ANUNCIO_BUTTON_LINE.sub("", texto).strip()
+    builder = InlineKeyboardBuilder()
+    for label, url in matches:
+        builder.button(text=label.strip(), url=url.strip())
+    builder.adjust(1)
+    return texto_limpio, builder.as_markup()
+
+
+@router.message(Command("anunciar"))
+async def cmd_anunciar(message: Message, state: FSMContext):
+    """
+    Punto de entrada de la difusión al canal de comunidad. Solo admins (ver
+    config.ADMIN_IDS) y solo en DM, mismo criterio que /stats/ventas/etc.
+    (ver _is_admin_dm) -no queremos que un admin dispare esto por accidente
+    en un grupo ni que se filtre a quien no tiene permisos.
+    """
+    if not _is_admin_dm(message):
+        return
+
+    if not COMMUNITY_CHANNEL_CHAT_ID:
+        await _safe_answer(
+            message,
+            "⚠️ No configuraste <code>COMMUNITY_CHANNEL_CHAT_ID</code> todavía, "
+            "así que no hay canal donde publicar (ver config.py).",
+        )
+        return
+
+    await state.set_state(AnuncioFlow.awaiting_content)
+    await _safe_answer(message, MSG_ANUNCIO_ASK_CONTENT, reply_markup=cancel_keyboard())
+
+
+@router.message(AnuncioFlow.awaiting_content, F.text)
+async def msg_anuncio_content(message: Message, state: FSMContext):
+    """Recibe el contenido, arma el preview EXACTO de cómo va a quedar
+    publicado (mismo parse_mode, mismo teclado) y pide confirmación antes
+    de tocar el canal -un typo acá se manda a todos los suscriptores, así
+    que no hay envío directo sin este paso."""
+    texto, keyboard = _parse_anuncio_buttons(message.text)
+    if not texto:
+        await _safe_answer(
+            message,
+            "El anuncio no puede quedar vacío (si solo pusiste líneas de "
+            "botón, agregá también el texto). Mandalo de nuevo, o cancelá.",
+            reply_markup=cancel_keyboard(),
+        )
+        return
+
+    await state.update_data(
+        anuncio_texto=texto,
+        anuncio_keyboard=keyboard.model_dump() if keyboard else None,
+    )
+    await message.answer("Así se va a ver publicado en el canal 👇", parse_mode="HTML")
+    await message.answer(texto, parse_mode="HTML", reply_markup=keyboard)
+    await _safe_answer(
+        message, "¿Confirmás la publicación?", reply_markup=anuncio_confirm_keyboard(),
+    )
+    await state.set_state(AnuncioFlow.confirming)
+
+
+@router.callback_query(F.data == "anuncio_confirm", AnuncioFlow.confirming)
+async def cb_anuncio_confirm(call: CallbackQuery, state: FSMContext):
+    """
+    Publica en el canal. Reusa _safe_send (mismo camino que cualquier otro
+    aviso del bot): si el envío directo falla, queda encolado en outbox con
+    reintento automático en vez de perderse -no hace falta lógica de
+    reintento propia acá.
+    """
+    data = await state.get_data()
+    texto = data.get("anuncio_texto", "")
+    kb_data = data.get("anuncio_keyboard")
+    keyboard = InlineKeyboardMarkup.model_validate(kb_data) if kb_data else None
+
+    await _safe_send(call.bot, COMMUNITY_CHANNEL_CHAT_ID, texto, reply_markup=keyboard)
+    logger.info("Anuncio publicado en el canal por admin %s", call.from_user.id)
+
+    await state.clear()
+    await _safe_call_answer(call, "Anuncio enviado.")
+    await call.message.edit_text(
+        "✅ Anuncio enviado al canal. Si Telegram lo rechazó por un error "
+        "transitorio, quedó encolado con reintento automático (outbox)."
+    )
 
 
 async def _release_referrals_loop(bot):
@@ -4026,6 +4139,13 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         # Todavía no se generó ninguna orden de cobro, nada que revertir.
         await state.clear()
         await call.message.answer("✅ Depósito cancelado.")
+        return
+
+    if current_state in (AnuncioFlow.awaiting_content, AnuncioFlow.confirming):
+        # Nada se publica hasta cb_anuncio_confirm, así que cancelar acá
+        # nunca deja un anuncio a medio mandar.
+        await state.clear()
+        await call.message.answer("✅ Anuncio cancelado, no se publicó nada.")
         return
 
     if current_state in (

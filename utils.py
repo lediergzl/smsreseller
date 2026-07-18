@@ -377,6 +377,18 @@ def channel_invite_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def anuncio_confirm_keyboard() -> InlineKeyboardMarkup:
+    """Confirmación final antes de publicar en el canal de comunidad (ver
+    handlers.cmd_anunciar). Reusa 'cancel_op', el mismo callback genérico
+    que ya maneja cb_cancel para el resto de los flujos FSM -no hace falta
+    un callback de cancelación aparte."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Publicar en el canal", callback_data="anuncio_confirm")
+    builder.button(text="❌ Cancelar", callback_data="cancel_op")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def refund_request_review_keyboard(request_id: int) -> InlineKeyboardMarkup:
     """
     Botones de aprobar/denegar una solicitud de reembolso post-entrega
@@ -957,6 +969,16 @@ MSG_CHANNEL_INVITE = (
     "primero de lo nuevo (servicios, países, promos) sin tener que estar "
     "pendiente del bot.\n\n"
     "Es de solo lectura, nadie te va a escribir ni vas a recibir spam."
+)
+
+# ── Difusión al canal de comunidad (/anunciar, solo admins) ──────────────────
+MSG_ANUNCIO_ASK_CONTENT = (
+    "📢 Mandame el texto del anuncio (podés usar el mismo formato HTML que "
+    "usa el resto del bot: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, etc.).\n\n"
+    "Si querés agregar botones con links, poné al final una línea por botón "
+    "con este formato:\n"
+    "<code>[Texto del botón](https://url-destino)</code>\n\n"
+    "Te muestro un preview antes de publicar nada."
 )
 
 # ── Solicitud de reembolso post-entrega ──────────────────────────────────────
