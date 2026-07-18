@@ -204,6 +204,29 @@ _DDL_STATEMENTS = [
         updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
+    # ── Referidos ─────────────────────────────────────────────────────────
+    # referrer_id: quién invitó a este usuario (NULL si nadie, o si vino
+    # orgánico). referral_code: código propio del usuario para invitar a
+    # otros (se genera perezosamente, ver Database.ensure_referral_code).
+    # No se agrega un contador denormalizado (referral_count): las
+    # estadísticas de /referidos se calculan con COUNT sobre `referrals`
+    # para no arrastrar un número que se pueda desincronizar del real.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id BIGINT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT UNIQUE",
+    "CREATE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code)",
+    "CREATE INDEX IF NOT EXISTS idx_users_referrer_id    ON users(referrer_id)",
+    """
+    CREATE TABLE IF NOT EXISTS referrals (
+        id          BIGSERIAL PRIMARY KEY,
+        referrer_id BIGINT NOT NULL,
+        referred_id BIGINT NOT NULL,
+        tx_id       BIGINT,
+        bonus_usd   DOUBLE PRECISION NOT NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)",
+    "CREATE INDEX IF NOT EXISTS idx_referrals_referred ON referrals(referred_id)",
 ]
 
 
@@ -551,6 +574,100 @@ class Database:
                 user_id,
             )
             return int(count or 0)
+
+    # ── Referidos ────────────────────────────────────────────────────────────
+    # Ver database._DDL_STATEMENTS (columnas en `users` + tabla `referrals`)
+    # y config.REFERRAL_BONUS_PCT / REFERRAL_MIN_PURCHASE_USD para el
+    # porcentaje y piso, configurables por variable de entorno. El disparo
+    # (detectar "primera compra completada" y llamar a
+    # register_referral_bonus) vive en handlers._maybe_credit_referral_bonus,
+    # no acá: este módulo solo expone las operaciones atómicas de datos.
+
+    async def ensure_referral_code(self, user_id: int) -> str:
+        """
+        Devuelve el código de referido del usuario, generándolo y
+        persistiéndolo la primera vez que hace falta (ej. al correr
+        /referidos). Determinístico a partir del user_id -no un random
+        guardado aparte- para no depender de una tabla de secuencias extra
+        ni de manejo de colisiones.
+        """
+        user = await self.get_user(user_id)
+        if user and user.get("referral_code"):
+            return user["referral_code"]
+
+        code = f"REF{user_id}"
+        async with self._conn() as conn:
+            await conn.execute(
+                "UPDATE users SET referral_code = $1 WHERE user_id = $2",
+                code, user_id,
+            )
+        return code
+
+    async def get_user_by_referral_code(self, code: str) -> Optional[dict]:
+        """Fila completa del dueño de ese código, o None si no existe."""
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE referral_code = $1", code,
+            )
+            return dict(row) if row else None
+
+    async def set_referrer(self, user_id: int, referrer_id: int) -> bool:
+        """
+        Vincula `user_id` a su referidor, SOLO si todavía no tenía uno
+        asignado (evita que reusar un link viejo/ajeno más tarde cambie
+        de referidor a alguien ya vinculado). Devuelve True si se asignó
+        de verdad en esta llamada.
+        """
+        async with self._conn() as conn:
+            tag = await conn.execute(
+                "UPDATE users SET referrer_id = $1 "
+                "WHERE user_id = $2 AND referrer_id IS NULL",
+                referrer_id, user_id,
+            )
+            return _affected_rows(tag) > 0
+
+    async def get_referral_stats(self, user_id: int) -> dict:
+        """
+        Estadísticas para /referidos: cuántos usuarios entraron con su
+        enlace (`invited`), a cuántos ya se les pagó bono (`paid`, hecho
+        vía `referrals`) y el total ganado en USD.
+        """
+        async with self._conn() as conn:
+            invited = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE referrer_id = $1", user_id,
+            )
+            row = await conn.fetchrow(
+                "SELECT COUNT(*) AS paid, COALESCE(SUM(bonus_usd), 0) AS total_bonus "
+                "FROM referrals WHERE referrer_id = $1",
+                user_id,
+            )
+            return {
+                "invited": int(invited or 0),
+                "paid": int(row["paid"]),
+                "total_bonus": float(row["total_bonus"]),
+            }
+
+    async def register_referral_bonus(
+        self, referrer_id: int, referred_id: int, tx_id: int, bonus_usd: float,
+    ) -> float:
+        """
+        Registra el bono en `referrals` (auditoría/estadísticas de
+        /referidos) y lo acredita al saldo del referidor con origen
+        'crypto' (retirable, igual que una recarga cripto). Devuelve el
+        nuevo saldo TOTAL del referidor. Pensado para llamarse UNA sola
+        vez por usuario referido -ver handlers._maybe_credit_referral_bonus,
+        que solo dispara en la primera compra completada del referido.
+        """
+        async with self._conn() as conn:
+            await conn.execute(
+                "INSERT INTO referrals (referrer_id, referred_id, tx_id, bonus_usd) "
+                "VALUES ($1, $2, $3, $4)",
+                referrer_id, referred_id, tx_id, bonus_usd,
+            )
+        return await self.credit_balance(
+            referrer_id, bonus_usd, tx_id,
+            reason=f"Bono de referido (usuario {referred_id})", origin="crypto",
+        )
 
     # ── Saldo interno (wallet virtual) ───────────────────────────────────────
 

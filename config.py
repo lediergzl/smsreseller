@@ -268,6 +268,22 @@ MANUAL_PURCHASE_MIN_USD: float = float(os.getenv("MANUAL_PURCHASE_MIN_USD", "0.3
 # ── Depósitos manuales (CUP vía Transfermóvil / EnZona) — continuación ────────
 # Tasa informal USDT/CUP del mercado cubano definida arriba se reutiliza acá.
 
+# ── Sistema de referidos ────────────────────────────────────────────────────────
+# Un usuario invita a otro con su enlace (/referidos); cuando el invitado
+# completa su PRIMERA compra, quien invitó recibe un bono en crédito de
+# saldo interno (origen 'crypto', retirable, igual que una recarga — ver
+# database.register_referral_bonus). El porcentaje es configurable por
+# variable de entorno a propósito: es un parámetro de campaña de marketing
+# que puede necesitar ajustarse sin tocar código ni redeploy manual de la
+# lógica de crédito.
+REFERRAL_BONUS_PCT: float = float(os.getenv("REFERRAL_BONUS_PCT", "0.10"))  # 10%
+
+# Piso en USD sobre el monto de esa primera compra para que se pague el
+# bono. Mismo motivo que MANUAL_PURCHASE_MIN_USD: una compra de pocos
+# centavos generaría un bono de fracciones de centavo, que no vale ni el
+# mensaje de notificación al referidor.
+REFERRAL_MIN_PURCHASE_USD: float = float(os.getenv("REFERRAL_MIN_PURCHASE_USD", "0.50"))
+
 # ── Administración / Reportes ─────────────────────────────────────────────────
 # Chat/canal donde el bot manda alertas en tiempo real (pago confirmado, venta
 # completada, reembolsos, timeouts). Usa el ID de un canal o grupo privado

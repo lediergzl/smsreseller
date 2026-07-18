@@ -478,12 +478,13 @@ def main_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
     builder.button(text="👤 Mi cuenta",        callback_data="my_profile")
     builder.button(text="📦 Mis pedidos",      callback_data="my_txns")
     builder.button(text="🌍 Mi país",          callback_data="my_country")
+    builder.button(text="🔗 Invitar amigos",   callback_data="my_referrals")
     builder.button(text="🆘 Soporte",          callback_data="support")
     if is_admin:
         builder.button(text="🛠️ Panel admin", callback_data="admin_panel")
-        builder.adjust(3, 3, 1)
+        builder.adjust(3, 3, 1, 1)
     else:
-        builder.adjust(3, 3)
+        builder.adjust(3, 3, 1)
     return builder.as_markup()
 
 
@@ -881,4 +882,27 @@ MSG_ERROR_GENERIC = (
     "❌ <b>Error interno</b>\n"
     "Algo salió mal. Por favor, intenta de nuevo con /start.\n"
     "Si el problema persiste, contacta al soporte."
+)
+
+MSG_REFERRAL_INFO = (
+    "🔗 <b>Invita y gana</b>\n\n"
+    "Comparte tu enlace. Cuando alguien lo use y complete su <b>primera "
+    "compra</b>, ganas <b>{bonus_pct}</b> de esa compra en crédito para tu "
+    "saldo (retirable, igual que una recarga).\n\n"
+    "📤 Tu enlace:\n<code>{link}</code>\n\n"
+    "👥 Invitados: {invited}\n"
+    "💰 Bonos pagados: {paid} · Total ganado: {total_bonus}"
+)
+
+MSG_REFERRAL_NEW_SIGNUP = (
+    "🔔 Alguien se registró con tu enlace de invitación.\n"
+    "Cuando complete su primera compra, recibirás tu bono automáticamente."
+)
+
+MSG_REFERRAL_BONUS_EARNED = (
+    "🎉 <b>¡Ganaste un bono de referido!</b>\n"
+    "Tu invitado completó su primera compra.\n"
+    "Bono acreditado: {bonus_usd}\n"
+    "Saldo actual: {new_balance}\n\n"
+    "Consulta /referidos o /saldo."
 )

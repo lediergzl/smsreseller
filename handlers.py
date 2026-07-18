@@ -24,6 +24,7 @@ from config import WITHDRAWAL_FEE_PCT, WITHDRAWAL_ALLOWED_CURRENCIES, DEPOSIT_MI
 from config import MANUAL_DEPOSIT_MIN_USD, MANUAL_DEPOSIT_MAX_USD, MANUAL_DEPOSIT_CUP_RATE
 from config import MANUAL_DEPOSIT_CUP_MARGIN_PCT, MANUAL_DEPOSIT_CUP_EXPOSURE_ALERT_USD, MANUAL_PURCHASE_MIN_USD
 from config import ACCOUNT_TYPE_LABELS
+from config import REFERRAL_BONUS_PCT, REFERRAL_MIN_PURCHASE_USD
 from database import db
 from utils import (
     format_amount, format_cup, apply_markup, apply_refund_fee, apply_withdrawal_fee, floor_to_cents, format_phone,
@@ -56,6 +57,7 @@ from utils import (
     MSG_CUP_WITHDRAW_SELECT_METHOD, MSG_CUP_WITHDRAW_ASK_AMOUNT, MSG_CUP_WITHDRAW_ASK_ACCOUNT,
     MSG_CUP_WITHDRAW_CONFIRM, MSG_CUP_WITHDRAW_SUBMITTED, MSG_CUP_WITHDRAW_APPROVED,
     MSG_CUP_WITHDRAW_REJECTED, MSG_CUP_WITHDRAW_ALREADY_PENDING,
+    MSG_REFERRAL_INFO, MSG_REFERRAL_NEW_SIGNUP, MSG_REFERRAL_BONUS_EARNED,
 )
 
 logger = logging.getLogger(__name__)
@@ -254,6 +256,11 @@ async def _notify_admin(bot, text: str):
         logger.error("No se pudo notificar al canal de admin: %s", exc)
 
 
+def _user_label(user_id: int, username: str = None) -> str:
+    """Identificación corta y clickeable-ish para mensajes de admin."""
+    return f"@{username}" if username else f"<code>{user_id}</code>"
+
+
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -296,6 +303,55 @@ def _tx_summary_line(tx: dict) -> str:
     )
 
 
+async def _maybe_credit_referral_bonus(bot, tx_id: int):
+    """
+    Si la compra recién marcada 'completed' (tx_id) es la PRIMERA compra
+    completada de quien la hizo, y esa persona llegó invitada por un
+    referidor (users.referrer_id), acredita el bono (config.
+    REFERRAL_BONUS_PCT del monto de esta compra, sujeto a
+    REFERRAL_MIN_PURCHASE_USD) al saldo del referidor y se lo notifica.
+
+    Se llama justo después de db.set_status(tx_id, "completed") en los dos
+    lugares donde eso pasa (_poll_sms y el chequeo de último momento en
+    cb_new_purchase_cancel). Cualquier error queda solo logueado: la
+    entrega del número al comprador ya fue exitosa en este punto y esta
+    lógica no debe poder romperla ni duplicarla (register_referral_bonus
+    solo se llama una vez por tx, ya que count_completed_orders == 1 solo
+    es cierto en la tx que acaba de completarse por primera vez).
+    """
+    try:
+        tx = await db.get_by_id(tx_id)
+        if not tx:
+            return
+        buyer_id = tx["user_id"]
+        if await db.count_completed_orders(buyer_id) != 1:
+            return  # no es la primera compra completada de este comprador
+
+        buyer = await db.get_user(buyer_id)
+        referrer_id = buyer.get("referrer_id") if buyer else None
+        if not referrer_id:
+            return
+
+        amount_usd = float(tx.get("amount_usd") or 0)
+        if amount_usd < REFERRAL_MIN_PURCHASE_USD:
+            return
+
+        bonus = round(amount_usd * REFERRAL_BONUS_PCT, 4)
+        if bonus <= 0:
+            return
+
+        new_balance = await db.register_referral_bonus(referrer_id, buyer_id, tx_id, bonus)
+        await _safe_send(
+            bot, referrer_id,
+            MSG_REFERRAL_BONUS_EARNED.format(
+                bonus_usd=format_amount(bonus, "USD"),
+                new_balance=format_amount(new_balance, "USD"),
+            ),
+        )
+    except Exception as exc:
+        logger.error("No se pudo acreditar bono de referido para tx=%s: %s", tx_id, exc)
+
+
 async def _credit_refund_for_tx(user_id: int, tx: dict, amount_usd: float, tx_id: int, reason: str) -> float:
     """
     Acredita un reembolso ligado a `tx` respetando su origen (cripto/CUP/
@@ -326,6 +382,33 @@ async def _credit_refund_for_tx(user_id: int, tx: dict, amount_usd: float, tx_id
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
+async def _capture_referral(message: Message):
+    """
+    Si /start vino con el parámetro ref_<código> (deep link armado en
+    _send_referral_info), vincula a quien corre /start con el dueño de ese
+    código (ver database.set_referrer). No hace nada si el link no trae
+    parámetro, si el código no existe, si es un intento de autoreferirse,
+    o si este usuario ya tenía un referidor asignado de antes (set_referrer
+    ya protege eso a nivel de DB, acá solo se evita la notificación de
+    "nuevo registrado" en ese caso). Nunca debe romper /start.
+    """
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2 or not args[1].startswith("ref_"):
+        return
+    code = args[1][len("ref_"):].strip()
+    if not code:
+        return
+    try:
+        referrer = await db.get_user_by_referral_code(code)
+        if not referrer or referrer["user_id"] == message.from_user.id:
+            return
+        linked = await db.set_referrer(message.from_user.id, referrer["user_id"])
+        if linked:
+            await _safe_send(message.bot, referrer["user_id"], MSG_REFERRAL_NEW_SIGNUP)
+    except Exception as exc:
+        logger.error("No se pudo procesar referido para %s: %s", message.from_user.id, exc)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     """Punto de entrada principal."""
@@ -338,6 +421,7 @@ async def cmd_start(message: Message, state: FSMContext):
         language_code=message.from_user.language_code,
         is_premium=message.from_user.is_premium,
     )
+    await _capture_referral(message)
 
     # Si había quedado un teclado de /verificar abierto de una sesión
     # anterior, se cierra acá (ver _clear_reply_keyboard) — /start ya se
@@ -365,6 +449,36 @@ async def cmd_start(message: Message, state: FSMContext):
             parse_mode="HTML",
             reply_markup=main_menu_keyboard(is_admin=is_admin),
         )
+
+
+async def _send_referral_info(bot, chat_id: int, user_id: int):
+    """Arma y envía el mensaje de /referidos (comando y botón del menú)."""
+    code = await db.ensure_referral_code(user_id)
+    bot_username = (await bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start=ref_{code}"
+    stats = await db.get_referral_stats(user_id)
+    await bot.send_message(
+        chat_id,
+        MSG_REFERRAL_INFO.format(
+            bonus_pct=f"{REFERRAL_BONUS_PCT:.0%}",
+            link=link,
+            invited=stats["invited"],
+            paid=stats["paid"],
+            total_bonus=format_amount(stats["total_bonus"], "USD"),
+        ),
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("referidos"))
+async def cmd_referidos(message: Message):
+    await _send_referral_info(message.bot, message.chat.id, message.from_user.id)
+
+
+@router.callback_query(F.data == "my_referrals")
+async def cb_my_referrals(call: CallbackQuery):
+    await _safe_call_answer(call)
+    await _send_referral_info(call.bot, call.message.chat.id, call.from_user.id)
 
 
 # ── Panel de administrador (callbacks del botón "🛠️ Panel admin") ──────────────
@@ -1630,6 +1744,24 @@ async def _start_manual_purchase_payment(message: Message, state: FSMContext, me
         currency="CUP", network="MANUAL", pay_amount=amount_cup, token_id="CUP_MANUAL",
     )
 
+    # Aviso inmediato al admin de que hay un pago CUP en camino, ANTES de
+    # que llegue el comprobante (que puede tardar minutos u horas — ver
+    # msg_purchase_manual_proof, que manda el mensaje "de verdad" con foto
+    # y botones para aprobar/rechazar). Este es solo un heads-up liviano
+    # para que quien tiene Telegram en el móvil sepa que hay que estar
+    # pendiente; no requiere ninguna acción todavía.
+    if tx := await db.get_by_id(tx_id):
+        buyer = await db.get_user(tx["user_id"])
+        await _notify_admin(
+            message.bot,
+            f"🔔 <b>Pago CUP iniciado</b> (compra)\n"
+            f"{_user_label(tx['user_id'], buyer.get('username') if buyer else None)} · "
+            f"{format_amount(billed_usd, 'USD')} ({f'{amount_cup:,}'.replace(',', ' ')} CUP)\n"
+            f"Método: {method['name']} · Código: <code>{reference_code}</code>\n"
+            f"{_tx_summary_line(tx)}\n"
+            "Aún sin comprobante — avisamos apenas llegue.",
+        )
+
     await state.update_data(
         manual_method_code = method_code,
         manual_amount_cup  = amount_cup,
@@ -2062,6 +2194,7 @@ async def _poll_sms(
                     f"✅ <b>Venta completada</b>\n{_tx_summary_line(tx)}\n"
                     f"📱 {tx.get('phone_number') or '—'}",
                 )
+            await _maybe_credit_referral_bonus(bot, tx_id)
             await state.clear()
             return
 
@@ -3440,6 +3573,18 @@ async def msg_manual_deposit_amount(message: Message, state: FSMContext):
         amount_cup=amount_cup, cup_rate=effective_rate,
     )
 
+    # Mismo aviso inmediato que en una compra pagada en CUP (ver
+    # _start_manual_purchase_payment): el admin se entera de que hay un
+    # depósito en camino antes de que llegue el comprobante.
+    await _notify_admin(
+        message.bot,
+        f"🔔 <b>Pago CUP iniciado</b> (depósito de saldo)\n"
+        f"{_user_label(message.from_user.id, message.from_user.username)} · "
+        f"{format_amount(amount, 'USD')} ({f'{amount_cup:,}'.replace(',', ' ')} CUP)\n"
+        f"Método: {method_name} · Código: <code>{dep['reference_code']}</code>\n"
+        "Aún sin comprobante — avisamos apenas llegue.",
+    )
+
     await state.update_data(
         manual_deposit_id     = dep["id"],
         manual_reference_code = dep["reference_code"],
@@ -3689,6 +3834,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
                         bot=call.bot,
                         text=f"✅ <b>Venta completada</b> (código llegó justo al cancelar)\n{_tx_summary_line(tx)}",
                     )
+                await _maybe_credit_referral_bonus(call.bot, tx_id)
                 code_arrived = True
 
         if code_arrived:
