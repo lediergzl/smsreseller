@@ -2001,28 +2001,31 @@ async def _poll_sms(
 
         logger.debug("Esperando SMS (tx=%s, elapsed=%ds, status=%s)", tx_id, elapsed, status)
 
-    # Tiempo agotado → cancelar en HeroSMS y acreditar como saldo interno
-    # (ver config.py REFUND_FEE_PCT): acá ya se entregó un número real, así
-    # que a diferencia de "sin números disponibles" o timeout de PAGO, sí es
-    # un caso donde el usuario pudo elegir usarlo y no lo hizo, y se retiene
-    # el cargo de servicio como fricción antiabuso. Se acredita como saldo
-    # interno en vez de mandar una transacción on-chain: no hay comisión de
-    # red que pagar, es instantáneo, y si el usuario de verdad quiere el
-    # dinero fuera del bot puede pedir un retiro con /saldo (ahí sí asume él
-    # la comisión de red).
+    # Tiempo agotado → cancelar en HeroSMS y acreditar como saldo interno.
+    # Reembolso COMPLETO (sin REFUND_FEE_PCT): a diferencia de una
+    # cancelación manual voluntaria (ver cb_cancel_active_purchase más
+    # abajo), acá no hay forma de saber si el SMS de verdad nunca llegó
+    # (falla del servicio, no culpa del usuario) o si el usuario
+    # simplemente no lo usó a tiempo — y penalizar el primer caso con un
+    # cargo antiabuso es peor que el abuso ocasional que el fee buscaba
+    # evitar. Se acredita como saldo interno en vez de mandar una
+    # transacción on-chain: no hay comisión de red que pagar, es
+    # instantáneo, y si el usuario de verdad quiere el dinero fuera del
+    # bot puede pedir un retiro con /saldo (ahí sí asume él la comisión
+    # de red).
     await hero.cancel_number(activation_id)
 
     tx = await db.get_by_id(tx_id)
     user_id = tx["user_id"] if tx else chat_id
     price_usd = tx["amount_usd"] if tx else pay_amount
-    credit_amount = apply_refund_fee(price_usd, REFUND_FEE_PCT)
+    credit_amount = price_usd
     new_balance = await _credit_refund_for_tx(
         user_id, tx or {}, credit_amount, tx_id, reason=f"SMS timeout tx={tx_id}",
     )
     refund_info = (
         f"se acreditaron {format_amount(credit_amount, 'USD')} a tu saldo interno "
-        f"(saldo total: {format_amount(new_balance, 'USD')}; se retiene un "
-        f"{REFUND_FEE_PCT:.0%} de cargo de servicio por el número no utilizado). "
+        f"(saldo total: {format_amount(new_balance, 'USD')}; reembolso completo, "
+        "el número no llegó a usarse). "
         "Úsalo en tu próxima compra con /start, o consulta /saldo"
     )
     await db.set_status(tx_id, "sms_timeout")
@@ -2753,6 +2756,22 @@ async def msg_cup_withdraw_amount(message: Message, state: FSMContext):
             )
             return
 
+        # Chequeo directo en espacio CUP (además del chequeo en USD más abajo):
+        # amount_available_usd se redondea a 2 decimales, lo que en una tasa
+        # de ~900-1000 CUP/USD equivale a un margen de casi 10 CUP donde
+        # montos distintos en CUP colapsan al mismo valor interno. Sin este
+        # chequeo, pedir más CUP del saldo disponible podía "colarse" y
+        # terminaba silenciosamente recortado al monto real en la pantalla
+        # de confirmación, sin avisar al usuario.
+        if amount_cup_requested > balance_cup:
+            await message.answer(
+                f"⚠️ El monto debe ser mayor a 0 CUP y no superar tu saldo CUP "
+                f"disponible ({format_cup(balance_cup)}).",
+                parse_mode="HTML",
+                reply_markup=cancel_keyboard(),
+            )
+            return
+
     # Mismo criterio que msg_withdraw_amount (retiro cripto) para el redondeo
     # del saldo: comparar contra floor_to_cents, nunca contra el saldo
     # redondeado hacia arriba. El mínimo en sí es CUP_WITHDRAWAL_MIN_USD,
@@ -2868,7 +2887,7 @@ async def cb_cup_withdraw_confirm(call: CallbackQuery, state: FSMContext):
     await call.message.answer(
         MSG_CUP_WITHDRAW_SUBMITTED.format(
             reference_code = wd["reference_code"],
-            amount_usd     = format_amount(amount_usd, "USD"),
+            amount_usd     = format_cup(data["cup_withdraw_gross_cup"]),
             amount_cup     = f"{data['cup_withdraw_amount_cup']:,}".replace(",", " "),
         ),
         parse_mode="HTML",
