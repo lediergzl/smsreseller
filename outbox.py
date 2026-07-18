@@ -19,7 +19,7 @@ al bot, cuenta eliminada, etc.).
 """
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -78,7 +78,7 @@ async def _attempt_send(
     except Exception as exc:
         give_up = attempts_so_far + 1 >= OUTBOX_MAX_ATTEMPTS
         delay = _next_attempt_delay(attempts_so_far)
-        next_attempt_at = (datetime.utcnow() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
+        next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
         logger.warning(
             "outbox: envío falló (id=%s chat=%s intento=%d/%d, próximo en %ds): %s",
             outbox_id, chat_id, attempts_so_far + 1, OUTBOX_MAX_ATTEMPTS, delay, exc,

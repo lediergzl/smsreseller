@@ -1042,10 +1042,14 @@ class Database:
         self, outbox_id: int, error: str, next_attempt_at, give_up: bool = False,
     ):
         """
-        Registra un intento fallido. `next_attempt_at` puede ser un string
-        "YYYY-MM-DD HH:MM:SS" o un datetime (outbox.py manda un string,
-        Postgres lo castea solo al insertar en una columna TIMESTAMPTZ).
+        Registra un intento fallido. `next_attempt_at` debe ser un datetime:
+        asyncpg no castea strings para una columna TIMESTAMPTZ (a diferencia
+        de psycopg2), así que si llega un string "YYYY-MM-DD HH:MM:SS" (por
+        compatibilidad con algún caller viejo) se convierte acá antes de
+        mandarlo a la query.
         """
+        if isinstance(next_attempt_at, str):
+            next_attempt_at = datetime.strptime(next_attempt_at, "%Y-%m-%d %H:%M:%S")
         async with self._conn() as conn:
             await conn.execute(
                 "UPDATE outbox SET attempts = attempts + 1, last_error = $1, "

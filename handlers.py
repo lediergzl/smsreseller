@@ -26,8 +26,8 @@ from config import MANUAL_DEPOSIT_CUP_MARGIN_PCT, MANUAL_DEPOSIT_CUP_EXPOSURE_AL
 from config import ACCOUNT_TYPE_LABELS
 from database import db
 from utils import (
-    format_amount, apply_markup, apply_refund_fee, apply_withdrawal_fee, floor_to_cents, format_phone,
-    usd_to_cup, effective_cup_rate, effective_cup_rate_payout, format_cup,
+    format_amount, format_cup, apply_markup, apply_refund_fee, apply_withdrawal_fee, floor_to_cents, format_phone,
+    usd_to_cup, effective_cup_rate, effective_cup_rate_payout,
     generate_payment_qr,
     is_wrapped_token,
     services_keyboard, countries_keyboard, currencies_keyboard,
@@ -512,7 +512,7 @@ async def _send_historial(user_id: int, answer_func):
             f"{status_icon} <b>{t['service_name']}</b> — {t['country_name']}\n"
             f"   Monto: {format_amount(t['amount_usd'] or 0, 'USD')} "
             f"(pagado en {currency_disp}) | Estado: {t['status']}\n"
-            f"   Fecha: {(t['created_at'] or '')[:16]}\n"
+            f"   Fecha: {str(t['created_at'] or '')[:16]}\n"
         )
     await answer_func("\n".join(lines), parse_mode="HTML")
 
@@ -711,7 +711,7 @@ async def _send_ventas(limit: int, answer_func):
     for t in sales:
         lines.append(
             f"✅ {_tx_summary_line(t)}\n"
-            f"   📱 {t.get('phone_number') or '—'} · {(t['updated_at'] or '')[:16]}\n"
+            f"   📱 {t.get('phone_number') or '—'} · {str(t['updated_at'] or '')[:16]}\n"
         )
     await answer_func("\n".join(lines), parse_mode="HTML")
 
