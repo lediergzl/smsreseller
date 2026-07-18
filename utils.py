@@ -7,7 +7,7 @@ import logging
 import math
 from typing import Callable, Awaitable
 import qrcode
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import COMMUNITY_CHANNEL_URL
@@ -539,7 +539,38 @@ def main_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def admin_menu_keyboard() -> InlineKeyboardMarkup:
+def main_persistent_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    """
+    Versión persistente (ReplyKeyboardMarkup) del menú principal, anclada
+    abajo del chat como en Cwallet -a diferencia de main_menu_keyboard
+    (InlineKeyboardMarkup, pegado a un mensaje puntual que queda
+    "enterrado" apenas el chat sigue andando), este menú queda siempre a
+    la vista sin depender de scrollear hacia arriba ni de volver a pedir
+    /start.
+
+    LIMITACIÓN DE TELEGRAM: un ReplyKeyboardButton normal (texto) NO puede
+    abrir una URL directamente -eso solo existe en InlineKeyboardButton.
+    Por eso "📢 Canal oficial" acá manda el texto como mensaje normal (ver
+    handlers.msg_canal_oficial), y ESE handler sí responde con un botón
+    inline con la URL real. Un toque extra, pero sigue siendo cero
+    escritura para el usuario.
+
+    Mismos labels EXACTOS que main_menu_keyboard donde aplica, porque los
+    handlers de mensaje matchean por texto literal (ver handlers.py,
+    sección "Menú persistente") -si cambiás un emoji o palabra acá, hay
+    que cambiarlo también del lado del handler correspondiente.
+    """
+    rows = [
+        [KeyboardButton(text="🛒 Comprar número"), KeyboardButton(text="💰 Mi saldo"), KeyboardButton(text="👤 Mi cuenta")],
+        [KeyboardButton(text="📦 Mis pedidos"), KeyboardButton(text="🌍 Mi país"), KeyboardButton(text="🔗 Invitar amigos")],
+        [KeyboardButton(text="🆘 Soporte")],
+    ]
+    if COMMUNITY_CHANNEL_URL:
+        rows[-1].append(KeyboardButton(text="📢 Canal oficial"))
+    if is_admin:
+        rows.append([KeyboardButton(text="🛠️ Panel admin")])
+
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
     """
     Panel de administrador en forma de grilla, mismo estilo que
     main_menu_keyboard: acceso rápido a los comandos administrativos más

@@ -11,7 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, ChatMemberUpdated
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -36,7 +36,7 @@ from utils import (
     generate_payment_qr,
     is_wrapped_token,
     services_keyboard, countries_keyboard, currencies_keyboard,
-    cancel_keyboard, main_menu_keyboard, admin_menu_keyboard, search_results_keyboard,
+    cancel_keyboard, main_persistent_keyboard, admin_menu_keyboard, search_results_keyboard,
     top_services_keyboard,
     balance_menu_keyboard,
     withdraw_start_keyboard, withdraw_currencies_keyboard, withdraw_confirm_keyboard,
@@ -188,27 +188,29 @@ async def _safe_answer(message: Message, text: str, **kwargs):
         )
 
 
-async def _clear_reply_keyboard(bot, chat_id: int):
+async def _reset_reply_keyboard(bot, chat_id: int, is_admin: bool = False):
     """
-    Cierra cualquier ReplyKeyboardMarkup que haya quedado pegado en pantalla
-    (hoy el único que existe es el de /verificar, ver cmd_verificar) enviando
-    un mensaje descartable con ReplyKeyboardRemove y borrándolo enseguida.
+    Antes (_clear_reply_keyboard) esto solo BORRABA cualquier
+    ReplyKeyboardMarkup pegado en pantalla -hoy hace falta RESTAURAR el
+    menú persistente en su lugar (ver utils.main_persistent_keyboard), no
+    dejar al usuario sin nada. Sigue sirviendo para el mismo caso original
+    -si quedó abierto el teclado de "Compartir mi contacto" de /verificar
+    (ver cmd_verificar) y el usuario ignora eso y sigue navegando- solo
+    que ahora, en vez de vaciar la pantalla, la reemplaza por el menú de
+    siempre.
 
-    Por qué hace falta: los ReplyKeyboardMarkup son una capa DISTINTA a los
-    InlineKeyboardMarkup que usa el resto del bot -mostrar un menú inline NO
-    cierra un ReplyKeyboardMarkup que haya quedado abierto de antes-, así
-    que si el usuario ignoraba /verificar y seguía navegando por los
-    botones normales, el teclado "Compartir mi contacto" se quedaba tapando
-    la pantalla (ver: se llamaba desde el panel admin y bloqueaba los
-    botones). Se llama en los puntos de entrada principales a los menús
-    (cmd_start, panel admin) como red de seguridad, además del botón
-    "❌ Cancelar" que ya cierra el teclado directamente.
+    Se manda como un mensaje descartable que se borra enseguida: el
+    cliente de Telegram sigue mostrando el teclado que ese mensaje fijó
+    aunque el mensaje en sí ya no esté (mismo truco que ya usaba esta
+    función).
     """
     try:
-        msg = await bot.send_message(chat_id, "🔄", reply_markup=ReplyKeyboardRemove())
+        msg = await bot.send_message(
+            chat_id, "🔄", reply_markup=main_persistent_keyboard(is_admin=is_admin),
+        )
         await msg.delete()
     except Exception as exc:
-        logger.debug("No se pudo limpiar el teclado de respuesta en %s: %s", chat_id, exc)
+        logger.debug("No se pudo restaurar el menú persistente en %s: %s", chat_id, exc)
 
 
 async def _safe_send(bot, chat_id: int, text: str, **kwargs):
@@ -626,32 +628,110 @@ async def cmd_start(message: Message, state: FSMContext):
     )
     await _capture_referral(message)
 
-    # Si había quedado un teclado de /verificar abierto de una sesión
-    # anterior, se cierra acá (ver _clear_reply_keyboard) — /start ya se
-    # documenta como la forma de cancelar esa verificación.
-    await _clear_reply_keyboard(message.bot, message.chat.id)
-
     # Si quien corre /start es un admin (ver config.ADMIN_IDS), el menú
-    # principal lleva un botón extra "🛠️ Panel admin" (ver
-    # utils.main_menu_keyboard) que abre el panel administrativo — el admin
-    # sigue viendo el mismo menú de cliente normal (puede comprar para sí
-    # mismo, consultar su saldo, etc.), solo que con acceso rápido extra.
+    # persistente lleva un botón extra "🛠️ Panel admin" (ver
+    # utils.main_persistent_keyboard) — el admin sigue viendo el mismo menú
+    # de cliente normal (puede comprar para sí mismo, consultar su saldo,
+    # etc.), solo que con acceso rápido extra.
     is_admin = _is_admin(message.from_user.id)
 
+    # NOTA: adjuntar main_persistent_keyboard acá ya reemplaza cualquier
+    # ReplyKeyboardMarkup que hubiera quedado pegado de antes (ej. el de
+    # "Compartir mi contacto" de /verificar, ver cmd_verificar) — un nuevo
+    # reply_markup siempre pisa al anterior, así que no hace falta limpiarlo
+    # aparte.
+
     # Tarjeta de bienvenida personalizada (foto de perfil real + datos de la
-    # cuenta), con el menú principal ya adjunto. Si algo falla (Pillow,
+    # cuenta), con el menú persistente ya adjunto. Si algo falla (Pillow,
     # fuente, foto corrupta, etc.) no debe tumbar el /start: se cae al
     # mensaje de texto normal de siempre.
     sent_card = await telegram_sender.send_welcome_card(
         message.bot, message, caption=MSG_WELCOME, parse_mode="HTML",
-        reply_markup=main_menu_keyboard(is_admin=is_admin),
+        reply_markup=main_persistent_keyboard(is_admin=is_admin),
     )
     if not sent_card:
         await message.answer(
             MSG_WELCOME,
             parse_mode="HTML",
-            reply_markup=main_menu_keyboard(is_admin=is_admin),
+            reply_markup=main_persistent_keyboard(is_admin=is_admin),
         )
+
+
+# ── Menú persistente (ReplyKeyboardMarkup, ver utils.main_persistent_keyboard) ─
+# Registrados TEMPRANO a propósito: aiogram evalúa los handlers de mensaje en
+# orden de registro y se queda con el primero cuyo filtro matchea. Como estos
+# no llevan filtro de estado (matchean en CUALQUIER estado FSM), tienen que
+# quedar ANTES de los handlers state-specific (ej. msg_search_service, más
+# abajo) para que tocar un botón del menú de abajo siempre "gane" e
+# interrumpa cualquier flujo a medio hacer -mismo criterio que ya tenía
+# cb_new_purchase (hace state.clear() antes de arrancar).
+#
+# Los labels de texto tienen que coincidir EXACTO con los botones armados en
+# utils.main_persistent_keyboard -si cambiás uno de los dos lados, cambiá el
+# otro también.
+
+@router.message(F.text == "🛒 Comprar número")
+async def msg_new_purchase(message: Message, state: FSMContext):
+    await _do_new_purchase(message.from_user.id, message.answer, state)
+
+
+@router.message(F.text == "💰 Mi saldo")
+async def msg_my_balance(message: Message):
+    await _send_saldo(message.from_user.id, message.answer)
+
+
+@router.message(F.text == "👤 Mi cuenta")
+async def msg_my_profile(message: Message):
+    await _send_profile(message.from_user, message.answer)
+
+
+@router.message(F.text == "📦 Mis pedidos")
+async def msg_my_txns(message: Message):
+    await _send_historial(message.from_user.id, message.answer)
+
+
+@router.message(F.text == "🌍 Mi país")
+async def msg_my_country(message: Message):
+    await _send_country_info(message.from_user.id, message.answer)
+
+
+@router.message(F.text == "🔗 Invitar amigos")
+async def msg_my_referrals(message: Message):
+    await _send_referral_info(message.bot, message.chat.id, message.from_user.id)
+
+
+@router.message(F.text == "🆘 Soporte")
+async def msg_support(message: Message):
+    await _send_support(message.answer)
+
+
+@router.message(F.text == "📢 Canal oficial")
+async def msg_canal_oficial(message: Message):
+    """
+    El botón persistente manda este texto como mensaje normal -un
+    ReplyKeyboardButton no puede abrir una URL directo, a diferencia de un
+    InlineKeyboardButton- así que acá respondemos con el link real en un
+    botón inline aparte (ver utils.channel_invite_keyboard). Un toque
+    extra, pero sigue siendo cero escritura para el usuario.
+    """
+    if not COMMUNITY_CHANNEL_URL:
+        return
+    await message.answer(MSG_CHANNEL_INVITE, reply_markup=channel_invite_keyboard())
+
+
+@router.message(F.text == "🛠️ Panel admin")
+async def msg_admin_panel(message: Message):
+    """Igual que cb_admin_panel (botón inline dentro del panel), pero
+    disparado desde el menú persistente de abajo. No respondemos nada a
+    quien no es admin -no delatamos que el botón/comando existe, mismo
+    criterio que el resto de los comandos admin (ver _is_admin_dm)."""
+    if not _is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "🛠️ <b>Panel de administrador</b>\nElige qué querés consultar:",
+        parse_mode="HTML",
+        reply_markup=admin_menu_keyboard(),
+    )
 
 
 async def _send_referral_info(bot, chat_id: int, user_id: int):
@@ -697,7 +777,7 @@ async def cb_admin_panel(call: CallbackQuery):
         await _safe_call_answer(call, "No autorizado.", show_alert=True)
         return
     await _safe_call_answer(call)
-    await _clear_reply_keyboard(call.bot, call.message.chat.id)
+    await _reset_reply_keyboard(call.bot, call.message.chat.id, is_admin=True)
     await call.message.answer(
         "🛠️ <b>Panel de administrador</b>\nElige qué querés consultar:",
         parse_mode="HTML",
@@ -708,11 +788,9 @@ async def cb_admin_panel(call: CallbackQuery):
 @router.callback_query(F.data == "back_to_user_menu")
 async def cb_back_to_user_menu(call: CallbackQuery):
     await _safe_call_answer(call)
-    await _clear_reply_keyboard(call.bot, call.message.chat.id)
     is_admin = _is_admin(call.from_user.id)
-    await call.message.answer(
-        "Menú principal:", reply_markup=main_menu_keyboard(is_admin=is_admin),
-    )
+    await _reset_reply_keyboard(call.bot, call.message.chat.id, is_admin=is_admin)
+    await call.message.answer("Menú principal 👇 (ver abajo del chat)")
 
 
 @router.callback_query(F.data == "adm_stats")
@@ -867,13 +945,21 @@ async def msg_cancel_verificar(message: Message):
     inline de los menús (son capas distintas de Telegram), así que se
     quedaba pegado en pantalla tapando otros botones si el usuario
     navegaba a otro lado en vez de completar/cancelar la verificación.
+
+    Restaura el menú persistente en vez de dejar el chat sin teclado (ver
+    utils.main_persistent_keyboard) -antes esto usaba ReplyKeyboardRemove,
+    que ahora se llevaría puesto el menú de navegación de siempre.
     """
-    await message.answer("Verificación cancelada.", reply_markup=ReplyKeyboardRemove())
+    is_admin = _is_admin(message.from_user.id)
+    await message.answer(
+        "Verificación cancelada.", reply_markup=main_persistent_keyboard(is_admin=is_admin),
+    )
 
 
 @router.message(F.contact)
 async def msg_contact_shared(message: Message):
     contact = message.contact
+    is_admin = _is_admin(message.from_user.id)
     # Un usuario podría reenviar el contacto de OTRA persona en vez de tocar
     # el botón -> validar que sea el suyo propio antes de guardarlo, o
     # terminaríamos asociando el teléfono de un tercero a esta cuenta.
@@ -881,14 +967,14 @@ async def msg_contact_shared(message: Message):
         await message.answer(
             "Ese contacto no es el tuyo, no lo guardé. Si querés compartir "
             "tu propio número, usa /verificar de nuevo y toca el botón.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=main_persistent_keyboard(is_admin=is_admin),
         )
         return
 
     await db.set_phone_number(message.from_user.id, contact.phone_number)
     await message.answer(
         "✅ Listo, tu contacto quedó asociado a tu cuenta.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=main_persistent_keyboard(is_admin=is_admin),
     )
 
 
@@ -1593,9 +1679,10 @@ async def cmd_quitar_metodo(message: Message):
 
 # ── Menú principal (callback) ─────────────────────────────────────────────────
 
-@router.callback_query(F.data == "new_purchase")
-async def cb_new_purchase(call: CallbackQuery, state: FSMContext):
-    await _safe_call_answer(call)
+async def _do_new_purchase(user_id: int, answer_func, state: FSMContext):
+    """Cuerpo compartido de 'Comprar número', llamado tanto desde el botón
+    inline (cb_new_purchase) como desde el botón persistente de abajo
+    (msg_new_purchase, ver sección 'Menú persistente')."""
     await state.clear()
 
     # Antiabuso: bloquear temporalmente a quien acumula muchos "número
@@ -1603,9 +1690,9 @@ async def cb_new_purchase(call: CallbackQuery, state: FSMContext):
     # revisa acá, ANTES de dejarlo elegir servicio, para no gastar ni una
     # llamada a HeroSMS/CCPayment en un intento que probablemente se
     # abandonará de nuevo.
-    strikes = await db.get_abuse_strikes(call.from_user.id, ABUSE_WINDOW_HOURS)
+    strikes = await db.get_abuse_strikes(user_id, ABUSE_WINDOW_HOURS)
     if strikes >= ABUSE_MAX_STRIKES:
-        await call.message.answer(
+        await answer_func(
             f"⏳ <b>Compras temporalmente restringidas</b>\n\n"
             f"Detectamos {strikes} números solicitados y no completados en "
             f"las últimas {ABUSE_WINDOW_HOURS}h.\n"
@@ -1621,12 +1708,14 @@ async def cb_new_purchase(call: CallbackQuery, state: FSMContext):
     top = await db.get_top_services(limit=8)
     keyboard = top_services_keyboard(top) if top else services_keyboard(SERVICES)
 
-    await call.message.answer(
-        MSG_SELECT_SERVICE,
-        parse_mode="HTML",
-        reply_markup=keyboard,
-    )
+    await answer_func(MSG_SELECT_SERVICE, parse_mode="HTML", reply_markup=keyboard)
     await state.set_state(PurchaseFlow.selecting_service)
+
+
+@router.callback_query(F.data == "new_purchase")
+async def cb_new_purchase(call: CallbackQuery, state: FSMContext):
+    await _safe_call_answer(call)
+    await _do_new_purchase(call.from_user.id, call.message.answer, state)
 
 
 @router.callback_query(F.data == "my_txns")
@@ -1641,14 +1730,12 @@ async def cb_my_balance(call: CallbackQuery):
     await _send_saldo(call.from_user.id, call.message.answer)
 
 
-@router.callback_query(F.data == "my_profile")
-async def cb_my_profile(call: CallbackQuery):
+async def _send_profile(user, answer_func):
     """Botón 'Mi cuenta': ficha básica del usuario. 'Nivel' y 'País' solo
     se muestran si un admin ya los asignó (ver /set_tipo, /set_pais);
     mientras tanto se omiten en vez de mostrar un valor inventado (mismo
-    criterio que welcome_card.generate_welcome_card)."""
-    await _safe_call_answer(call)
-    user = call.from_user
+    criterio que welcome_card.generate_welcome_card). `user` es un
+    aiogram.types.User -sirve tanto call.from_user como message.from_user."""
     user_row = await db.get_user(user.id)
     orders_count = await db.count_completed_orders(user.id)
 
@@ -1664,36 +1751,52 @@ async def cb_my_profile(call: CallbackQuery):
     if user_row and user_row.get("first_seen"):
         lines.append(f"Miembro desde: {str(user_row['first_seen'])[:10]}")
 
-    await call.message.answer("\n".join(lines), parse_mode="HTML")
+    await answer_func("\n".join(lines), parse_mode="HTML")
 
 
-@router.callback_query(F.data == "my_country")
-async def cb_my_country(call: CallbackQuery):
+@router.callback_query(F.data == "my_profile")
+async def cb_my_profile(call: CallbackQuery):
+    await _safe_call_answer(call)
+    await _send_profile(call.from_user, call.message.answer)
+
+
+async def _send_country_info(user_id: int, answer_func):
     """Botón 'Mi país': el país es texto libre asignado por un admin
     (ver database.set_country / /set_pais), no algo que el usuario elige
     aquí mismo -> solo se muestra el valor actual (o se avisa que aún no
     fue asignado)."""
-    await _safe_call_answer(call)
-    user_row = await db.get_user(call.from_user.id)
+    user_row = await db.get_user(user_id)
     country = user_row.get("country") if user_row else None
     if country:
-        await call.message.answer(f"🌍 Tu país registrado: <b>{country}</b>", parse_mode="HTML")
+        await answer_func(f"🌍 Tu país registrado: <b>{country}</b>", parse_mode="HTML")
     else:
-        await call.message.answer(
+        await answer_func(
             "🌍 Todavía no tienes un país asignado en tu cuenta. "
             "Contacta a soporte si crees que debería tener uno."
         )
 
 
-@router.callback_query(F.data == "support")
-async def cb_support(call: CallbackQuery):
+@router.callback_query(F.data == "my_country")
+async def cb_my_country(call: CallbackQuery):
     await _safe_call_answer(call)
-    await call.message.answer(
+    await _send_country_info(call.from_user.id, call.message.answer)
+
+
+async def _send_support(answer_func):
+    await answer_func(
         "🆘 <b>Soporte</b>\n\n"
         "Escríbenos directamente a @yode86 con tu consulta "
         "(incluye el ID de tu pedido si aplica) y te responderemos a la "
-        "brevedad."
+        "brevedad.",
+        parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data == "support")
+async def cb_support(call: CallbackQuery):
+    await _safe_call_answer(call)
+    await _send_support(call.message.answer)
+
 
 
 # ── Selección de servicio ─────────────────────────────────────────────────────
