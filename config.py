@@ -334,6 +334,14 @@ COMMUNITY_CHANNEL_URL: str = os.getenv("COMMUNITY_CHANNEL_URL", "")
 # que le llega al bot (o usar @userinfobot / @RawDataBot en el canal).
 COMMUNITY_CHANNEL_CHAT_ID: int = int(os.getenv("COMMUNITY_CHANNEL_CHAT_ID", "0") or 0)
 
+# Grupo de soporte/consultas entre usuarios -a diferencia del canal, acá el
+# bot NO administra nada ni trackea quién se une (es solo un espacio de
+# discusión entre usuarios, no un canal de broadcast del bot). Por eso solo
+# hace falta la URL, no un chat_id: se usa nada más para el botón de link en
+# el mensaje de /soporte (ver handlers._send_support). Si queda vacío, ese
+# botón simplemente no aparece.
+COMMUNITY_GROUP_URL: str = os.getenv("COMMUNITY_GROUP_URL", "")
+
 # ── Administración / Reportes ─────────────────────────────────────────────────
 # Chat/canal donde el bot manda alertas en tiempo real (pago confirmado, venta
 # completada, reembolsos, timeouts). Usa el ID de un canal o grupo privado
