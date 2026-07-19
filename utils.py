@@ -10,7 +10,7 @@ import qrcode
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import COMMUNITY_CHANNEL_URL
+from config import COMMUNITY_CHANNEL_URL, COMMUNITY_GROUP_URL
 
 logger = logging.getLogger(__name__)
 
@@ -373,6 +373,21 @@ def channel_invite_keyboard() -> InlineKeyboardMarkup:
     main_menu_keyboard, ver handlers._maybe_prompt_channel_join."""
     builder = InlineKeyboardBuilder()
     builder.button(text="📢 Unirme al canal", url=COMMUNITY_CHANNEL_URL)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def support_keyboard() -> InlineKeyboardMarkup | None:
+    """Botón de link al grupo de soporte/consultas (ver
+    handlers._send_support). A diferencia del canal, este grupo no lo
+    administra el bot -es solo un espacio de discusión entre usuarios-, así
+    que alcanza con un botón de URL, sin tracking de quién se une. Devuelve
+    None si config.COMMUNITY_GROUP_URL no está seteado, para no adjuntar un
+    teclado vacío al mensaje de soporte."""
+    if not COMMUNITY_GROUP_URL:
+        return None
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👥 Grupo de soporte", url=COMMUNITY_GROUP_URL)
     builder.adjust(1)
     return builder.as_markup()
 
