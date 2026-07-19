@@ -28,7 +28,7 @@ from config import MANUAL_DEPOSIT_MIN_USD, MANUAL_DEPOSIT_MAX_USD, MANUAL_DEPOSI
 from config import MANUAL_DEPOSIT_CUP_MARGIN_PCT, MANUAL_DEPOSIT_CUP_EXPOSURE_ALERT_USD, MANUAL_PURCHASE_MIN_USD
 from config import ACCOUNT_TYPE_LABELS
 from config import REFERRAL_BONUS_PCT, REFERRAL_MIN_PURCHASE_USD, REFERRAL_HOLD_HOURS, REFERRAL_RELEASE_INTERVAL
-from config import COMMUNITY_CHANNEL_CHAT_ID, COMMUNITY_CHANNEL_URL
+from config import COMMUNITY_CHANNEL_CHAT_ID, COMMUNITY_CHANNEL_URL, COMMUNITY_GROUP_URL
 from database import db
 from utils import (
     format_amount, format_cup, apply_markup, apply_refund_fee, apply_withdrawal_fee, floor_to_cents, format_phone,
@@ -42,7 +42,7 @@ from utils import (
     withdraw_start_keyboard, withdraw_currencies_keyboard, withdraw_confirm_keyboard,
     deposit_currencies_keyboard,
     manual_payment_methods_keyboard, manual_deposit_review_keyboard,
-    purchase_cup_review_keyboard, refund_request_review_keyboard, channel_invite_keyboard,
+    purchase_cup_review_keyboard, refund_request_review_keyboard, channel_invite_keyboard, support_keyboard,
     cup_withdraw_methods_keyboard, cup_withdraw_confirm_keyboard, manual_withdrawal_review_keyboard,
     anuncio_confirm_keyboard,
     MSG_WELCOME, MSG_SELECT_SERVICE, MSG_SELECT_COUNTRY, MSG_SELECT_CURRENCY,
@@ -429,6 +429,86 @@ async def on_channel_member_update(event: ChatMemberUpdated):
     new_status = event.new_chat_member.status
     if new_status in ("member", "administrator", "creator"):
         await db.mark_channel_joined(event.new_chat_member.user.id)
+
+
+@router.my_chat_member()
+async def on_bot_membership_changed(event: ChatMemberUpdated):
+    """
+    Se dispara cuando cambia el estado del BOT MISMO en CUALQUIER chat (lo
+    agregan a un grupo/canal, lo promueven a admin, lo sacan) -a
+    diferencia de on_channel_member_update (que solo mira el canal de
+    comunidad YA configurado, filtrado por su chat_id conocido), este no
+    lleva filtro: es justamente la forma de DESCUBRIR el chat_id de un
+    grupo/canal NUEVO sin depender de un bot de terceros
+    (@userinfobot / @RawDataBot) -alcanza con agregar este bot ahí, y él
+    mismo le avisa el chat_id al admin.
+
+    Le avisa a ADMIN_CHAT_ID (no al chat nuevo -ahí podría haber usuarios
+    normales, ver el caso real de OTPVirtual Community, que terminó
+    teniendo 8 miembros no-admin) para que el chat_id nunca quede expuesto
+    en un chat público.
+    """
+    chat = event.chat
+    new_status = event.new_chat_member.status
+    old_status = event.old_chat_member.status
+
+    joined = new_status in ("member", "administrator") and old_status in ("left", "kicked")
+    left   = new_status in ("left", "kicked") and old_status in ("member", "administrator")
+    if not joined and not left:
+        return  # otros cambios de estado (ej. restricted) no son relevantes acá
+
+    chat_type_label = {"group": "grupo", "supergroup": "supergrupo", "channel": "canal"}.get(
+        chat.type, chat.type,
+    )
+    chat_name = chat.title or "(sin nombre)"
+
+    if joined:
+        is_admin_now = new_status == "administrator"
+        text = (
+            f"🔎 <b>Me agregaron a un {chat_type_label}</b>\n"
+            f"Nombre: <b>{chat_name}</b>\n"
+            f"chat_id: <code>{chat.id}</code>\n\n"
+            + (
+                "✅ Ya soy administrador ahí."
+                if is_admin_now else
+                "⚠️ Todavía NO soy administrador -si necesitás que publique "
+                "(/anunciar) o detecte quién se une, promovéme a admin."
+            )
+            + "\n\nCopiá ese chat_id y pegalo en la variable de Render que "
+            "corresponda (COMMUNITY_CHANNEL_CHAT_ID si es el canal de "
+            "comunidad, ADMIN_CHAT_ID si es el grupo de administradores)."
+        )
+    else:
+        text = f"👋 Me sacaron de: <b>{chat_name}</b> (chat_id: <code>{chat.id}</code>)"
+
+    try:
+        await event.bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML")
+    except Exception as exc:
+        logger.error("No se pudo notificar al admin sobre el chat %s: %s", chat.id, exc)
+
+
+@router.message(Command("chatid"))
+async def cmd_chatid(message: Message):
+    """
+    Respaldo manual de on_bot_membership_changed: por si el bot ya estaba
+    en un grupo desde antes de este cambio (ese aviso solo dispara al
+    agregarlo de nuevo), /chatid confirma el chat_id sin salir de Telegram.
+    Solo admins -no tiene sentido que cualquier miembro del grupo lo vea.
+
+    NO sirve igual en CANALES (ahí Telegram entrega esto como
+    channel_post, no como message, y postear la respuesta ahí se vería
+    públicamente en el canal) -para un canal, confiá en el aviso
+    automático que ya te llega a ADMIN_CHAT_ID en cuanto agregás el bot.
+    """
+    if not _is_admin(message.from_user.id):
+        return
+    chat = message.chat
+    await message.answer(
+        f"🔎 chat_id de este chat: <code>{chat.id}</code>\n"
+        f"Tipo: {chat.type}\n"
+        f"Nombre: {chat.title or chat.full_name or '(sin nombre)'}",
+        parse_mode="HTML",
+    )
 
 
 _ANUNCIO_BUTTON_LINE = re.compile(r"^\[(.+?)\]\((https?://\S+)\)\s*$", re.MULTILINE)
@@ -1798,13 +1878,18 @@ async def cb_my_country(call: CallbackQuery):
 
 
 async def _send_support(answer_func):
-    await answer_func(
+    text = (
         "🆘 <b>Soporte</b>\n\n"
         "Escríbenos directamente a @yode86 con tu consulta "
         "(incluye el ID de tu pedido si aplica) y te responderemos a la "
-        "brevedad.",
-        parse_mode="HTML",
+        "brevedad."
     )
+    if COMMUNITY_GROUP_URL:
+        text += (
+            "\n\nTambién podés preguntar en el grupo -otros usuarios y "
+            "nosotros solemos responder ahí más rápido para dudas generales."
+        )
+    await answer_func(text, parse_mode="HTML", reply_markup=support_keyboard())
 
 
 @router.callback_query(F.data == "support")
