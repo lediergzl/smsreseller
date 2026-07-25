@@ -45,6 +45,11 @@ async def db_health_loop(bot: Bot):
     interval_seconds = config.DB_PING_INTERVAL_MINUTES * 60
     while True:
         try:
+            # OJO: integrity_check() es async - faltaba este await. Sin él,
+            # `ok, detail = db.integrity_check()` intenta desempaquetar un
+            # objeto coroutine y explota con TypeError, lo que caía en el
+            # except de abajo y silenciaba el chequeo de salud para
+            # siempre (nunca alertaba una caída real de Neon).
             ok, detail = await db.integrity_check()
             if not ok:
                 logger.error("Chequeo de conectividad a la base falló: %s", detail)

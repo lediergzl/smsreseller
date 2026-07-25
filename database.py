@@ -36,6 +36,7 @@ quien toque este archivo más adelante):
     fila se parsea el "command tag" que devuelve `conn.execute(...)`
     (ej. "UPDATE 1") con `_affected_rows(...)`.
 """
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -330,13 +331,28 @@ class _PooledConnection:
     no bloquear el event loop mientras se espera la red hacia Neon.
     """
 
+    # Si el pool está saturado (todas las conexiones ocupadas por queries
+    # colgadas), esperar acquire() para siempre es lo que termina
+    # congelando el bot entero para todos los usuarios. Con este timeout,
+    # en vez de colgarse la corrutina revienta con un error claro que el
+    # handler ya loguea/reporta normalmente.
+    ACQUIRE_TIMEOUT = 10
+
     def __init__(self, pool: asyncpg.Pool):
         self._pool = pool
         self._conn: Optional[asyncpg.Connection] = None
         self._tx = None
 
     async def __aenter__(self) -> "_PooledConnection":
-        self._conn = await self._pool.acquire()
+        try:
+            self._conn = await asyncio.wait_for(
+                self._pool.acquire(), timeout=self.ACQUIRE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"No se pudo obtener una conexión del pool en {self.ACQUIRE_TIMEOUT}s "
+                "(probablemente el pool está saturado con queries colgadas)."
+            )
         self._tx = self._conn.transaction()
         await self._tx.start()
         return self
@@ -386,7 +402,27 @@ class Database:
             return
         # Pool chico: alcanza de sobra para un bot de este tamaño y respeta
         # el límite de conexiones concurrentes del plan free de Neon.
-        self._pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=5)
+        #
+        # command_timeout: sin esto, si una conexión queda "zombie" (Neon o
+        # algún proxy de red la cerró silenciosamente sin que asyncpg se
+        # entere), cualquier query que le toque esa conexión se queda
+        # esperando una respuesta que nunca llega - PARA SIEMPRE. Como
+        # aiogram corre todo en un único event loop y el pool es chico,
+        # basta con que esto le pase a 1-2 conexiones para que el resto de
+        # los usuarios se queden esperando turno también (ver
+        # ACQUIRE_TIMEOUT en _PooledConnection) y el bot entero parezca
+        # colgado aunque el proceso siga vivo y Neon esté despierto.
+        #
+        # max_inactive_connection_lifetime: recicla conexiones que llevan
+        # un rato sin usarse ANTES de que se vuelvan stale, en vez de
+        # esperar a que fallen a mitad de una query real.
+        self._pool = await asyncpg.create_pool(
+            dsn=self.dsn,
+            min_size=1,
+            max_size=5,
+            command_timeout=15,
+            max_inactive_connection_lifetime=180,
+        )
         await self._create_tables()
         logger.info("Base de datos (Postgres/Neon, asyncpg) inicializada correctamente.")
 
