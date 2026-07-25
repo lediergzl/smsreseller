@@ -4422,20 +4422,20 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         # confirmación final (cb_withdraw_confirm), así que cancelar acá
         # nunca deja el saldo tocado.
         await state.clear()
-        await call.message.answer("✅ Retiro cancelado. Tu saldo no fue modificado.")
+        await _safe_answer(call.message, "✅ Retiro cancelado. Tu saldo no fue modificado.")
         return
 
     if current_state in (DepositFlow.awaiting_amount, DepositFlow.selecting_currency):
         # Todavía no se generó ninguna orden de cobro, nada que revertir.
         await state.clear()
-        await call.message.answer("✅ Depósito cancelado.")
+        await _safe_answer(call.message, "✅ Depósito cancelado.")
         return
 
     if current_state in (AnuncioFlow.awaiting_content, AnuncioFlow.confirming):
         # Nada se publica hasta cb_anuncio_confirm, así que cancelar acá
         # nunca deja un anuncio a medio mandar.
         await state.clear()
-        await call.message.answer("✅ Anuncio cancelado, no se publicó nada.")
+        await _safe_answer(call.message, "✅ Anuncio cancelado, no se publicó nada.")
         return
 
     if current_state in (
@@ -4451,7 +4451,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         if dep_id:
             await db.set_manual_deposit_status(dep_id, "cancelled")
         await state.clear()
-        await call.message.answer("✅ Depósito CUP cancelado.")
+        await _safe_answer(call.message, "✅ Depósito CUP cancelado.")
         return
 
     if current_state in (PurchaseFlow.selecting_manual_method, PurchaseFlow.awaiting_manual_review):
@@ -4460,7 +4460,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         if tx_id:
             await db.set_status(tx_id, "error")
         await state.clear()
-        await call.message.answer("✅ Compra cancelada. No se generó ningún cargo.")
+        await _safe_answer(call.message, "✅ Compra cancelada. No se generó ningún cargo.")
         return
 
     if current_state == DepositFlow.awaiting_payment:
@@ -4472,7 +4472,8 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         if deposit_id:
             await db.set_deposit_status(deposit_id, "cancelled")
         await state.clear()
-        await call.message.answer(
+        await _safe_answer(
+            call.message,
             "✅ Depósito cancelado.\n"
             "Si ya habías enviado el pago antes de cancelar, lo detectaremos "
             "y se acreditará automáticamente a tu saldo."
@@ -4494,7 +4495,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
                 await db.set_sms_code(tx_id, code)
                 await db.set_status(tx_id, "completed")
                 await hero.set_status_done(act_id)
-                await call.message.answer(MSG_CODE_RECEIVED.format(code=code), parse_mode="HTML")
+                await _safe_answer(call.message, MSG_CODE_RECEIVED.format(code=code))
                 if tx := await db.get_by_id(tx_id):
                     await _notify_admin(
                         bot=call.bot,
@@ -4548,7 +4549,8 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
                 reason=f"Cancelación manual tx={tx_id}",
             )
             await db.set_status(tx_id, "refunded")
-            await call.message.answer(
+            await _safe_answer(
+                call.message,
                 f"💰 Se acreditaron {format_amount(credit_amount, 'USD')} a tu saldo "
                 f"interno (saldo total: {format_amount(new_balance, 'USD')}; se retiene "
                 f"un {REFUND_FEE_PCT:.0%} de cargo de servicio). Úsalo en tu próxima "
@@ -4572,7 +4574,8 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         await db.set_status(tx_id, "error")
 
     await state.clear()
-    await call.message.answer(
+    await _safe_answer(
+        call.message,
         "✅ Operación cancelada.\n"
         "Si ya habías enviado un pago antes de cancelar, lo detectaremos "
         "y se reembolsará automáticamente. Usa /start para comenzar de nuevo."
