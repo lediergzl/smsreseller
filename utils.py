@@ -436,6 +436,24 @@ def purchase_cup_review_keyboard(tx_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def channel_gate_keyboard() -> InlineKeyboardMarkup:
+    """
+    Teclado del gate obligatorio de /start (ver handlers.cmd_start y
+    handlers._check_channel_membership). A diferencia de
+    channel_invite_keyboard (un nudge que se puede ignorar), acá el botón
+    "✅ Ya me uní" dispara una verificación REAL vía bot.get_chat_member
+    -no alcanza con tocar el link, hay que confirmar- antes de dejar pasar
+    al usuario al resto del bot.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📢 Unirme al canal", url=COMMUNITY_CHANNEL_URL)
+    if COMMUNITY_GROUP_URL:
+        builder.button(text="👥 Unirme al grupo", url=COMMUNITY_GROUP_URL)
+    builder.button(text="✅ Ya me uní", callback_data="check_channel_join")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def channel_invite_keyboard() -> InlineKeyboardMarkup:
     """Botón único para el nudge puntual (ver MSG_CHANNEL_INVITE). Solo se
     llama si config.COMMUNITY_CHANNEL_URL está seteado -mismo chequeo que
@@ -888,9 +906,11 @@ MSG_MANUAL_DEPOSIT_INSTRUCTIONS = (
     "⚠️ <b>Importante:</b> pon este código en el concepto/mensaje de la "
     "transferencia, es la única forma de identificar tu pago:\n"
     "<code>{reference_code}</code>\n\n"
-    "Cuando termines, envía aquí una <b>captura de pantalla</b> del "
-    "comprobante (o escribe el ID/número de la transacción si no puedes "
-    "mandar foto)."
+    "Cuando termines, envía aquí una <b>captura de pantalla completa</b> "
+    "del comprobante (o escribe el ID/número de la transacción si no "
+    "puedes mandar foto).\n"
+    "📅 Que se vea la <b>fecha y hora</b> de la transferencia — no la "
+    "recortes ni la edites, o la revisión se demora más."
 )
 
 MSG_MANUAL_PURCHASE_INSTRUCTIONS = (
@@ -899,9 +919,18 @@ MSG_MANUAL_PURCHASE_INSTRUCTIONS = (
     "⚠️ <b>Importante:</b> pon este código en el concepto/mensaje de la "
     "transferencia, es la única forma de identificar tu pago:\n"
     "<code>{reference_code}</code>\n\n"
-    "Cuando termines, envía aquí una <b>captura de pantalla</b> del "
-    "comprobante (o escribe el ID/número de la transacción si no puedes "
-    "mandar foto). Apenas se confirme, recibirás tu número automáticamente."
+    "Cuando termines, envía aquí una <b>captura de pantalla completa</b> "
+    "del comprobante (o escribe el ID/número de la transacción si no "
+    "puedes mandar foto).\n"
+    "📅 Que se vea la <b>fecha y hora</b> de la transferencia — no la "
+    "recortes ni la edites, o la revisión se demora más.\n"
+    "Apenas se confirme, recibirás tu número automáticamente."
+)
+
+MSG_MANUAL_DEPOSIT_ASK_SENT_AMOUNT = (
+    "💰 Por último, escribe la <b>cantidad exacta en CUP</b> que mandaste "
+    "según tu comprobante (puede diferir un poco por comisión del banco). "
+    "Esto ayuda al admin a verificar el pago más rápido."
 )
 
 MSG_MANUAL_DEPOSIT_PROOF_RECEIVED = (
@@ -1073,6 +1102,12 @@ MSG_REFERRAL_BONUS_EARNED = (
 # confianza posible, recién tuvo una experiencia buena. El botón "📢 Canal
 # oficial" del menú principal (ver utils.main_menu_keyboard) ya está siempre
 # visible; esto es un empujón adicional en el mejor momento, no un reemplazo.
+MSG_CHANNEL_GATE = (
+    "🔔 <b>Antes de empezar, únete a nuestro canal</b>\n\n"
+    "Ahí avisamos caídas de servicio, promociones y novedades importantes. "
+    "Toca el botón para unirte y después <b>\"✅ Ya me uní\"</b> para continuar."
+)
+
 MSG_CHANNEL_INVITE = (
     "📢 Antes de que sigas, unite a nuestro canal -ahí vas a enterarte "
     "primero de lo nuevo (servicios, países, promos) sin tener que estar "

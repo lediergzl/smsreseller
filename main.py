@@ -141,11 +141,20 @@ def _build_bot_and_dispatcher():
     return bot, dp, storage
 
 
-async def _startup_sequence(bot: Bot, storage):
+async def _startup_sequence(bot: Bot, storage, background_tasks: list):
     """Todo lo que antes corría al principio de main(): chequeo de
     integridad, recovery de transacciones/depósitos, outbox, warm cache y
     las tareas en background. Se llama tanto desde el arranque en modo
-    webhook (on_startup) como desde el modo polling local."""
+    webhook (on_startup) como desde el modo polling local.
+
+    `background_tasks`: lista compartida con el llamador donde se van
+    guardando las tareas de loop infinito que se crean acá (retry_loop,
+    warm_cache, db_health_loop). Sin esto, on_shutdown no tenía forma de
+    cancelarlas antes de cerrar la base -ver el bug real que esto arregla:
+    en un rolling restart de Render, `db.close()` corría mientras
+    retry_loop todavía estaba vivo, y su próxima iteración tocaba `db` con
+    el pool ya en None, disparando el mismo RuntimeError que "no conectado
+    todavía" (el código no distingue "nunca conectado" de "ya cerrado")."""
     logger = logging.getLogger(__name__)
 
     # Crea el pool de conexiones (asyncpg) y asegura que las tablas existan.
@@ -173,17 +182,29 @@ async def _startup_sequence(bot: Bot, storage):
     # Reintentar de una vez cualquier aviso que haya quedado pendiente en el
     # outbox de una corrida anterior.
     await outbox.flush_pending(bot)
-    asyncio.create_task(outbox.retry_loop(bot))
+    background_tasks.append(asyncio.create_task(outbox.retry_loop(bot)))
 
     # Precalentar caché de servicios/países (HeroSMS) y de catálogo de
     # monedas (CCPayment) en background, en paralelo.
-    asyncio.create_task(hero.warm_cache())
-    asyncio.create_task(ccpay.warm_catalog_cache())
+    background_tasks.append(asyncio.create_task(hero.warm_cache()))
+    background_tasks.append(asyncio.create_task(ccpay.warm_catalog_cache()))
 
     # Chequeo de salud de la DB + keep-alive de Neon (ver backup_task.py).
-    asyncio.create_task(backup_task.db_health_loop(bot))
+    background_tasks.append(asyncio.create_task(backup_task.db_health_loop(bot)))
 
     logger.info("Bot iniciado correctamente.")
+
+
+async def _cancel_background_tasks(background_tasks: list):
+    """Cancela y espera todas las tareas de loop infinito arrancadas en
+    _startup_sequence. Se llama SIEMPRE antes de `await db.close()` (tanto
+    en modo webhook como en polling) para que ninguna de ellas intente
+    tocar `db` justo después de que el pool ya se cerró -ver docstring de
+    _startup_sequence para el bug real que esto evita."""
+    for task in background_tasks:
+        task.cancel()
+    if background_tasks:
+        await asyncio.gather(*background_tasks, return_exceptions=True)
 
 
 def _run_webhook(bot: Bot, dp: Dispatcher, storage):
@@ -209,6 +230,7 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
     # tardar en abrir el puerto (ver por qué esto importa, más abajo en
     # on_startup).
     ready = asyncio.Event()
+    background_tasks: list[asyncio.Task] = []
 
     @dp.update.outer_middleware()
     async def _wait_until_ready(handler, event, data):
@@ -254,7 +276,7 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
         # todavía sin conectar.
         async def _startup_and_signal_ready():
             try:
-                await _startup_sequence(bot, storage)
+                await _startup_sequence(bot, storage, background_tasks)
             finally:
                 ready.set()
 
@@ -269,6 +291,15 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
         # hasta el próximo restart: los updates quedan acumulados como
         # pending_update_count en vez de llegar, y como nunca llegan no se
         # genera ningún log.
+        #
+        # Cancelar las tareas de background ANTES que db.close(): sin esto,
+        # retry_loop/db_health_loop/warm_cache podían seguir vivas -ya
+        # dormidas en su próximo asyncio.sleep- y, al despertar justo
+        # después de que el pool se cerrara acá abajo, disparar el mismo
+        # RuntimeError de "Database.connect() no fue llamado todavía" (el
+        # código no distingue "nunca conectado" de "pool ya cerrado") -esto
+        # es justo lo que se veía en los logs durante un rolling restart.
+        await _cancel_background_tasks(background_tasks)
         await bot.session.close()
         await hero.close_session()
         await ccpay.close_session()
@@ -300,11 +331,16 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
 async def _run_polling(bot: Bot, dp: Dispatcher, storage):
     """Modo local: long polling de siempre, sin necesidad de URL pública."""
     logger = logging.getLogger(__name__)
-    await _startup_sequence(bot, storage)
+    background_tasks: list[asyncio.Task] = []
+    await _startup_sequence(bot, storage, background_tasks)
     logger.info("Bot iniciado. Escuchando actualizaciones (polling)...")
     try:
         await dp.start_polling(bot)
     finally:
+        # Mismo motivo que en on_shutdown de _run_webhook: cancelar antes
+        # de cerrar la base, para que ninguna tarea en background la toque
+        # después de que el pool ya no exista.
+        await _cancel_background_tasks(background_tasks)
         await bot.session.close()
         await hero.close_session()
         await ccpay.close_session()

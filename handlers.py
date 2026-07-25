@@ -41,7 +41,7 @@ from utils import (
     balance_menu_keyboard,
     withdraw_start_keyboard, withdraw_currencies_keyboard, withdraw_confirm_keyboard,
     deposit_currencies_keyboard,
-    manual_payment_methods_keyboard, manual_deposit_review_keyboard,
+    manual_payment_methods_keyboard, manual_deposit_review_keyboard, channel_gate_keyboard,
     purchase_cup_review_keyboard, refund_request_review_keyboard, channel_invite_keyboard, support_keyboard,
     cup_withdraw_methods_keyboard, cup_withdraw_confirm_keyboard, manual_withdrawal_review_keyboard,
     anuncio_confirm_keyboard,
@@ -57,7 +57,8 @@ from utils import (
     MSG_MANUAL_DEPOSIT_SELECT_METHOD, MSG_MANUAL_DEPOSIT_ASK_AMOUNT,
     MSG_MANUAL_DEPOSIT_INSTRUCTIONS, MSG_MANUAL_DEPOSIT_PROOF_RECEIVED,
     MSG_MANUAL_DEPOSIT_APPROVED, MSG_MANUAL_DEPOSIT_REJECTED,
-    MSG_MANUAL_DEPOSIT_ALREADY_PENDING,
+    MSG_MANUAL_DEPOSIT_ALREADY_PENDING, MSG_MANUAL_DEPOSIT_ASK_SENT_AMOUNT,
+    MSG_CHANNEL_GATE,
     MSG_MANUAL_PURCHASE_INSTRUCTIONS,
     MSG_CUP_WITHDRAW_SELECT_METHOD, MSG_CUP_WITHDRAW_ASK_AMOUNT, MSG_CUP_WITHDRAW_ASK_ACCOUNT,
     MSG_CUP_WITHDRAW_CONFIRM, MSG_CUP_WITHDRAW_SUBMITTED, MSG_CUP_WITHDRAW_APPROVED,
@@ -105,9 +106,10 @@ class DepositFlow(StatesGroup):
 
 
 class ManualDepositFlow(StatesGroup):
-    selecting_method = State()   # Usuario eligiendo Transfermóvil/EnZona
-    awaiting_amount  = State()   # Usuario escribiendo cuánto quiere depositar (USD)
-    awaiting_proof   = State()   # Bot esperando foto/texto del comprobante
+    selecting_method    = State()   # Usuario eligiendo Transfermóvil/EnZona
+    awaiting_amount     = State()   # Usuario escribiendo cuánto quiere depositar (USD)
+    awaiting_proof      = State()   # Bot esperando foto/texto del comprobante
+    awaiting_sent_amount = State()  # Comprobante ya recibido, pidiendo confirmar el monto CUP exacto que mandó
 
 
 class AnuncioFlow(StatesGroup):
@@ -373,6 +375,33 @@ async def _maybe_credit_referral_bonus(bot, tx_id: int):
         await db.register_referral_bonus_pending(referrer_id, buyer_id, tx_id, bonus)
     except Exception as exc:
         logger.error("No se pudo registrar bono de referido pendiente para tx=%s: %s", tx_id, exc)
+
+
+async def _check_channel_membership(bot, user_id: int) -> bool:
+    """
+    Verificación REAL (no un botón que se pudo tocar sin llegar a unirse)
+    de si `user_id` está en el canal de comunidad, vía bot.get_chat_member
+    -requiere que el bot sea ADMIN del canal, igual que
+    on_channel_member_update. Usada por el gate obligatorio de /start (ver
+    cmd_start / cb_check_channel_join).
+
+    Si COMMUNITY_CHANNEL_CHAT_ID no está configurado, o si la llamada
+    falla (bot todavía no es admin del canal, error de red, etc.),
+    devolvemos True -es decir, NO bloqueamos al usuario- para que un canal
+    mal configurado nunca deje a todo el mundo afuera del bot. Se loguea
+    igual para que quede constancia del problema.
+    """
+    if not COMMUNITY_CHANNEL_CHAT_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(COMMUNITY_CHANNEL_CHAT_ID, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as exc:
+        logger.warning(
+            "No se pudo verificar membresía de canal para %s (¿el bot es admin "
+            "del canal?): %s", user_id, exc,
+        )
+        return True
 
 
 async def _maybe_prompt_channel_join(bot, tx_id: int):
@@ -667,8 +696,14 @@ async def _credit_refund_for_tx(user_id: int, tx: dict, amount_usd: float, tx_id
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
-async def _capture_referral(message: Message):
+async def _capture_referral_text(bot, user_id: int, start_text: str | None):
     """
+    Cuerpo real de la captura de referido, sin depender de un objeto
+    Message del usuario -necesario porque el gate obligatorio de canal
+    (ver cmd_start / cb_check_channel_join) confirma la membresía vía un
+    CALLBACK, donde call.message es un mensaje DEL BOT, no del usuario: ahí
+    no hay un Message real con el texto "/start ref_xxx" original para leer.
+
     Si /start vino con el parámetro ref_<código> (deep link armado en
     _send_referral_info), vincula a quien corre /start con el dueño de ese
     código (ver database.set_referrer). No hace nada si el link no trae
@@ -677,7 +712,7 @@ async def _capture_referral(message: Message):
     ya protege eso a nivel de DB, acá solo se evita la notificación de
     "nuevo registrado" en ese caso). Nunca debe romper /start.
     """
-    args = (message.text or "").split(maxsplit=1)
+    args = (start_text or "").split(maxsplit=1)
     if len(args) < 2 or not args[1].startswith("ref_"):
         return
     code = args[1][len("ref_"):].strip()
@@ -685,37 +720,50 @@ async def _capture_referral(message: Message):
         return
     try:
         referrer = await db.get_user_by_referral_code(code)
-        if not referrer or referrer["user_id"] == message.from_user.id:
+        if not referrer or referrer["user_id"] == user_id:
             return
-        linked = await db.set_referrer(message.from_user.id, referrer["user_id"])
+        linked = await db.set_referrer(user_id, referrer["user_id"])
         if linked:
-            await _safe_send(message.bot, referrer["user_id"], MSG_REFERRAL_NEW_SIGNUP)
+            await _safe_send(bot, referrer["user_id"], MSG_REFERRAL_NEW_SIGNUP)
     except Exception as exc:
-        logger.error("No se pudo procesar referido para %s: %s", message.from_user.id, exc)
+        logger.error("No se pudo procesar referido para %s: %s", user_id, exc)
 
 
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    """Punto de entrada principal."""
-    if await _warn_if_active_order(state, message.answer, "start", message.bot, message.from_user.id):
-        return
+async def _capture_referral(message: Message):
+    """Wrapper de _capture_referral_text para el caso normal (un Message
+    real del usuario, con su /start ref_xxx en message.text)."""
+    await _capture_referral_text(message.bot, message.from_user.id, message.text)
+
+
+async def _finish_start(bot, chat_id: int, user, state: FSMContext, message: Message | None = None):
+    """
+    Cuerpo compartido del /start "de verdad" (registro + tarjeta de
+    bienvenida + menú persistente), extraído para poder reusarlo también
+    desde cb_check_channel_join -ahí no hay un Message del USUARIO propio
+    (call.message es un mensaje DEL BOT), así que no podemos simplemente
+    volver a llamar a cmd_start.
+
+    `message`, si se pasa, se usa para intentar la tarjeta de bienvenida
+    con foto de perfil real (telegram_sender.send_welcome_card la necesita
+    para leer el chat/usuario original); sin ella, se manda directo el
+    mensaje de texto plano.
+    """
     await state.clear()
     await db.register_user(
-        message.from_user.id,
-        username=message.from_user.username,
-        first_name=message.from_user.first_name,
-        last_name=message.from_user.last_name,
-        language_code=message.from_user.language_code,
-        is_premium=message.from_user.is_premium,
+        user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        language_code=user.language_code,
+        is_premium=user.is_premium,
     )
-    await _capture_referral(message)
 
     # Si quien corre /start es un admin (ver config.ADMIN_IDS), el menú
     # persistente lleva un botón extra "🛠️ Panel admin" (ver
     # utils.main_persistent_keyboard) — el admin sigue viendo el mismo menú
     # de cliente normal (puede comprar para sí mismo, consultar su saldo,
     # etc.), solo que con acceso rápido extra.
-    is_admin = _is_admin(message.from_user.id)
+    is_admin = _is_admin(user.id)
 
     # NOTA: adjuntar main_persistent_keyboard acá ya reemplaza cualquier
     # ReplyKeyboardMarkup que hubiera quedado pegado de antes (ej. el de
@@ -727,16 +775,73 @@ async def cmd_start(message: Message, state: FSMContext):
     # cuenta), con el menú persistente ya adjunto. Si algo falla (Pillow,
     # fuente, foto corrupta, etc.) no debe tumbar el /start: se cae al
     # mensaje de texto normal de siempre.
-    sent_card = await telegram_sender.send_welcome_card(
-        message.bot, message, caption=MSG_WELCOME, parse_mode="HTML",
-        reply_markup=main_persistent_keyboard(is_admin=is_admin),
-    )
+    sent_card = False
+    if message is not None:
+        sent_card = await telegram_sender.send_welcome_card(
+            bot, message, caption=MSG_WELCOME, parse_mode="HTML",
+            reply_markup=main_persistent_keyboard(is_admin=is_admin),
+        )
     if not sent_card:
-        await message.answer(
-            MSG_WELCOME,
+        await bot.send_message(
+            chat_id, MSG_WELCOME,
             parse_mode="HTML",
             reply_markup=main_persistent_keyboard(is_admin=is_admin),
         )
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    """Punto de entrada principal."""
+    if await _warn_if_active_order(state, message.answer, "start", message.bot, message.from_user.id):
+        return
+
+    # Gate obligatorio: si hay un canal de comunidad configurado
+    # (COMMUNITY_CHANNEL_CHAT_ID + COMMUNITY_CHANNEL_URL) y el usuario NO
+    # está en él, se corta acá -no se registra, no se captura referido, no
+    # se muestra el menú- hasta que confirme membresía real con el botón
+    # "✅ Ya me uní" (ver cb_check_channel_join). A diferencia del nudge
+    # antiguo (_maybe_prompt_channel_join, solo un aviso tras la primera
+    # compra), esto bloquea de entrada.
+    if not await _check_channel_membership(message.bot, message.from_user.id):
+        # Guardamos el /start original (puede traer ?start=ref_xxx) para no
+        # perder la captura de referido si el usuario confirma membresía
+        # más tarde vía cb_check_channel_join, donde ya no hay acceso a
+        # este Message.
+        await state.update_data(pending_start_text=message.text)
+        await message.answer(
+            MSG_CHANNEL_GATE, parse_mode="HTML", reply_markup=channel_gate_keyboard(),
+        )
+        return
+
+    await _capture_referral(message)
+    await _finish_start(message.bot, message.chat.id, message.from_user, state, message=message)
+
+
+@router.callback_query(F.data == "check_channel_join")
+async def cb_check_channel_join(call: CallbackQuery, state: FSMContext):
+    """Botón "✅ Ya me uní" del gate obligatorio (ver MSG_CHANNEL_GATE /
+    channel_gate_keyboard). Verifica de nuevo -tocar el link no alcanza,
+    hay que haberse unido de verdad- y recién ahí deja pasar al /start
+    real."""
+    if not await _check_channel_membership(call.bot, call.from_user.id):
+        await _safe_call_answer(
+            call,
+            "Todavía no te veo en el canal. Únete con el botón de arriba y "
+            "toca \"Ya me uní\" de nuevo.",
+            show_alert=True,
+        )
+        return
+
+    await db.mark_channel_joined(call.from_user.id)
+    await _safe_call_answer(call, "✅ ¡Gracias por unirte!")
+    try:
+        await call.message.edit_text("✅ Verificado, ¡bienvenido!")
+    except Exception as exc:
+        logger.debug("No se pudo editar el mensaje del gate de canal: %s", exc)
+
+    pending_start_text = (await state.get_data()).get("pending_start_text")
+    await _capture_referral_text(call.bot, call.from_user.id, pending_start_text)
+    await _finish_start(call.bot, call.message.chat.id, call.from_user, state)
 
 
 # ── Menú persistente (ReplyKeyboardMarkup, ver utils.main_persistent_keyboard) ─
@@ -4311,28 +4416,80 @@ async def msg_manual_deposit_proof(message: Message, state: FSMContext):
         dep_id, proof_file_id=proof_file_id,
         proof_file_unique_id=proof_file_unique_id, proof_text=proof_text,
     )
-    reused = await db.find_reused_proof(proof_file_unique_id, exclude_dep_id=dep_id)
+
+    # Ya guardamos el comprobante, pero todavía NO avisamos al admin ni
+    # limpiamos el estado: primero le pedimos al usuario que confirme el
+    # monto CUP exacto que mandó (ver MSG_MANUAL_DEPOSIT_ASK_SENT_AMOUNT).
+    # Los bancos/monederos cubanos suelen cobrar una comisión de la
+    # transferencia (ver ejemplo real: "cobro de comisión de 1.00 CUP"),
+    # así que el monto que llega no siempre coincide centavo a centavo con
+    # lo que pedimos transferir -tenerlo aparte le da al admin un dato más
+    # para cruzar contra la captura, sin tener que hacer zoom al número.
+    await state.set_state(ManualDepositFlow.awaiting_sent_amount)
+    await message.answer(
+        MSG_MANUAL_DEPOSIT_ASK_SENT_AMOUNT,
+        parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(ManualDepositFlow.awaiting_sent_amount)
+async def msg_manual_deposit_sent_amount(message: Message, state: FSMContext):
+    """
+    Recibe el monto CUP que el usuario dice haber transferido (tras ya
+    haber mandado la captura, ver msg_manual_deposit_proof). Con esto
+    recién se notifica al admin y se cierra el flujo -antes de esto el
+    admin no se entera de que ya llegó comprobante.
+    """
+    data = await state.get_data()
+    dep_id = data.get("manual_deposit_id")
+    reference_code = data.get("manual_reference_code")
+    if not dep_id:
+        await state.clear()
+        await message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
+        return
+
+    text = (message.text or "").strip().replace(" ", "").replace(",", "")
+    try:
+        sent_amount_cup = round(float(text))
+    except ValueError:
+        await message.answer(
+            "⚠️ Escribe solo el número de CUP que mandaste (ej: 300).",
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard(),
+        )
+        return
+
+    dep = await db.get_manual_deposit_by_id(dep_id)
+    if not dep:
+        await state.clear()
+        await message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
+        return
+    reused = await db.find_reused_proof(dep.get("proof_file_unique_id"), exclude_dep_id=dep_id)
 
     await message.answer(
         MSG_MANUAL_DEPOSIT_PROOF_RECEIVED.format(reference_code=reference_code),
         parse_mode="HTML",
     )
 
-    dep = await db.get_manual_deposit_by_id(dep_id)
     cup_str = f"{dep['amount_cup']:,}".replace(",", " ") if dep.get("amount_cup") else "?"
+    sent_cup_str = f"{sent_amount_cup:,}".replace(",", " ")
     dep_method = await db.get_payment_method(dep["method"])
+    mismatch_tag = " ⚠️ <b>no coincide con lo pedido</b>" if dep.get("amount_cup") and sent_amount_cup != dep["amount_cup"] else ""
     caption = (
         _reused_proof_warning(reused) +
         f"🇨🇺 <b>Nuevo depósito CUP a revisar</b>\n"
         f"Código: <code>{reference_code}</code>\n"
         f"Método: {(dep_method or {}).get('name', dep['method'])}\n"
-        f"Monto: {format_amount(dep['amount_usd'], 'USD')} ≈ {cup_str} CUP "
+        f"Pedido: {format_amount(dep['amount_usd'], 'USD')} ≈ {cup_str} CUP "
         f"(tasa {dep.get('cup_rate') or '?'})\n"
-        f"👤 <code>{dep['user_id']}</code>"
+        f"Cliente dice haber mandado: {sent_cup_str} CUP{mismatch_tag}\n"
+        f"👤 {_user_label(dep['user_id'], message.from_user.username)}"
     )
-    if proof_text:
-        caption += f"\n📝 Comprobante (texto): <code>{proof_text}</code>"
+    if dep.get("proof_text"):
+        caption += f"\n📝 Comprobante (texto): <code>{dep['proof_text']}</code>"
 
+    proof_file_id = dep.get("proof_file_id")
     try:
         if proof_file_id:
             await message.bot.send_photo(
@@ -4486,7 +4643,7 @@ async def _perform_cancel(bot, user_id: int, state: FSMContext):
 
     if current_state in (
         ManualDepositFlow.selecting_method, ManualDepositFlow.awaiting_amount,
-        ManualDepositFlow.awaiting_proof,
+        ManualDepositFlow.awaiting_proof, ManualDepositFlow.awaiting_sent_amount,
     ):
         # No se acreditó nada en ningún punto de este flujo hasta la
         # aprobación del admin, así que cancelar acá nunca deja saldo a
@@ -4698,6 +4855,7 @@ _RISKY_STATES = {
     PurchaseFlow.awaiting_payment, PurchaseFlow.awaiting_sms,
     PurchaseFlow.selecting_manual_method, PurchaseFlow.awaiting_manual_review,
     DepositFlow.awaiting_payment, ManualDepositFlow.awaiting_proof,
+    ManualDepositFlow.awaiting_sent_amount,
     WithdrawFlow.confirming, CupWithdrawFlow.confirming,
 }
 
@@ -4726,6 +4884,8 @@ def _describe_active_order(current_state, data: dict) -> str:
         return "un depósito esperando el pago"
     if current_state == ManualDepositFlow.awaiting_proof:
         return "un depósito por Transfermóvil/EnZona esperando tu comprobante"
+    if current_state == ManualDepositFlow.awaiting_sent_amount:
+        return "un depósito por Transfermóvil/EnZona esperando que confirmes el monto enviado"
     if current_state == WithdrawFlow.confirming:
         return "un retiro a punto de confirmarse"
     if current_state == CupWithdrawFlow.confirming:

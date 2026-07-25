@@ -14,6 +14,8 @@ import asyncio
 import json
 import logging
 import time
+import unicodedata
+from difflib import SequenceMatcher
 from typing import Optional
 import aiohttp
 from config import HEROSMS_API_KEY, HEROSMS_API_URL
@@ -135,23 +137,79 @@ async def get_services(force_refresh: bool = False) -> list[dict]:
         return _services_cache["data"]
 
 
+def _normalize(text: str) -> str:
+    """
+    Minúsculas + sin acentos/diacríticos (ej. "telegrám" -> "telegram"), para
+    que la búsqueda no dependa de que el usuario tipee los acentos exactos
+    -algo muy común escribiendo rápido desde el celular.
+    """
+    text = text.strip().lower()
+    text = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in text if not unicodedata.combining(c))
+
+
+def _match_score(query_norm: str, query_words: list[str], name_norm: str, code_norm: str) -> Optional[float]:
+    """
+    Puntaje de relevancia (más BAJO = mejor match) para un servicio dado,
+    o None si no matchea en absoluto. Antes esto era un único chequeo
+    rígido `q in name.lower() or q in code.lower()` -si el usuario tenía
+    una idea vaga o cometía un typo ("wasap", "watsap", "wp"), no
+    encontraba nada aunque el servicio SÍ existiera en la lista de
+    HeroSMS. Ahora se prueban, de más a menos estricto:
+
+      0. Coincidencia exacta con el nombre o código.
+      1. El nombre/código EMPIEZA con lo que escribió.
+      2. Todas las palabras de la búsqueda aparecen en el nombre/código,
+         en CUALQUIER orden (ej. "insta business" -> "Instagram Business").
+      3. Lo que escribió aparece como substring en cualquier parte.
+      4. Fuzzy: se PARECE lo suficiente al nombre (tolera errores de
+         tipeo y variantes como "wasap" ~ "whatsapp"), via
+         difflib.SequenceMatcher. Umbral 0.6 elegido para atrapar typos
+         de 1-2 letras en nombres cortos sin generar demasiado ruido.
+    """
+    if query_norm == name_norm or query_norm == code_norm:
+        return 0.0
+    if name_norm.startswith(query_norm) or code_norm.startswith(query_norm):
+        return 1.0
+    if query_words and all(w in name_norm or w in code_norm for w in query_words):
+        return 2.0
+    if query_norm in name_norm or query_norm in code_norm:
+        return 3.0
+
+    ratio = max(
+        SequenceMatcher(None, query_norm, name_norm).ratio(),
+        SequenceMatcher(None, query_norm, code_norm).ratio(),
+    )
+    if ratio >= 0.6:
+        return 4.0 + (1.0 - ratio)  # cuanto más se parece, mejor (más chico)
+    return None
+
+
 async def search_services(query: str, limit: int = 20) -> list[dict]:
     """
-    Busca servicios por nombre o código (case-insensitive, substring match).
-    Si query está vacío o es "todos"/"all"/"populares", devuelve los primeros
-    `limit` servicios tal cual los entrega la API.
+    Busca servicios por nombre o código, tolerando ideas vagas, errores de
+    tipeo y orden de palabras distinto (ver _match_score). Si query está
+    vacío o es "todos"/"all"/"populares", devuelve los primeros `limit`
+    servicios tal cual los entrega la API.
     """
     services = await get_services()
-    q = query.strip().lower()
+    q = _normalize(query)
 
     if not q or q in ("todos", "all", "populares", "*"):
         return services[:limit]
 
-    matches = [
-        s for s in services
-        if q in s["name"].lower() or q in s["code"].lower()
-    ]
-    return matches[:limit]
+    q_words = q.split()
+
+    scored = []
+    for s in services:
+        name_n = _normalize(s["name"])
+        code_n = _normalize(s["code"])
+        score = _match_score(q, q_words, name_n, code_n)
+        if score is not None:
+            scored.append((score, s))
+
+    scored.sort(key=lambda pair: pair[0])
+    return [s for _, s in scored[:limit]]
 
 
 async def get_service_name(code: str) -> str:

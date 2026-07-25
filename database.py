@@ -1221,6 +1221,26 @@ class Database:
             )
             return dict(row) if row else None
 
+    async def get_manual_deposit_reminder_status(self, user_id: int) -> dict:
+        """
+        Resumen de intentos de depósito CUP del usuario, para el
+        recordatorio de /saldo (ver handlers._send_saldo): si tuvo AL
+        MENOS un registro en manual_deposits (empezó el flujo alguna vez,
+        sin importar en qué paso quedó) pero NINGUNO llegó a 'approved',
+        vale la pena recordarle que le falta completarlo. Si nunca tuvo
+        ninguno, o si ya tiene al menos uno aprobado, no hace falta nada.
+        """
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT COUNT(*) AS total, "
+                "COUNT(*) FILTER (WHERE status = 'approved') AS approved "
+                "FROM manual_deposits WHERE user_id = $1",
+                user_id,
+            )
+            total = int(row["total"] or 0)
+            approved = int(row["approved"] or 0)
+            return {"attempted": total > 0, "approved": approved > 0}
+
     async def get_pending_manual_deposits_for_review(self) -> list[dict]:
         """Todas las solicitudes esperando aprobación de un admin (para /pendientes)."""
         async with self._conn() as conn:
