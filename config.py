@@ -342,6 +342,17 @@ COMMUNITY_CHANNEL_CHAT_ID: int = int(os.getenv("COMMUNITY_CHANNEL_CHAT_ID", "0")
 # botón simplemente no aparece.
 COMMUNITY_GROUP_URL: str = os.getenv("COMMUNITY_GROUP_URL", "")
 
+# chat_id NUMÉRICO del grupo (ej. -1001234567890), NO la URL. Hace falta
+# además de la URL porque /hablar (handlers.cmd_hablar) publica ahí
+# directamente vía bot.send_message(COMMUNITY_GROUP_CHAT_ID, ...) -eso
+# necesita el id, un link de invitación no sirve para mandar mensajes. Para
+# obtenerlo: agregar el bot como admin del grupo, mandar cualquier mensaje
+# ahí, y mirar el update que le llega al bot (o usar @userinfobot /
+# @RawDataBot en el grupo). Igual que COMMUNITY_CHANNEL_CHAT_ID, en 0
+# simplemente desactiva /hablar (ver handlers._start_anuncio_flow) sin
+# romper nada más.
+COMMUNITY_GROUP_CHAT_ID: int = int(os.getenv("COMMUNITY_GROUP_CHAT_ID", "0") or 0)
+
 # ── Administración / Reportes ─────────────────────────────────────────────────
 # Chat/canal donde el bot manda alertas en tiempo real (pago confirmado, venta
 # completada, reembolsos, timeouts). Usa el ID de un canal o grupo privado
