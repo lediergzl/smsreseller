@@ -697,6 +697,8 @@ async def _capture_referral(message: Message):
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     """Punto de entrada principal."""
+    if await _warn_if_active_order(state, message.answer, "start", message.bot, message.from_user.id):
+        return
     await state.clear()
     await db.register_user(
         message.from_user.id,
@@ -752,36 +754,50 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(F.text == "🛒 Comprar número")
 async def msg_new_purchase(message: Message, state: FSMContext):
+    if await _warn_if_active_order(state, message.answer, "new_purchase", message.bot, message.from_user.id):
+        return
     await _do_new_purchase(message.from_user.id, message.answer, state)
 
 
 @router.message(F.text == "💰 Mi saldo")
-async def msg_my_balance(message: Message):
+async def msg_my_balance(message: Message, state: FSMContext):
+    if await _warn_if_active_order(state, message.answer, "my_balance", message.bot, message.from_user.id):
+        return
     await _send_saldo(message.from_user.id, message.answer)
 
 
 @router.message(F.text == "👤 Mi cuenta")
-async def msg_my_profile(message: Message):
+async def msg_my_profile(message: Message, state: FSMContext):
+    if await _warn_if_active_order(state, message.answer, "my_profile", message.bot, message.from_user.id):
+        return
     await _send_profile(message.from_user, message.answer)
 
 
 @router.message(F.text == "📦 Mis pedidos")
-async def msg_my_txns(message: Message):
+async def msg_my_txns(message: Message, state: FSMContext):
+    if await _warn_if_active_order(state, message.answer, "my_txns", message.bot, message.from_user.id):
+        return
     await _send_historial(message.from_user.id, message.answer)
 
 
 @router.message(F.text == "🌍 Mi país")
-async def msg_my_country(message: Message):
+async def msg_my_country(message: Message, state: FSMContext):
+    if await _warn_if_active_order(state, message.answer, "my_country", message.bot, message.from_user.id):
+        return
     await _send_country_info(message.from_user.id, message.answer)
 
 
 @router.message(F.text == "🔗 Invitar amigos")
-async def msg_my_referrals(message: Message):
+async def msg_my_referrals(message: Message, state: FSMContext):
+    if await _warn_if_active_order(state, message.answer, "my_referrals", message.bot, message.from_user.id):
+        return
     await _send_referral_info(message.bot, message.chat.id, message.from_user.id)
 
 
 @router.message(F.text == "🆘 Soporte")
-async def msg_support(message: Message):
+async def msg_support(message: Message, state: FSMContext):
+    if await _warn_if_active_order(state, message.answer, "support", message.bot, message.from_user.id):
+        return
     await _send_support(message.answer)
 
 
@@ -4406,10 +4422,20 @@ async def cb_admin_reject_manual(call: CallbackQuery):
 
 # ── Cancelación ───────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "cancel_op")
-async def cb_cancel(call: CallbackQuery, state: FSMContext):
-    """El usuario cancela la operación en curso."""
-    await _safe_call_answer(call, "Operación cancelada.")
+async def _perform_cancel(bot, user_id: int, state: FSMContext):
+    """Cuerpo compartido de la cancelación: cierra de verdad la operación
+    activa (marca la tx/depósito en la base, avisa al admin si corresponde,
+    reembolsa si ya se había entregado un número) y le manda al usuario la
+    confirmación correspondiente.
+
+    Parametrizado con `bot`/`user_id` (en vez de recibir el CallbackQuery
+    directo) para poder reusarse desde dos lugares: el botón ❌ Cancelar
+    (cb_cancel, más abajo) y la confirmación de "seguir navegando" cuando
+    había una operación riesgosa en curso (ver _warn_if_active_order) — así
+    tocar "sí, quiero salir igual" no solo abandona el estado en memoria,
+    también cierra la orden de verdad en vez de dejarla huérfana en la base
+    (que era justo el bug reportado: TX #18 quedó 'pending' para siempre
+    después de navegar a 'Mi cuenta' y 'Panel admin')."""
     current_state = await state.get_state()
     data = await state.get_data()
     tx_id = data.get("tx_id")
@@ -4423,13 +4449,13 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         # resucita en cada reinicio (ver resume_transaction, Caso 3.5).
         # En vez de rendirnos, buscamos directo en la base si el usuario
         # tiene una compra o depósito con pago CUP sin resolver.
-        fallback_tx = await db.get_pending_manual_purchase(call.from_user.id)
+        fallback_tx = await db.get_pending_manual_purchase(user_id)
         if fallback_tx:
             tx_id = fallback_tx["id"]
             current_state = PurchaseFlow.awaiting_manual_review
             data = {**data, "tx_id": tx_id, "manual_reference_code": f"REF-{tx_id:06d}"}
         else:
-            fallback_dep = await db.get_pending_manual_deposit(call.from_user.id)
+            fallback_dep = await db.get_pending_manual_deposit(user_id)
             if fallback_dep:
                 current_state = ManualDepositFlow.awaiting_proof
                 data = {**data, "manual_deposit_id": fallback_dep["id"]}
@@ -4442,20 +4468,20 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         # confirmación final (cb_withdraw_confirm), así que cancelar acá
         # nunca deja el saldo tocado.
         await state.clear()
-        await _safe_answer(call.message, "✅ Retiro cancelado. Tu saldo no fue modificado.")
+        await _safe_send(bot, user_id, "✅ Retiro cancelado. Tu saldo no fue modificado.")
         return
 
     if current_state in (DepositFlow.awaiting_amount, DepositFlow.selecting_currency):
         # Todavía no se generó ninguna orden de cobro, nada que revertir.
         await state.clear()
-        await _safe_answer(call.message, "✅ Depósito cancelado.")
+        await _safe_send(bot, user_id, "✅ Depósito cancelado.")
         return
 
     if current_state in (AnuncioFlow.awaiting_content, AnuncioFlow.confirming):
         # Nada se publica hasta cb_anuncio_confirm, así que cancelar acá
         # nunca deja un anuncio a medio mandar.
         await state.clear()
-        await _safe_answer(call.message, "✅ Anuncio cancelado, no se publicó nada.")
+        await _safe_send(bot, user_id, "✅ Anuncio cancelado, no se publicó nada.")
         return
 
     if current_state in (
@@ -4484,18 +4510,18 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
             try:
                 dep = await db.get_manual_deposit_by_id(dep_id)
                 if dep:
-                    buyer = await db.get_user(call.from_user.id)
+                    buyer = await db.get_user(user_id)
                     await _notify_admin(
-                        call.bot,
+                        bot,
                         f"❌ <b>Pago CUP cancelado por el cliente</b> (depósito de saldo)\n"
-                        f"{_user_label(call.from_user.id, buyer.get('username') if buyer else None)} · "
+                        f"{_user_label(user_id, buyer.get('username') if buyer else None)} · "
                         f"{format_amount(dep['amount_usd'], 'USD')}\n"
                         f"Código: <code>{dep['reference_code']}</code>",
                     )
             except Exception as exc:
                 logger.error("No se pudo avisar al admin de la cancelación del depósito %s: %s", dep_id, exc)
         await state.clear()
-        await _safe_answer(call.message, "✅ Depósito CUP cancelado.")
+        await _safe_send(bot, user_id, "✅ Depósito CUP cancelado.")
         return
 
     if current_state in (PurchaseFlow.selecting_manual_method, PurchaseFlow.awaiting_manual_review):
@@ -4520,7 +4546,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
                     if tx:
                         buyer = await db.get_user(tx["user_id"])
                         await _notify_admin(
-                            call.bot,
+                            bot,
                             f"❌ <b>Pago CUP cancelado por el cliente</b> (compra)\n"
                             f"{_user_label(tx['user_id'], buyer.get('username') if buyer else None)}\n"
                             f"Código: <code>{reference_code}</code>\n"
@@ -4529,7 +4555,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
                 except Exception as exc:
                     logger.error("No se pudo avisar al admin de la cancelación de la tx %s: %s", tx_id, exc)
         await state.clear()
-        await _safe_answer(call.message, "✅ Compra cancelada. No se generó ningún cargo.")
+        await _safe_send(bot, user_id, "✅ Compra cancelada. No se generó ningún cargo.")
         return
 
     if current_state == DepositFlow.awaiting_payment:
@@ -4541,8 +4567,8 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         if deposit_id:
             await db.set_deposit_status(deposit_id, "cancelled")
         await state.clear()
-        await _safe_answer(
-            call.message,
+        await _safe_send(
+            bot, user_id,
             "✅ Depósito cancelado.\n"
             "Si ya habías enviado el pago antes de cancelar, lo detectaremos "
             "y se acreditará automáticamente a tu saldo."
@@ -4564,14 +4590,14 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
                 await db.set_sms_code(tx_id, code)
                 await db.set_status(tx_id, "completed")
                 await hero.set_status_done(act_id)
-                await _safe_answer(call.message, MSG_CODE_RECEIVED.format(code=code))
+                await _safe_send(bot, user_id, MSG_CODE_RECEIVED.format(code=code))
                 if tx := await db.get_by_id(tx_id):
                     await _notify_admin(
-                        bot=call.bot,
+                        bot=bot,
                         text=f"✅ <b>Venta completada</b> (código llegó justo al cancelar)\n{_tx_summary_line(tx)}",
                     )
-                await _maybe_credit_referral_bonus(call.bot, tx_id)
-                await _maybe_prompt_channel_join(call.bot, tx_id)
+                await _maybe_credit_referral_bonus(bot, tx_id)
+                await _maybe_prompt_channel_join(bot, tx_id)
                 code_arrived = True
 
         if code_arrived:
@@ -4597,7 +4623,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
             if not ok:
                 if tx2 := await db.get_by_id(tx_id_):
                     await _notify_admin(
-                        bot=call.bot,
+                        bot=bot,
                         text=f"🚨 <b>Cancelación con problemas</b>\n{_tx_summary_line(tx2)}\n"
                              "• HeroSMS rechazó la cancelación (revisar saldo/costo no recuperado)",
                     )
@@ -4614,12 +4640,12 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
             price_usd = data.get("price_usd") or 0
             credit_amount = apply_refund_fee(price_usd, REFUND_FEE_PCT)
             new_balance = await _credit_refund_for_tx(
-                call.from_user.id, tx_for_wait or {}, credit_amount, tx_id,
+                user_id, tx_for_wait or {}, credit_amount, tx_id,
                 reason=f"Cancelación manual tx={tx_id}",
             )
             await db.set_status(tx_id, "refunded")
-            await _safe_answer(
-                call.message,
+            await _safe_send(
+                bot, user_id,
                 f"💰 Se acreditaron {format_amount(credit_amount, 'USD')} a tu saldo "
                 f"interno (saldo total: {format_amount(new_balance, 'USD')}; se retiene "
                 f"un {REFUND_FEE_PCT:.0%} de cargo de servicio). Úsalo en tu próxima "
@@ -4643,12 +4669,105 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         await db.set_status(tx_id, "error")
 
     await state.clear()
-    await _safe_answer(
-        call.message,
+    await _safe_send(
+        bot, user_id,
         "✅ Operación cancelada.\n"
         "Si ya habías enviado un pago antes de cancelar, lo detectaremos "
         "y se reembolsará automáticamente. Usa /start para comenzar de nuevo."
     )
+
+
+@router.callback_query(F.data == "cancel_op")
+async def cb_cancel(call: CallbackQuery, state: FSMContext):
+    """El usuario cancela la operación en curso."""
+    await _safe_call_answer(call, "Operación cancelada.")
+    await _perform_cancel(call.bot, call.from_user.id, state)
+
+
+# ── Aviso al navegar con una operación riesgosa en curso ───────────────────────
+# Bug real que motivó esto: un admin tenía la TX #18 en 'awaiting_payment'
+# (0.22 USD, pago pendiente) y tocó "👤 Mi cuenta" y después "🛠️ Panel admin"
+# desde el menú persistente — ninguno de esos handlers toca el estado FSM ni
+# la orden en la base, así que la tx quedó 'pending' colgada sin que nadie se
+# enterara ni la cancelara (ver captura). Los puntos de entrada del menú
+# (persistente e inline) llaman a _warn_if_active_order ANTES de hacer lo
+# suyo; si hay una operación con dinero/orden real de por medio, se avisa y
+# se pide confirmar en vez de abandonarla en silencio.
+
+_RISKY_STATES = {
+    PurchaseFlow.awaiting_payment, PurchaseFlow.awaiting_sms,
+    PurchaseFlow.selecting_manual_method, PurchaseFlow.awaiting_manual_review,
+    DepositFlow.awaiting_payment, ManualDepositFlow.awaiting_proof,
+    WithdrawFlow.confirming, CupWithdrawFlow.confirming,
+}
+
+
+def _describe_active_order(current_state, data: dict) -> str:
+    """Descripción legible de la operación activa para el aviso de
+    _warn_if_active_order. Usa datos que ya están en el FSM (ver el
+    diccionario de claves documentado al principio del archivo) — no
+    consulta la base, para que el aviso sea instantáneo."""
+    service = data.get("service_name")
+    country = data.get("country_name")
+    price = data.get("price_usd")
+    order = f"{service} ({country})" if service and country else (service or "")
+    price_txt = format_amount(price, "USD") if price else ""
+
+    if current_state in (
+        PurchaseFlow.awaiting_payment, PurchaseFlow.selecting_manual_method,
+        PurchaseFlow.awaiting_manual_review,
+    ):
+        parts = [p for p in (f"compra de {order}" if order else "una compra", price_txt) if p]
+        return " — ".join(parts) + ", esperando el pago"
+    if current_state == PurchaseFlow.awaiting_sms:
+        base = f"compra de {order}" if order else "una compra"
+        return f"{base} — ya tenés un número asignado, esperando el código SMS"
+    if current_state == DepositFlow.awaiting_payment:
+        return "un depósito esperando el pago"
+    if current_state == ManualDepositFlow.awaiting_proof:
+        return "un depósito por Transfermóvil/EnZona esperando tu comprobante"
+    if current_state == WithdrawFlow.confirming:
+        return "un retiro a punto de confirmarse"
+    if current_state == CupWithdrawFlow.confirming:
+        return "un retiro CUP a punto de confirmarse"
+    return ""
+
+
+async def _warn_if_active_order(state: FSMContext, answer_func, target: str, bot, user_id: int) -> bool:
+    """Guard usado por los puntos de entrada del menú (Comprar número, Mi
+    saldo, Panel admin, etc.). Devuelve True si el llamador debe CORTAR acá
+    (no seguir con la acción original que el usuario pidió); False si es
+    seguro continuar.
+
+    `target` identifica la acción que el usuario intentó (una clave corta,
+    no el texto exacto del botón, así "💰 Mi saldo" del menú persistente y
+    su equivalente inline cuentan como la MISMA acción). Si ya se avisó
+    sobre esta misma acción y el usuario la vuelve a tocar, se toma como
+    confirmación explícita: se cancela la operación de verdad (mismo camino
+    que ❌ Cancelar, ver _perform_cancel) y se deja pasar. Si toca algo
+    DISTINTO, se vuelve a avisar — nunca se asume que cualquier segundo tap
+    confirma cualquier cosa."""
+    current_state = await state.get_state()
+    if current_state not in _RISKY_STATES:
+        return False
+
+    data = await state.get_data()
+    if data.get("nav_warning_target") == target:
+        await _perform_cancel(bot, user_id, state)
+        return False
+
+    label = _describe_active_order(current_state, data)
+    await state.update_data(nav_warning_target=target)
+    await answer_func(
+        "⚠️ Tenés una operación en curso"
+        + (f": <b>{label}</b>" if label else "") + ".\n\n"
+        "Navegar a otra sección no la cancela sola: sigue esperando en "
+        "segundo plano. Tocá <b>❌ Cancelar</b> para cerrarla ahora, o "
+        "volvé a tocar la misma opción que acabás de tocar para confirmar "
+        "que igual querés salir así (se cancelará automáticamente).",
+        parse_mode="HTML", reply_markup=cancel_keyboard(),
+    )
+    return True
 
 
 # ── Catch-all: sesión sin estado válido ───────────────────────────────────────
