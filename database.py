@@ -177,6 +177,12 @@ _DDL_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_manual_dep_user   ON manual_deposits(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_manual_dep_status ON manual_deposits(status)",
+    # sent_amount_cup: lo que el usuario DICE haber transferido (ver
+    # handlers.msg_manual_deposit_sent_amount). Antes solo vivía en el
+    # caption del aviso al admin y se perdía -no había forma de retomar el
+    # descuadre si el admin revisaba la solicitud más tarde (ej. vía
+    # /pendientes) en vez de aprobar al toque desde el aviso original.
+    "ALTER TABLE manual_deposits ADD COLUMN IF NOT EXISTS sent_amount_cup BIGINT",
     """
     CREATE TABLE IF NOT EXISTS outbox (
         id              BIGSERIAL PRIMARY KEY,
@@ -1197,6 +1203,12 @@ class Database:
         if reviewed_by is not None:
             kwargs["reviewed_by"] = reviewed_by
         await self._update_manual_deposit(dep_id, **kwargs)
+
+    async def set_manual_deposit_sent_amount(self, dep_id: int, sent_amount_cup: int):
+        """Guarda el monto CUP que el usuario dice haber transferido (ver
+        handlers.msg_manual_deposit_sent_amount), para poder comparar contra
+        lo pedido incluso si el admin revisa la solicitud más tarde."""
+        await self._update_manual_deposit(dep_id, sent_amount_cup=sent_amount_cup)
 
     async def _update_manual_deposit(self, dep_id: int, **kwargs):
         kwargs["updated_at"] = datetime.utcnow()

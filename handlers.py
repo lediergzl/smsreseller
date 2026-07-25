@@ -41,10 +41,10 @@ from utils import (
     balance_menu_keyboard,
     withdraw_start_keyboard, withdraw_currencies_keyboard, withdraw_confirm_keyboard,
     deposit_currencies_keyboard,
-    manual_payment_methods_keyboard, manual_deposit_review_keyboard, channel_gate_keyboard,
+    manual_payment_methods_keyboard, manual_deposit_review_keyboard, manual_deposit_mismatch_keyboard, channel_gate_keyboard,
     purchase_cup_review_keyboard, refund_request_review_keyboard, channel_invite_keyboard, support_keyboard,
     cup_withdraw_methods_keyboard, cup_withdraw_confirm_keyboard, manual_withdrawal_review_keyboard,
-    cup_withdraw_pending_keyboard,
+    cup_withdraw_pending_keyboard, manual_deposit_pending_keyboard,
     anuncio_confirm_keyboard,
     MSG_WELCOME, MSG_SELECT_SERVICE, MSG_SELECT_COUNTRY, MSG_SELECT_CURRENCY,
     MSG_PAYMENT_INSTRUCTIONS, MSG_WRAPPED_TOKEN_WARNING,
@@ -58,7 +58,7 @@ from utils import (
     MSG_MANUAL_DEPOSIT_SELECT_METHOD, MSG_MANUAL_DEPOSIT_ASK_AMOUNT,
     MSG_MANUAL_DEPOSIT_INSTRUCTIONS, MSG_MANUAL_DEPOSIT_PROOF_RECEIVED,
     MSG_MANUAL_DEPOSIT_APPROVED, MSG_MANUAL_DEPOSIT_REJECTED,
-    MSG_MANUAL_DEPOSIT_ALREADY_PENDING, MSG_MANUAL_DEPOSIT_ASK_SENT_AMOUNT,
+    MSG_MANUAL_DEPOSIT_ALREADY_PENDING, MSG_MANUAL_DEPOSIT_CANCELLED, MSG_MANUAL_DEPOSIT_ASK_SENT_AMOUNT,
     MSG_CHANNEL_GATE,
     MSG_MANUAL_PURCHASE_INSTRUCTIONS,
     MSG_CUP_WITHDRAW_SELECT_METHOD, MSG_CUP_WITHDRAW_ASK_AMOUNT, MSG_CUP_WITHDRAW_ASK_ACCOUNT,
@@ -268,17 +268,32 @@ def _reused_proof_warning(matches: list[dict]) -> str:
     )
 
 
-async def _notify_admin(bot, text: str):
+async def _notify_admin(bot, text: str, reply_markup=None) -> bool:
     """
-    Envía una alerta al canal/grupo de admin (ADMIN_CHAT_ID). No-op si no
-    está configurado, y nunca debe tumbar el flujo del usuario si falla.
+    Envía una alerta al grupo de admin (ADMIN_CHAT_ID). Si falla (bot sin
+    permisos en el grupo, ADMIN_CHAT_ID mal configurado, etc.), reintenta
+    por DM a cada admin en ADMIN_IDS -antes esto fallaba 100% en silencio y
+    la solicitud quedaba invisible para todos (ver el bug de retiro CUP que
+    nunca llegó al grupo). Devuelve True si logró entregarlo por al menos
+    un canal.
     """
-    if not ADMIN_CHAT_ID:
-        return
-    try:
-        await bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML")
-    except Exception as exc:
-        logger.error("No se pudo notificar al canal de admin: %s", exc)
+    delivered = False
+    if ADMIN_CHAT_ID:
+        try:
+            await bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML", reply_markup=reply_markup)
+            delivered = True
+        except Exception as exc:
+            logger.error("No se pudo notificar al canal de admin: %s", exc)
+
+    if not delivered:
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, text, parse_mode="HTML", reply_markup=reply_markup)
+                delivered = True
+            except Exception as exc:
+                logger.error("No se pudo notificar por DM al admin %s: %s", admin_id, exc)
+
+    return delivered
 
 
 def _user_label(user_id: int, username: str = None) -> str:
@@ -1262,13 +1277,10 @@ async def cmd_reembolso(message: Message):
         "bien, denegar -el reclamo es contra el servicio destino, no "
         "contra el número."
     )
-    try:
-        await message.bot.send_message(
-            ADMIN_CHAT_ID, caption, parse_mode="HTML",
-            reply_markup=refund_request_review_keyboard(request_id),
-        )
-    except Exception as exc:
-        logger.error("No se pudo notificar al admin la solicitud de reembolso #%s: %s", request_id, exc)
+    await _notify_admin(
+        message.bot, caption,
+        reply_markup=refund_request_review_keyboard(request_id),
+    )
 
 
 @router.callback_query(F.data.startswith("rfnd_ok:"))
@@ -3892,21 +3904,17 @@ async def cb_cup_withdraw_confirm(call: CallbackQuery, state: FSMContext):
 
     cup_amount_str = f"{data['cup_withdraw_amount_cup']:,}".replace(",", " ")
 
-    try:
-        await call.bot.send_message(
-            ADMIN_CHAT_ID,
-            f"🇨🇺 <b>Nuevo retiro CUP a procesar</b>\n"
-            f"Código: <code>{wd['reference_code']}</code>\n"
-            f"Método: {method_name}\n"
-            f"Cuenta destino: <code>{destination}</code>\n"
-            f"Monto: {format_amount(amount_usd, 'USD')} → "
-            f"{cup_amount_str} CUP\n"
-            f"👤 <code>{user_id}</code>",
-            parse_mode="HTML",
-            reply_markup=manual_withdrawal_review_keyboard(wd["id"]),
-        )
-    except Exception as exc:
-        logger.error("No se pudo notificar al admin el retiro CUP %s: %s", wd["id"], exc)
+    await _notify_admin(
+        call.bot,
+        f"🇨🇺 <b>Nuevo retiro CUP a procesar</b>\n"
+        f"Código: <code>{wd['reference_code']}</code>\n"
+        f"Método: {method_name}\n"
+        f"Cuenta destino: <code>{destination}</code>\n"
+        f"Monto: {format_amount(amount_usd, 'USD')} → "
+        f"{cup_amount_str} CUP\n"
+        f"👤 <code>{user_id}</code>",
+        reply_markup=manual_withdrawal_review_keyboard(wd["id"]),
+    )
 
     await state.clear()
 
@@ -4315,6 +4323,7 @@ async def cb_start_manual_deposit(call: CallbackQuery, state: FSMContext):
                 reference_code=existing["reference_code"]
             ),
             parse_mode="HTML",
+            reply_markup=manual_deposit_pending_keyboard(existing["id"]),
         )
         return
 
@@ -4512,6 +4521,7 @@ async def msg_manual_deposit_sent_amount(message: Message, state: FSMContext):
         await state.clear()
         await message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
         return
+    await db.set_manual_deposit_sent_amount(dep_id, sent_amount_cup)
     reused = await db.find_reused_proof(dep.get("proof_file_unique_id"), exclude_dep_id=dep_id)
 
     await message.answer(
@@ -4569,6 +4579,48 @@ async def cb_admin_approve_manual(call: CallbackQuery):
         await _safe_call_answer(call, f"Ya estaba en estado '{dep['status']}'.", show_alert=True)
         return
 
+    # Si el usuario dijo haber mandado un monto distinto al pedido, no
+    # acreditamos con un solo clic: obligamos a un segundo clic explícito
+    # (mdep_ok_force) para que el admin no apruebe de largada sin fijarse
+    # en la etiqueta de descuadre del caption.
+    sent = dep.get("sent_amount_cup")
+    if sent is not None and dep.get("amount_cup") and sent != dep["amount_cup"]:
+        await _safe_call_answer(
+            call,
+            f"⚠️ El cliente dijo haber mandado {sent} CUP, pero se pidieron "
+            f"{dep['amount_cup']} CUP. Verificá la captura antes de confirmar.",
+            show_alert=True,
+        )
+        try:
+            await call.message.edit_reply_markup(reply_markup=manual_deposit_mismatch_keyboard(dep_id))
+        except Exception:
+            pass
+        return
+
+    await _finalize_manual_deposit_approval(call, dep)
+
+
+@router.callback_query(F.data.startswith("mdep_ok_force:"))
+async def cb_admin_approve_manual_force(call: CallbackQuery):
+    """Segundo clic tras el aviso de descuadre (ver cb_admin_approve_manual)."""
+    if not _is_admin(call.from_user.id):
+        await _safe_call_answer(call, "No autorizado.", show_alert=True)
+        return
+
+    dep_id = int(call.data.split(":", 1)[1])
+    dep = await db.get_manual_deposit_by_id(dep_id)
+    if not dep:
+        await _safe_call_answer(call, "No encontrado.", show_alert=True)
+        return
+    if dep["status"] != "pending_review":
+        await _safe_call_answer(call, f"Ya estaba en estado '{dep['status']}'.", show_alert=True)
+        return
+
+    await _finalize_manual_deposit_approval(call, dep)
+
+
+async def _finalize_manual_deposit_approval(call: CallbackQuery, dep: dict):
+    dep_id = dep["id"]
     new_balance = await db.credit_balance(
         dep["user_id"], dep["amount_usd"], reason=f"Depósito manual aprobado id={dep_id}",
         origin="cup",
@@ -4622,6 +4674,41 @@ async def cb_admin_reject_manual(call: CallbackQuery):
     await _safe_send(
         call.bot, dep["user_id"],
         MSG_MANUAL_DEPOSIT_REJECTED.format(reference_code=dep["reference_code"]),
+    )
+
+
+@router.callback_query(F.data.startswith("user_cancel_dep:"))
+async def cb_user_cancel_manual_deposit(call: CallbackQuery):
+    """
+    El propio usuario cancela su depósito manual pendiente (awaiting_proof
+    o pending_review). No hay saldo que revertir: a diferencia del retiro,
+    el depósito manual no descuenta nada hasta que el admin lo aprueba.
+    """
+    await _safe_call_answer(call)
+    dep_id = int(call.data.split(":", 1)[1])
+    dep = await db.get_manual_deposit_by_id(dep_id)
+    if not dep:
+        await call.message.answer("No encontré esa solicitud.")
+        return
+    if dep["user_id"] != call.from_user.id:
+        await _safe_call_answer(call, "No autorizado.", show_alert=True)
+        return
+    if dep["status"] not in ("awaiting_proof", "pending_review"):
+        await call.message.answer(f"Esa solicitud ya estaba en estado '{dep['status']}'.")
+        return
+
+    await db.set_manual_deposit_status(dep_id, "cancelled", reviewed_by=call.from_user.id)
+
+    await call.message.answer(
+        MSG_MANUAL_DEPOSIT_CANCELLED.format(reference_code=dep["reference_code"]),
+        parse_mode="HTML",
+    )
+
+    await _notify_admin(
+        call.bot,
+        f"🚫 <b>Depósito CUP cancelado por el usuario</b>\n"
+        f"Código: <code>{dep['reference_code']}</code>\n"
+        f"👤 <code>{dep['user_id']}</code>",
     )
 
 

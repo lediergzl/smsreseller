@@ -422,6 +422,20 @@ def manual_deposit_review_keyboard(dep_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def manual_deposit_mismatch_keyboard(dep_id: int) -> InlineKeyboardMarkup:
+    """
+    Se muestra en vez del teclado normal cuando el monto que el usuario dice
+    haber mandado no coincide con lo pedido -obliga a un segundo clic
+    explícito antes de acreditar, en vez de dejar "✅ Aprobar" como un solo
+    clic que acredita el monto pedido sin importar el descuadre.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⚠️ Acreditar monto pedido igual", callback_data=f"mdep_ok_force:{dep_id}")
+    builder.button(text="❌ Rechazar", callback_data=f"mdep_no:{dep_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def purchase_cup_review_keyboard(tx_id: int) -> InlineKeyboardMarkup:
     """
     Igual que manual_deposit_review_keyboard pero para un pago CUP ligado
@@ -588,6 +602,13 @@ def cup_withdraw_pending_keyboard(wd_id: int) -> InlineKeyboardMarkup:
     """Botón para que el propio usuario cancele su retiro CUP pendiente."""
     builder = InlineKeyboardBuilder()
     builder.button(text="❌ Cancelar solicitud", callback_data=f"user_cancel_wd:{wd_id}")
+    return builder.as_markup()
+
+
+def manual_deposit_pending_keyboard(dep_id: int) -> InlineKeyboardMarkup:
+    """Botón para que el propio usuario cancele su depósito manual pendiente."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Cancelar solicitud", callback_data=f"user_cancel_dep:{dep_id}")
     return builder.as_markup()
 
 
@@ -961,8 +982,12 @@ MSG_MANUAL_DEPOSIT_REJECTED = (
 
 MSG_MANUAL_DEPOSIT_ALREADY_PENDING = (
     "⚠️ Ya tienes una solicitud de depósito CUP en curso (código "
-    "<code>{reference_code}</code>). Espera a que se resuelva antes de "
-    "abrir otra."
+    "<code>{reference_code}</code>). Espera a que se resuelva, o cancélala "
+    "abajo si ya no la necesitas."
+)
+
+MSG_MANUAL_DEPOSIT_CANCELLED = (
+    "✅ Solicitud <code>{reference_code}</code> cancelada."
 )
 
 MSG_WITHDRAW_ASK_AMOUNT = (
