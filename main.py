@@ -219,7 +219,14 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
         await _startup_sequence(bot, storage)
 
     async def on_shutdown(bot: Bot):
-        await bot.delete_webhook()
+        # NO borrar el webhook acá: Render hace rolling restart (arranca la
+        # instancia nueva -que ya llama a set_webhook en SU on_startup- ANTES
+        # de apagar esta). Si esta instancia vieja llama a delete_webhook()
+        # al apagarse, borra el webhook que la instancia nueva acaba de
+        # configurar, dejando el bot sin webhook (url="" en getWebhookInfo)
+        # hasta el próximo restart: los updates quedan acumulados como
+        # pending_update_count en vez de llegar, y como nunca llegan no se
+        # genera ningún log.
         await bot.session.close()
         await hero.close_session()
         await ccpay.close_session()
