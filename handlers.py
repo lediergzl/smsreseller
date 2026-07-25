@@ -4450,6 +4450,21 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
         dep_id = data.get("manual_deposit_id")
         if dep_id:
             await db.set_manual_deposit_status(dep_id, "cancelled")
+            # Si llegamos hasta acá con un dep_id ya asignado, es porque el
+            # admin ya recibió el aviso de "Pago CUP iniciado" al arrancar
+            # el depósito (ver msg cerca de create_manual_deposit). Sin este
+            # aviso, el admin se queda esperando indefinidamente un
+            # comprobante que nunca va a llegar.
+            dep = await db.get_manual_deposit_by_id(dep_id)
+            if dep:
+                buyer = await db.get_user(call.from_user.id)
+                await _notify_admin(
+                    call.bot,
+                    f"❌ <b>Pago CUP cancelado por el cliente</b> (depósito de saldo)\n"
+                    f"{_user_label(call.from_user.id, buyer.get('username') if buyer else None)} · "
+                    f"{format_amount(dep['amount_usd'], 'USD')}\n"
+                    f"Código: <code>{dep['reference_code']}</code>",
+                )
         await state.clear()
         await _safe_answer(call.message, "✅ Depósito CUP cancelado.")
         return
@@ -4457,8 +4472,26 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
     if current_state in (PurchaseFlow.selecting_manual_method, PurchaseFlow.awaiting_manual_review):
         # No se acreditó/cobró nada hasta que un admin aprueba el
         # comprobante, así que cancelar acá nunca deja nada a medio tocar.
+        reference_code = data.get("manual_reference_code")
         if tx_id:
             await db.set_status(tx_id, "error")
+            # manual_reference_code solo existe una vez que se generó la
+            # orden de pago CUP (ver _start_manual_purchase_payment), que es
+            # justo el punto en el que ya se avisó al admin con "Pago CUP
+            # iniciado". Sin este aviso de cancelación, ese mensaje se queda
+            # colgado en el canal del admin como si siguiera pendiente
+            # (esperando un comprobante que ya no va a llegar).
+            if reference_code:
+                tx = await db.get_by_id(tx_id)
+                if tx:
+                    buyer = await db.get_user(tx["user_id"])
+                    await _notify_admin(
+                        call.bot,
+                        f"❌ <b>Pago CUP cancelado por el cliente</b> (compra)\n"
+                        f"{_user_label(tx['user_id'], buyer.get('username') if buyer else None)}\n"
+                        f"Código: <code>{reference_code}</code>\n"
+                        f"{_tx_summary_line(tx)}",
+                    )
         await state.clear()
         await _safe_answer(call.message, "✅ Compra cancelada. No se generó ningún cargo.")
         return
