@@ -35,7 +35,7 @@ from utils import (
     usd_to_cup, effective_cup_rate, effective_cup_rate_payout,
     generate_payment_qr,
     is_wrapped_token,
-    services_keyboard, countries_keyboard, currencies_keyboard,
+    services_keyboard, countries_keyboard, currencies_keyboard, currency_networks_keyboard,
     cancel_keyboard, main_persistent_keyboard, admin_menu_keyboard, search_results_keyboard,
     top_services_keyboard,
     balance_menu_keyboard,
@@ -2150,6 +2150,43 @@ async def cb_pay_balance(call: CallbackQuery, state: FSMContext):
     await _handle_after_payment(call.bot, call.message.chat.id, state, tx_id)
 
 
+# ── Moneda con varias redes → submenú de redes ─────────────────────────────────
+# (ver utils._add_grouped_currency_buttons / currency_networks_keyboard: el
+# menú principal agrupa por moneda, y solo al tocar una con >1 red se listan
+# sus redes individuales acá, en vez de mostrar cada combinación de entrada.)
+
+@router.callback_query(PurchaseFlow.selecting_currency, F.data.startswith("curg:"))
+async def cb_select_currency_group(call: CallbackQuery, state: FSMContext):
+    await _safe_call_answer(call)
+    currency = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    options = data.get("currency_options", [])
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=currency_networks_keyboard(options, currency, prefix="cur")
+        )
+    except Exception as exc:
+        logger.debug("No se pudo mostrar submenú de redes de %s: %s", currency, exc)
+
+
+@router.callback_query(PurchaseFlow.selecting_currency, F.data == "curg_back")
+async def cb_select_currency_group_back(call: CallbackQuery, state: FSMContext):
+    await _safe_call_answer(call)
+    data = await state.get_data()
+    options   = data.get("currency_options", [])
+    price_usd = data.get("price_usd", 0.0)
+    balance_usd = await db.get_balance(call.from_user.id)
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=currencies_keyboard(
+                options, balance_usd=balance_usd, price_usd=price_usd,
+                manual_cup_available=bool(await db.get_payment_methods()),
+            )
+        )
+    except Exception as exc:
+        logger.debug("No se pudo volver al menú de monedas: %s", exc)
+
+
 # ── Selección de moneda → crear orden de pago ─────────────────────────────────
 
 @router.callback_query(PurchaseFlow.selecting_currency, F.data.startswith("cur:"))
@@ -3272,6 +3309,31 @@ async def msg_withdraw_amount(message: Message, state: FSMContext):
     )
 
 
+@router.callback_query(WithdrawFlow.selecting_currency, F.data.startswith("wcurg:"))
+async def cb_withdraw_select_currency_group(call: CallbackQuery, state: FSMContext):
+    await _safe_call_answer(call)
+    currency = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    options = data.get("withdraw_options", [])
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=currency_networks_keyboard(options, currency, prefix="wcur")
+        )
+    except Exception as exc:
+        logger.debug("No se pudo mostrar submenú de redes de %s: %s", currency, exc)
+
+
+@router.callback_query(WithdrawFlow.selecting_currency, F.data == "wcurg_back")
+async def cb_withdraw_select_currency_group_back(call: CallbackQuery, state: FSMContext):
+    await _safe_call_answer(call)
+    data = await state.get_data()
+    options = data.get("withdraw_options", [])
+    try:
+        await call.message.edit_reply_markup(reply_markup=withdraw_currencies_keyboard(options))
+    except Exception as exc:
+        logger.debug("No se pudo volver al menú de monedas: %s", exc)
+
+
 @router.callback_query(WithdrawFlow.selecting_currency, F.data.startswith("wcur:"))
 async def cb_withdraw_select_currency(call: CallbackQuery, state: FSMContext):
     await _safe_call_answer(call)
@@ -3876,6 +3938,31 @@ async def msg_deposit_amount(message: Message, state: FSMContext):
         parse_mode="HTML",
         reply_markup=deposit_currencies_keyboard(options),
     )
+
+
+@router.callback_query(DepositFlow.selecting_currency, F.data.startswith("dcurg:"))
+async def cb_select_deposit_currency_group(call: CallbackQuery, state: FSMContext):
+    await _safe_call_answer(call)
+    currency = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    options = data.get("deposit_options", [])
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=currency_networks_keyboard(options, currency, prefix="dcur")
+        )
+    except Exception as exc:
+        logger.debug("No se pudo mostrar submenú de redes de %s: %s", currency, exc)
+
+
+@router.callback_query(DepositFlow.selecting_currency, F.data == "dcurg_back")
+async def cb_select_deposit_currency_group_back(call: CallbackQuery, state: FSMContext):
+    await _safe_call_answer(call)
+    data = await state.get_data()
+    options = data.get("deposit_options", [])
+    try:
+        await call.message.edit_reply_markup(reply_markup=deposit_currencies_keyboard(options))
+    except Exception as exc:
+        logger.debug("No se pudo volver al menú de monedas: %s", exc)
 
 
 @router.callback_query(DepositFlow.selecting_currency, F.data.startswith("dcur:"))

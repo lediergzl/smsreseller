@@ -272,7 +272,78 @@ def countries_keyboard(countries: list[dict], markup: float, success_stats: dict
 
         label = f"🌍 {name} — {format_amount(price_usd, 'USD')}{suffix}"
         builder.button(text=label, callback_data=f"cnt:{code}:{cost_usd}")
-    builder.adjust(1)  # 1 país por fila para legibilidad
+    # 2 países por fila (estilo "tabla"): reduce a la mitad el alto del
+    # teclado sin perder legibilidad, ya que cada botón sigue siendo una
+    # sola línea corta (nombre + precio + badge).
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def _group_currency_options(options: list[dict]) -> dict[str, list[tuple[int, dict]]]:
+    """
+    Agrupa `options` (lista plana de {"currency", "network", ...}, ver
+    ccpay_api.get_supported_currencies) por moneda, preservando el índice
+    ORIGINAL de cada opción (el que usan los callback_data "cur:i"/"dcur:i"/
+    "wcur:i" para crear la orden) y el orden relativo ya decidido por el
+    llamador (redes de comisión baja / depositado-antes primero).
+
+    Devuelve un dict ordenado {"USDT": [(3, {...}), (7, {...})], "BTC": [...]}.
+    """
+    grouped: dict[str, list[tuple[int, dict]]] = {}
+    for i, opt in enumerate(options):
+        grouped.setdefault(opt["currency"], []).append((i, opt))
+    return grouped
+
+
+def _currency_option_label(opt: dict) -> str:
+    amount_str = format_amount(opt["amount"], opt["currency"])
+    fee_tag = " · 💚 comisión baja" if opt.get("low_fee") else ""
+    dep_tag = " · 🔁 la que depositaste" if opt.get("deposited_in") else ""
+    return f"💰 {opt['label']} — {amount_str}{fee_tag}{dep_tag}"
+
+
+def _add_grouped_currency_buttons(builder: InlineKeyboardBuilder, options: list[dict], prefix: str):
+    """
+    Agrega un botón por MONEDA (no por moneda+red) al `builder`: si una
+    moneda solo tiene una red disponible, el botón ya lleva directo a
+    crear la orden (callback_data "{prefix}:i", igual que antes). Si tiene
+    varias redes (ej. USDT en BSC/OPTIMISM/BASE), el botón muestra solo el
+    nombre de la moneda y abre el submenú de redes al tocarlo
+    (callback_data "{prefix}g:MONEDA"), en vez de listar cada red como una
+    fila aparte — esto es lo que evita la lista larga y repetitiva
+    (USDC (BASE), USDC (BSC), ETH (BASE), ETH (BSC), ...) que confundía al
+    usuario al elegir método de pago.
+    """
+    for currency, entries in _group_currency_options(options).items():
+        if len(entries) == 1:
+            i, opt = entries[0]
+            builder.button(text=_currency_option_label(opt), callback_data=f"{prefix}:{i}")
+        else:
+            best_low_fee = any(opt.get("low_fee") for _, opt in entries)
+            fee_tag = " · 💚 comisión baja disponible" if best_low_fee else ""
+            label = f"💰 {currency} — {len(entries)} redes disponibles{fee_tag}"
+            builder.button(text=label, callback_data=f"{prefix}g:{currency}")
+
+
+def currency_networks_keyboard(options: list[dict], currency: str, prefix: str) -> InlineKeyboardMarkup:
+    """
+    Submenú que aparece al tocar una moneda con más de una red (ver
+    _add_grouped_currency_buttons): un botón por red, con el mismo
+    callback_data "{prefix}:i" final que usaba currencies_keyboard antes de
+    agrupar (así el handler que crea la orden de pago no cambia). Incluye
+    un botón "Volver" ("{prefix}g_back") para regresar al menú de monedas.
+    """
+    builder = InlineKeyboardBuilder()
+    for i, opt in enumerate(options):
+        if opt["currency"] != currency:
+            continue
+        amount_str = format_amount(opt["amount"], opt["currency"])
+        fee_tag = " · 💚 comisión baja" if opt.get("low_fee") else ""
+        dep_tag = " · 🔁 la que depositaste" if opt.get("deposited_in") else ""
+        label = f"🌐 {opt['network']} — {amount_str}{fee_tag}{dep_tag}"
+        builder.button(text=label, callback_data=f"{prefix}:{i}")
+    builder.button(text="⬅️ Volver", callback_data=f"{prefix}g_back")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -306,11 +377,7 @@ def currencies_keyboard(
         )
     if manual_cup_available:
         builder.button(text="🇨🇺 Pagar con CUP", callback_data="pay_cup")
-    for i, opt in enumerate(options):
-        amount_str = format_amount(opt["amount"], opt["currency"])
-        fee_tag = " · 💚 comisión baja" if opt.get("low_fee") else ""
-        label = f"💰 {opt['label']} — {amount_str}{fee_tag}"
-        builder.button(text=label, callback_data=f"cur:{i}")
+    _add_grouped_currency_buttons(builder, options, prefix="cur")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -436,11 +503,7 @@ def deposit_currencies_keyboard(options: list[dict]) -> InlineKeyboardMarkup:
     compra o de un retiro.
     """
     builder = InlineKeyboardBuilder()
-    for i, opt in enumerate(options):
-        amount_str = format_amount(opt["amount"], opt["currency"])
-        fee_tag = " · 💚 comisión baja" if opt.get("low_fee") else ""
-        label = f"💰 {opt['label']} — {amount_str}{fee_tag}"
-        builder.button(text=label, callback_data=f"dcur:{i}")
+    _add_grouped_currency_buttons(builder, options, prefix="dcur")
     builder.button(text="❌ Cancelar", callback_data="cancel_op")
     builder.adjust(1)
     return builder.as_markup()
@@ -455,15 +518,10 @@ def withdraw_currencies_keyboard(options: list[dict]) -> InlineKeyboardMarkup:
     FSM state simplemente no matchearía, pero usar prefijo distinto es más
     claro de leer).
     """
+    # "deposited_in" es una pista (viene de db.get_last_completed_deposit),
+    # no una garantía de liquidez real — ver docstring en database.py.
     builder = InlineKeyboardBuilder()
-    for i, opt in enumerate(options):
-        amount_str = format_amount(opt["amount"], opt["currency"])
-        fee_tag = " · 💚 comisión baja" if opt.get("low_fee") else ""
-        # "deposited_in" es una pista (viene de db.get_last_completed_deposit),
-        # no una garantía de liquidez real — ver docstring en database.py.
-        dep_tag = " · 🔁 la que depositaste" if opt.get("deposited_in") else ""
-        label = f"💰 {opt['label']} — {amount_str}{fee_tag}{dep_tag}"
-        builder.button(text=label, callback_data=f"wcur:{i}")
+    _add_grouped_currency_buttons(builder, options, prefix="wcur")
     builder.button(text="❌ Cancelar", callback_data="cancel_op")
     builder.adjust(1)
     return builder.as_markup()
