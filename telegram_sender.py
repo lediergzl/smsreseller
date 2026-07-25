@@ -131,7 +131,15 @@ async def send_welcome_card(bot: Bot, message: Message, caption: str,
             _build_user_stats(user.id, user.username, user.first_name, None),
         )
         stats.profile_photo_path = photo_path
-        card_path = generate_welcome_card(stats, out_dir=CARDS_DIR)
+        # generate_welcome_card es síncrona y pesada en CPU (Pillow: abrir/
+        # redimensionar imágenes, GaussianBlur, dibujar texto con varias
+        # fuentes). Llamarla directo bloquearía el único event loop del bot
+        # -congelando TODOS los chats, no solo este /start- durante todo el
+        # tiempo que tarde en generarse la tarjeta (mismo motivo por el que
+        # database.py migró de psycopg2 a asyncpg). asyncio.to_thread la
+        # corre en un thread aparte para que el loop siga libre mientras
+        # tanto.
+        card_path = await asyncio.to_thread(generate_welcome_card, stats, CARDS_DIR)
 
         await message.answer_photo(
             FSInputFile(card_path),
