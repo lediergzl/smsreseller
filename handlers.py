@@ -5223,6 +5223,15 @@ async def cb_fallback_expired_session(call: CallbackQuery, state: FSMContext):
 
 @router.message()
 async def msg_fallback_expired_session(message: Message, state: FSMContext):
+    # Sin esto, este catch-all responde a TODO lo que llegue como Message
+    # -incluye mensajes normales de otros usuarios en el grupo/canal, y
+    # también mensajes de servicio (ej. "Fulano agregó a OTPVIRTUAL"), ya
+    # que Telegram los manda como Message con content_type especial, no
+    # solo como my_chat_member update. El FSM de compra/retiro solo existe
+    # en el chat privado con el bot, así que en cualquier otro chat no hay
+    # "sesión" de la que hablar: mejor no contestar nada.
+    if message.chat.type != "private":
+        return
     await state.clear()
     await _safe_answer(
         message,
