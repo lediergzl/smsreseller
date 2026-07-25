@@ -733,6 +733,46 @@ async def _post_channel_referral_bonus(bot, released: dict):
     )
 
 
+async def _post_channel_withdrawal_crypto(
+    bot, user: dict | None, amount_usd: float, currency: str, network: str, txid: str | None,
+) -> None:
+    """
+    Publica en el canal de comunidad que se procesó un retiro cripto -da
+    fiabilidad (prueba pública de que los retiros se pagan de verdad).
+    Mismo criterio de privacidad que los avisos de referidos: se identifica
+    al usuario por @username si lo tiene configurado, o genérico si no.
+
+    Si CCPayment devolvió un hash/ID de transacción (ver desempaquetado de
+    ccpay.refund_user en cb_withdraw_confirm), se incluye como comprobante;
+    si no, se publica igual solo con el monto y la moneda/red.
+    """
+    if not COMMUNITY_CHANNEL_CHAT_ID:
+        return
+    who = f"@{user['username']}" if user and user.get("username") else "Un usuario"
+    texto = f"✅ {who} retiró {format_amount(amount_usd, 'USD')} en {currency} ({network})."
+    if txid:
+        texto += f"\n🔗 Comprobante (hash): <code>{txid}</code>"
+    await _safe_send(bot, COMMUNITY_CHANNEL_CHAT_ID, texto, parse_mode="HTML")
+
+
+async def _post_channel_withdrawal_cup(bot, user: dict | None, amount_usd: float, method_label: str) -> None:
+    """
+    Contraparte de _post_channel_withdrawal_crypto para el retiro CUP
+    (Transfermóvil/EnZona). Acá no hay hash de transacción posible -el
+    admin transfiere a mano- así que el "comprobante" es solo texto: monto
+    y método. Se publica cuando el admin APRUEBA (mwd_ok), no cuando el
+    usuario solo lo solicita, para no anunciar algo que todavía puede
+    rechazarse.
+    """
+    if not COMMUNITY_CHANNEL_CHAT_ID:
+        return
+    who = f"@{user['username']}" if user and user.get("username") else "Un usuario"
+    await _safe_send(
+        bot, COMMUNITY_CHANNEL_CHAT_ID,
+        f"✅ {who} retiró {format_amount(amount_usd, 'USD')} vía {method_label}.",
+    )
+
+
 async def _credit_refund_for_tx(user_id: int, tx: dict, amount_usd: float, tx_id: int, reason: str) -> float:
     """
     Acredita un reembolso ligado a `tx` respetando su origen (cripto/CUP/
@@ -3623,12 +3663,25 @@ async def cb_withdraw_confirm(call: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    sent, err_code = await ccpay.refund_user(
+    # Desempaquetado defensivo: si ccpay_api.refund_user ya devuelve un
+    # tercer valor (hash/ID de transacción, para publicarlo como
+    # comprobante -ver _post_channel_withdrawal_crypto), lo tomamos; si
+    # todavía devuelve solo (sent, err_code) como antes, seguimos andando
+    # igual, simplemente sin comprobante público. Si tu ccpay_api.py NO
+    # devuelve un tercer valor todavía, conviene agregarlo (ej. el
+    # `orderId`/`txid` que venga en la respuesta de CCPayment) para que el
+    # aviso del canal incluya el hash real.
+    withdraw_result = await ccpay.refund_user(
         to_address = address,
         amount     = data["withdraw_crypto_amount"],
         token_id   = data["withdraw_token_id"],
         memo       = f"Retiro de saldo - user {user_id}",
     )
+    if isinstance(withdraw_result, tuple) and len(withdraw_result) >= 3:
+        sent, err_code, txid = withdraw_result[0], withdraw_result[1], withdraw_result[2]
+    else:
+        sent, err_code = withdraw_result
+        txid = None
 
     if not sent:
         # Revertir siempre primero: pase lo que pase después, el usuario no
@@ -3716,6 +3769,10 @@ async def cb_withdraw_confirm(call: CallbackQuery, state: FSMContext):
         f"{format_amount(amount_usd, 'USD')} → {currency} ({network})\n"
         f"Dirección: <code>{address}</code>",
     )
+
+    user = await db.get_user(user_id)
+    await _post_channel_withdrawal_crypto(call.bot, user, amount_usd, currency, network, txid)
+
     await state.clear()
 
 
@@ -4015,6 +4072,14 @@ async def cb_admin_approve_cup_withdrawal(call: CallbackQuery):
             amount_cup     = f"{wd['amount_cup']:,}".replace(",", " "),
         ),
     )
+
+    # method_name/method no viene garantizado en el dict de todas las
+    # versiones de get_manual_withdrawal_by_id -si tu database.py usa otro
+    # nombre de columna, ajustá este .get() para que apunte al campo real
+    # (Transfermóvil/EnZona).
+    method_label = wd.get("method_name") or wd.get("method") or "un método CUP"
+    user = await db.get_user(wd["user_id"])
+    await _post_channel_withdrawal_cup(call.bot, user, wd["amount_usd"], method_label)
 
 
 @router.callback_query(F.data.startswith("mwd_no:"))
