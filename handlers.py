@@ -44,6 +44,7 @@ from utils import (
     manual_payment_methods_keyboard, manual_deposit_review_keyboard, channel_gate_keyboard,
     purchase_cup_review_keyboard, refund_request_review_keyboard, channel_invite_keyboard, support_keyboard,
     cup_withdraw_methods_keyboard, cup_withdraw_confirm_keyboard, manual_withdrawal_review_keyboard,
+    cup_withdraw_pending_keyboard,
     anuncio_confirm_keyboard,
     MSG_WELCOME, MSG_SELECT_SERVICE, MSG_SELECT_COUNTRY, MSG_SELECT_CURRENCY,
     MSG_PAYMENT_INSTRUCTIONS, MSG_WRAPPED_TOKEN_WARNING,
@@ -62,7 +63,7 @@ from utils import (
     MSG_MANUAL_PURCHASE_INSTRUCTIONS,
     MSG_CUP_WITHDRAW_SELECT_METHOD, MSG_CUP_WITHDRAW_ASK_AMOUNT, MSG_CUP_WITHDRAW_ASK_ACCOUNT,
     MSG_CUP_WITHDRAW_CONFIRM, MSG_CUP_WITHDRAW_SUBMITTED, MSG_CUP_WITHDRAW_APPROVED,
-    MSG_CUP_WITHDRAW_REJECTED, MSG_CUP_WITHDRAW_ALREADY_PENDING,
+    MSG_CUP_WITHDRAW_REJECTED, MSG_CUP_WITHDRAW_ALREADY_PENDING, MSG_CUP_WITHDRAW_CANCELLED,
     MSG_REFERRAL_INFO, MSG_REFERRAL_NEW_SIGNUP, MSG_REFERRAL_BONUS_EARNED,
     MSG_REFUND_REQUEST_RECEIVED, MSG_REFUND_ALREADY_OPEN, MSG_REFUND_NOT_ELIGIBLE,
     MSG_REFUND_APPROVED, MSG_REFUND_DENIED,
@@ -3656,6 +3657,7 @@ async def cb_start_cup_withdraw(call: CallbackQuery, state: FSMContext):
         await call.message.answer(
             MSG_CUP_WITHDRAW_ALREADY_PENDING.format(reference_code=existing["reference_code"]),
             parse_mode="HTML",
+            reply_markup=cup_withdraw_pending_keyboard(existing["id"]),
         )
         return
 
@@ -3971,6 +3973,51 @@ async def cb_admin_reject_cup_withdrawal(call: CallbackQuery):
             reference_code = wd["reference_code"],
             amount_usd     = format_amount(wd["amount_usd"], "USD"),
         ),
+    )
+
+
+@router.callback_query(F.data.startswith("user_cancel_wd:"))
+async def cb_user_cancel_cup_withdrawal(call: CallbackQuery):
+    """
+    El propio usuario cancela su retiro CUP pendiente (antes solo el admin
+    podía resolverla vía mwd_ok/mwd_no). Necesario porque el aviso a
+    ADMIN_CHAT_ID puede no llegar (ver _notify_admin, falla en silencio) y
+    el usuario quedaba sin forma de destrabar su solicitud.
+    """
+    await _safe_call_answer(call)
+    wd_id = int(call.data.split(":", 1)[1])
+    wd = await db.get_manual_withdrawal_by_id(wd_id)
+    if not wd:
+        await call.message.answer("No encontré esa solicitud.")
+        return
+    if wd["user_id"] != call.from_user.id:
+        await _safe_call_answer(call, "No autorizado.", show_alert=True)
+        return
+    if wd["status"] != "pending_review":
+        await call.message.answer(f"Esa solicitud ya estaba en estado '{wd['status']}'.")
+        return
+
+    # Mismo criterio que el rechazo del admin: revertir el saldo CUP antes
+    # que nada, el usuario no debe perder saldo por cancelar.
+    await db.credit_balance(
+        wd["user_id"], wd["amount_usd"], reason=f"Reversión retiro CUP cancelado por usuario wd={wd_id}",
+        origin="cup",
+    )
+    await db.set_manual_withdrawal_status(wd_id, "cancelled", reviewed_by=call.from_user.id)
+
+    await call.message.answer(
+        MSG_CUP_WITHDRAW_CANCELLED.format(
+            reference_code = wd["reference_code"],
+            amount_usd     = format_amount(wd["amount_usd"], "USD"),
+        ),
+        parse_mode="HTML",
+    )
+
+    await _notify_admin(
+        call.bot,
+        f"🚫 <b>Retiro CUP cancelado por el usuario</b>\n"
+        f"Código: <code>{wd['reference_code']}</code>\n"
+        f"👤 <code>{wd['user_id']}</code>",
     )
 
 
@@ -4535,6 +4582,7 @@ async def cb_admin_approve_manual(call: CallbackQuery):
         call.bot, dep["user_id"],
         MSG_MANUAL_DEPOSIT_APPROVED.format(
             amount_usd  = format_amount(dep["amount_usd"], "USD"),
+            amount_cup  = f"{dep['amount_cup']:,}".replace(",", " "),
             new_balance = format_amount(new_balance, "USD"),
         ),
     )

@@ -584,6 +584,13 @@ def manual_withdrawal_review_keyboard(wd_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def cup_withdraw_pending_keyboard(wd_id: int) -> InlineKeyboardMarkup:
+    """Botón para que el propio usuario cancele su retiro CUP pendiente."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Cancelar solicitud", callback_data=f"user_cancel_wd:{wd_id}")
+    return builder.as_markup()
+
+
 def cancel_keyboard() -> InlineKeyboardMarkup:
     """Botón para cancelar la operación en curso."""
     builder = InlineKeyboardBuilder()
@@ -941,7 +948,7 @@ MSG_MANUAL_DEPOSIT_PROOF_RECEIVED = (
 
 MSG_MANUAL_DEPOSIT_APPROVED = (
     "✅ <b>¡Depósito aprobado!</b>\n"
-    "Se acreditaron {amount_usd} a tu saldo interno.\n"
+    "Se acreditaron {amount_usd} ({amount_cup} CUP) a tu saldo interno.\n"
     "Nuevo saldo: {new_balance}\n\n"
     "Puedes usarlo en tu próxima compra con /start, o consultar /saldo."
 )
@@ -1063,8 +1070,13 @@ MSG_CUP_WITHDRAW_REJECTED = (
 
 MSG_CUP_WITHDRAW_ALREADY_PENDING = (
     "⚠️ Ya tienes una solicitud de retiro CUP en curso (código "
-    "<code>{reference_code}</code>). Espera a que se resuelva antes de "
-    "abrir otra."
+    "<code>{reference_code}</code>). Espera a que se resuelva, o cancélala "
+    "abajo si ya no la necesitas."
+)
+
+MSG_CUP_WITHDRAW_CANCELLED = (
+    "✅ Solicitud <code>{reference_code}</code> cancelada.\n"
+    "Se devolvieron {amount_usd} a tu saldo interno."
 )
 
 MSG_ERROR_GENERIC = (
