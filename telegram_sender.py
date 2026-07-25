@@ -12,6 +12,7 @@ Nunca lanza hacia arriba: si algo falla generando/enviando la tarjeta
 (Pillow, fuente faltante, foto corrupta, etc.), se loguea y el llamador
 puede seguir con un mensaje de texto de respaldo (ver handlers.cmd_start).
 """
+import asyncio
 import logging
 import os
 import tempfile
@@ -78,9 +79,16 @@ async def _build_user_stats(user_id: int, username: str | None, first_name: str 
     quedan en None hasta que un admin los asigna con /set_tipo o /set_pais
     (ver handlers.py) — mientras tanto la tarjeta simplemente no muestra
     esas filas (ver welcome_card.generate_welcome_card)."""
-    breakdown = await db.get_balance_breakdown(user_id)
-    orders_count = await db.count_completed_orders(user_id)
-    user_row = await db.get_user(user_id)
+    # Las 3 consultas son independientes entre sí (no una depende del
+    # resultado de otra), así que se piden en paralelo en vez de una tras
+    # otra -> 1 round-trip "de ancho" a Neon en vez de 3 seguidos. Antes
+    # esto tardaba la SUMA de las 3 latencias; ahora tarda lo que tarde la
+    # más lenta de las tres.
+    breakdown, orders_count, user_row = await asyncio.gather(
+        db.get_balance_breakdown(user_id),
+        db.count_completed_orders(user_id),
+        db.get_user(user_id),
+    )
     joined_at = _format_joined_at(user_row.get("first_seen")) if user_row else None
 
     return UserStats(
@@ -112,8 +120,17 @@ async def send_welcome_card(bot: Bot, message: Message, caption: str,
     photo_path = None
     card_path = None
     try:
-        photo_path = await _download_profile_photo(bot, user.id)
-        stats = await _build_user_stats(user.id, user.username, user.first_name, photo_path)
+        # _download_profile_photo (llamadas a la API de Telegram) y
+        # _build_user_stats (lecturas a la base) no dependen una de la
+        # otra -> se piden en paralelo. _build_user_stats recibe
+        # photo_path=None acá porque en ese momento todavía no se resolvió;
+        # se lo pega después al UserStats ya armado (más abajo), una vez
+        # que ambas terminaron.
+        photo_path, stats = await asyncio.gather(
+            _download_profile_photo(bot, user.id),
+            _build_user_stats(user.id, user.username, user.first_name, None),
+        )
+        stats.profile_photo_path = photo_path
         card_path = generate_welcome_card(stats, out_dir=CARDS_DIR)
 
         await message.answer_photo(

@@ -180,12 +180,31 @@ def _unpack_token_id(token_id: str) -> tuple[int, str]:
 
 # ── Monedas soportadas ───────────────────────────────────────────────────────
 
+# Caché en memoria del catálogo de /getCoinList (mismo patrón que
+# herosms_api._services_cache/_countries_cache): QUÉ monedas/redes están
+# habilitadas para el merchant cambia rara vez (el admin no agrega una
+# moneda nueva todos los días), a diferencia del PRECIO de cada una, que sí
+# hace falta pedir fresco siempre (ver get_estimated_amounts_batch, sin
+# caché a propósito). Antes de esto, cada vez que un usuario elegía país en
+# una compra, o arrancaba un depósito/retiro, el bot pagaba un round-trip
+# completo a CCPayment (/getCoinList) SOLO para volver a armar la misma
+# lista de monedas que ya había pedido minutos antes — con Neon/CCPayment
+# ambos por fuera de la red de Render, esa latencia se sumaba directo al
+# tiempo que el usuario esperaba viendo "Consultando monedas disponibles...".
+_CATALOG_CACHE_TTL = 1800  # 30 min: catálogo de monedas cambia poco
+_catalog_cache: dict = {"data": [], "ts": 0.0, "key": None}
+
+
 async def get_supported_currencies(
     max_coins: int = 12, max_networks_per_coin: int = 2,
 ) -> list[dict]:
     """
     Consulta /getCoinList: catálogo de monedas/redes habilitadas para el
     merchant, con su coinId + chain (reemplaza al token_id UUID de v1).
+    Cacheado en memoria por `_CATALOG_CACHE_TTL` segundos (ver
+    _catalog_cache) — distintos (max_coins, max_networks_per_coin) invalidan
+    la caché entre sí, aunque en la práctica el bot siempre llama con los
+    mismos valores default.
 
     Devuelve una lista de dicts:
         {"currency": "USDT", "network": "TRC20", "label": "...",
@@ -204,11 +223,20 @@ async def get_supported_currencies(
     de comisión baja, se toman las primeras que haya. Menos redes por
     moneda, pero las más relevantes/baratas para el usuario.
     """
+    cache_key = (max_coins, max_networks_per_coin)
+    now = time.time()
+    if (
+        _catalog_cache["key"] == cache_key
+        and _catalog_cache["data"]
+        and (now - _catalog_cache["ts"] < _CATALOG_CACHE_TTL)
+    ):
+        return _catalog_cache["data"]
+
     try:
         resp = await _post("/getCoinList")
         if resp.get("code") != 10000:
             logger.error("get_supported_currencies error: %s", resp)
-            return []
+            return _catalog_cache["data"] if _catalog_cache["key"] == cache_key else []
 
         coins = (resp.get("data") or {}).get("coins", [])
         result = []
@@ -238,10 +266,31 @@ async def get_supported_currencies(
             # las primeras `max_networks_per_coin` de esta moneda.
             coin_options.sort(key=lambda o: not o["low_fee"])
             result.extend(coin_options[:max_networks_per_coin])
+
+        if result:
+            _catalog_cache["data"] = result
+            _catalog_cache["ts"] = now
+            _catalog_cache["key"] = cache_key
         return result
     except Exception as exc:
         logger.error("get_supported_currencies exception: %s: %s", type(exc).__name__, exc)
-        return []
+        # Si había caché (aunque esté vencida) es mejor devolverla que dejar
+        # al usuario sin ninguna moneda para elegir por un timeout puntual.
+        return _catalog_cache["data"] if _catalog_cache["key"] == cache_key else []
+
+
+async def warm_catalog_cache():
+    """
+    Precarga el catálogo de monedas al arrancar el bot (mismo motivo que
+    herosms_api.warm_cache): así el primer usuario que elige país/moneda no
+    paga el costo de la primera llamada fría a /getCoinList. Se llama como
+    tarea en background desde main.py, sin bloquear el arranque.
+    """
+    try:
+        await get_supported_currencies()
+        logger.info("warm_catalog_cache: catálogo de monedas de CCPayment precargado.")
+    except Exception as exc:
+        logger.warning("warm_catalog_cache: fallo precargando catálogo: %s", exc)
 
 
 async def get_estimated_amount(amount_usd: float, token_id: str) -> Optional[float]:

@@ -338,8 +338,29 @@ class _PooledConnection:
     # handler ya loguea/reporta normalmente.
     ACQUIRE_TIMEOUT = 10
 
-    def __init__(self, pool: asyncpg.Pool):
+    def __init__(self, pool: asyncpg.Pool, transactional: bool = False):
+        """
+        `transactional`: si es True, envuelve todo el bloque `async with` en
+        un BEGIN/COMMIT explícito (para que varios statements se apliquen
+        todos-o-ninguno, ej. descontar saldo + insertar en el ledger). Si es
+        False (default), NO se abre transacción: cada statement se ejecuta
+        con el autocommit implícito de Postgres.
+
+        Por qué el default cambió de "siempre transaccional" a esto: un
+        BEGIN + COMMIT explícitos son 2 round-trips de red extra a Neon por
+        cada `async with self._conn()`, aunque adentro haya un solo SELECT o
+        UPDATE — que es el caso de la gran mayoría de los métodos de esta
+        clase (~57 de 65). Con la latencia real hacia Neon (más aún si el
+        compute estaba "dormido", ver backup_task.py) eso significaba pagar
+        ~2 viajes de red de más en CADA consulta simple, para una garantía
+        de atomicidad que un solo statement ya tiene sin necesidad de
+        envolverlo en nada. Los pocos métodos que sí ejecutan varios
+        statements relacionados con dinero (credit_balance, debit_balance,
+        release_pending_referrals, etc.) piden `transactional=True`
+        explícitamente — ver Database._conn(transactional=True).
+        """
         self._pool = pool
+        self._transactional = transactional
         self._conn: Optional[asyncpg.Connection] = None
         self._tx = None
 
@@ -353,16 +374,18 @@ class _PooledConnection:
                 f"No se pudo obtener una conexión del pool en {self.ACQUIRE_TIMEOUT}s "
                 "(probablemente el pool está saturado con queries colgadas)."
             )
-        self._tx = self._conn.transaction()
-        await self._tx.start()
+        if self._transactional:
+            self._tx = self._conn.transaction()
+            await self._tx.start()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
         try:
-            if exc_type is None:
-                await self._tx.commit()
-            else:
-                await self._tx.rollback()
+            if self._tx is not None:
+                if exc_type is None:
+                    await self._tx.commit()
+                else:
+                    await self._tx.rollback()
         finally:
             await self._pool.release(self._conn)
         return False
@@ -432,13 +455,21 @@ class Database:
             await self._pool.close()
             self._pool = None
 
-    def _conn(self) -> _PooledConnection:
+    def _conn(self, transactional: bool = False) -> _PooledConnection:
+        """
+        `transactional=True` solo cuando el bloque `async with` de abajo va
+        a ejecutar VARIOS statements que tienen que aplicarse todos-o-nada
+        (ej. actualizar `balances` + insertar en `balance_ledger`). Para un
+        único SELECT/UPDATE/INSERT, dejar el default (False): ver el
+        docstring de _PooledConnection para el motivo (evita 2 round-trips
+        de red de más por consulta).
+        """
         if self._pool is None:
             raise RuntimeError(
                 "Database.connect() no fue llamado todavía. Hay que hacer "
                 "'await db.connect()' antes de usar cualquier método de `db`."
             )
-        return _PooledConnection(self._pool)
+        return _PooledConnection(self._pool, transactional=transactional)
 
     async def _create_tables(self):
         async with self._conn() as conn:
@@ -814,7 +845,12 @@ class Database:
         handler de usuario.
         """
         to_credit: list[dict] = []
-        async with self._conn() as conn:
+        # transactional=True: corre en background (una vez por hora, ver
+        # REFERRAL_RELEASE_INTERVAL), no en el camino caliente de un
+        # usuario esperando respuesta, así que el costo extra de BEGIN/
+        # COMMIT no importa acá — y sí importa que el UPDATE de cada fila
+        # quede atómico junto con la lectura que decide su status.
+        async with self._conn(transactional=True) as conn:
             rows = await conn.fetch(
                 """
                 SELECT r.id, r.referrer_id, r.referred_id, r.tx_id, r.bonus_usd,
@@ -941,7 +977,11 @@ class Database:
         """
         column = self._ORIGIN_COLUMN.get(origin, "balance_usd")
         amount_usd = round(float(amount_usd), 4)
-        async with self._conn() as conn:
+        # transactional=True: el UPDATE de `balances` y el INSERT en
+        # `balance_ledger` tienen que quedar juntos o ninguno (es dinero
+        # real) — a diferencia de la mayoría de los métodos de esta clase,
+        # que hacen un único statement y no necesitan el BEGIN/COMMIT extra.
+        async with self._conn(transactional=True) as conn:
             await conn.execute(
                 f"INSERT INTO balances (user_id, {column}, updated_at) "
                 f"VALUES ($1, $2, NOW()) "
@@ -975,7 +1015,12 @@ class Database:
             drenando primero CUP (la menos flexible de las dos).
         """
         amount_usd = round(float(amount_usd), 4)
-        async with self._conn() as conn:
+        # transactional=True: lee el saldo actual y después lo actualiza +
+        # registra el ledger en el mismo BEGIN/COMMIT — necesario para que
+        # dos descuentos concurrentes del mismo usuario no lean el mismo
+        # saldo "viejo" y ambos pasen la validación de "alcanza" cuando en
+        # realidad solo alcanza para uno.
+        async with self._conn(transactional=True) as conn:
             row = await conn.fetchrow(
                 "SELECT balance_usd, balance_usd_cup FROM balances WHERE user_id = $1",
                 user_id,

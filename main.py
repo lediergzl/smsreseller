@@ -175,8 +175,10 @@ async def _startup_sequence(bot: Bot, storage):
     await outbox.flush_pending(bot)
     asyncio.create_task(outbox.retry_loop(bot))
 
-    # Precalentar caché de servicios/países en background.
+    # Precalentar caché de servicios/países (HeroSMS) y de catálogo de
+    # monedas (CCPayment) en background, en paralelo.
     asyncio.create_task(hero.warm_cache())
+    asyncio.create_task(ccpay.warm_catalog_cache())
 
     # Chequeo de salud de la DB + keep-alive de Neon (ver backup_task.py).
     asyncio.create_task(backup_task.db_health_loop(bot))
