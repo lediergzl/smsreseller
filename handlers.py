@@ -28,7 +28,7 @@ from config import MANUAL_DEPOSIT_MIN_USD, MANUAL_DEPOSIT_MAX_USD, MANUAL_DEPOSI
 from config import MANUAL_DEPOSIT_CUP_MARGIN_PCT, MANUAL_DEPOSIT_CUP_EXPOSURE_ALERT_USD, MANUAL_PURCHASE_MIN_USD
 from config import ACCOUNT_TYPE_LABELS
 from config import REFERRAL_BONUS_PCT, REFERRAL_MIN_PURCHASE_USD, REFERRAL_HOLD_HOURS, REFERRAL_RELEASE_INTERVAL
-from config import COMMUNITY_CHANNEL_CHAT_ID, COMMUNITY_CHANNEL_URL, COMMUNITY_GROUP_URL
+from config import COMMUNITY_CHANNEL_CHAT_ID, COMMUNITY_CHANNEL_URL, COMMUNITY_GROUP_URL, COMMUNITY_GROUP_CHAT_ID
 from database import db
 from utils import (
     format_amount, format_cup, apply_markup, apply_refund_fee, apply_withdrawal_fee, floor_to_cents, format_phone,
@@ -115,12 +115,15 @@ class ManualDepositFlow(StatesGroup):
 
 class AnuncioFlow(StatesGroup):
     """
-    /anunciar (solo admins, ver config.ADMIN_IDS): publicar un mensaje en
-    COMMUNITY_CHANNEL_CHAT_ID. Dos pasos nada más -contenido y confirmación-
-    porque a diferencia de los flujos de compra/retiro acá no hay nada que
-    reservar ni cobrar mientras se piensa el mensaje.
+    /anunciar (canal, COMMUNITY_CHANNEL_CHAT_ID) y /hablar (grupo,
+    COMMUNITY_GROUP_CHAT_ID) comparten este mismo flujo -solo cambia el
+    chat_id destino, guardado en el state como anuncio_target/
+    anuncio_target_label (ver cmd_anunciar / cmd_hablar). Dos pasos nada
+    más -contenido y confirmación- porque a diferencia de los flujos de
+    compra/retiro acá no hay nada que reservar ni cobrar mientras se
+    piensa el mensaje.
     """
-    awaiting_content = State()  # Esperando el texto (+ botones opcionales) del anuncio
+    awaiting_content = State()  # Esperando el texto (+ botones opcionales) del mensaje
     confirming        = State()  # Preview mostrado, esperando confirmación final
 
 
@@ -580,23 +583,45 @@ def _parse_anuncio_buttons(texto: str) -> tuple[str, InlineKeyboardMarkup | None
 
 @router.message(Command("anunciar"))
 async def cmd_anunciar(message: Message, state: FSMContext):
+    """Punto de entrada de la difusión al CANAL de comunidad."""
+    await _start_anuncio_flow(
+        message, state,
+        target=COMMUNITY_CHANNEL_CHAT_ID, target_label="canal",
+        missing_var="COMMUNITY_CHANNEL_CHAT_ID",
+    )
+
+
+@router.message(Command("hablar"))
+async def cmd_hablar(message: Message, state: FSMContext):
     """
-    Punto de entrada de la difusión al canal de comunidad. Solo admins (ver
-    config.ADMIN_IDS) y solo en DM, mismo criterio que /stats/ventas/etc.
+    Igual que /anunciar pero publica en el GRUPO de soporte
+    (COMMUNITY_GROUP_CHAT_ID) en vez del canal -para que el admin no tenga
+    que escribir ahí con su cuenta personal cuando quiere hablar "como el
+    bot" (avisos, respuestas fijadas, etc).
+    """
+    await _start_anuncio_flow(
+        message, state,
+        target=COMMUNITY_GROUP_CHAT_ID, target_label="grupo",
+        missing_var="COMMUNITY_GROUP_CHAT_ID",
+    )
+
+
+async def _start_anuncio_flow(message: Message, state: FSMContext, target: int, target_label: str, missing_var: str):
+    """Solo admins y solo en DM, mismo criterio que /stats/ventas/etc.
     (ver _is_admin_dm) -no queremos que un admin dispare esto por accidente
-    en un grupo ni que se filtre a quien no tiene permisos.
-    """
+    en un grupo ni que se filtre a quien no tiene permisos."""
     if not _is_admin_dm(message):
         return
 
-    if not COMMUNITY_CHANNEL_CHAT_ID:
+    if not target:
         await _safe_answer(
             message,
-            "⚠️ No configuraste <code>COMMUNITY_CHANNEL_CHAT_ID</code> todavía, "
-            "así que no hay canal donde publicar (ver config.py).",
+            f"⚠️ No configuraste <code>{missing_var}</code> todavía, "
+            f"así que no hay {target_label} donde publicar (ver config.py).",
         )
         return
 
+    await state.update_data(anuncio_target=target, anuncio_target_label=target_label)
     await state.set_state(AnuncioFlow.awaiting_content)
     await _safe_answer(message, MSG_ANUNCIO_ASK_CONTENT, reply_markup=cancel_keyboard())
 
@@ -621,7 +646,9 @@ async def msg_anuncio_content(message: Message, state: FSMContext):
         anuncio_texto=texto,
         anuncio_keyboard=keyboard.model_dump() if keyboard else None,
     )
-    await message.answer("Así se va a ver publicado en el canal 👇", parse_mode="HTML")
+    data = await state.get_data()
+    target_label = data.get("anuncio_target_label", "canal")
+    await message.answer(f"Así se va a ver publicado en el {target_label} 👇", parse_mode="HTML")
     await message.answer(texto, parse_mode="HTML", reply_markup=keyboard)
     await _safe_answer(
         message, "¿Confirmás la publicación?", reply_markup=anuncio_confirm_keyboard(),
@@ -632,24 +659,27 @@ async def msg_anuncio_content(message: Message, state: FSMContext):
 @router.callback_query(F.data == "anuncio_confirm", AnuncioFlow.confirming)
 async def cb_anuncio_confirm(call: CallbackQuery, state: FSMContext):
     """
-    Publica en el canal. Reusa _safe_send (mismo camino que cualquier otro
-    aviso del bot): si el envío directo falla, queda encolado en outbox con
-    reintento automático en vez de perderse -no hace falta lógica de
-    reintento propia acá.
+    Publica en el canal o grupo (según con qué comando se arrancó el
+    flujo, ver anuncio_target en el state). Reusa _safe_send (mismo camino
+    que cualquier otro aviso del bot): si el envío directo falla, queda
+    encolado en outbox con reintento automático en vez de perderse -no
+    hace falta lógica de reintento propia acá.
     """
     data = await state.get_data()
     texto = data.get("anuncio_texto", "")
     kb_data = data.get("anuncio_keyboard")
     keyboard = InlineKeyboardMarkup.model_validate(kb_data) if kb_data else None
+    target = data.get("anuncio_target", COMMUNITY_CHANNEL_CHAT_ID)
+    target_label = data.get("anuncio_target_label", "canal")
 
-    await _safe_send(call.bot, COMMUNITY_CHANNEL_CHAT_ID, texto, reply_markup=keyboard)
-    logger.info("Anuncio publicado en el canal por admin %s", call.from_user.id)
+    await _safe_send(call.bot, target, texto, reply_markup=keyboard)
+    logger.info("Anuncio publicado en el %s por admin %s", target_label, call.from_user.id)
 
     await state.clear()
     await _safe_call_answer(call, "Anuncio enviado.")
     await call.message.edit_text(
-        "✅ Anuncio enviado al canal. Si Telegram lo rechazó por un error "
-        "transitorio, quedó encolado con reintento automático (outbox)."
+        f"✅ Anuncio enviado al {target_label}. Si Telegram lo rechazó por un "
+        "error transitorio, quedó encolado con reintento automático (outbox)."
     )
 
 
@@ -677,9 +707,30 @@ async def _release_referrals_loop(bot):
                         new_balance=format_amount(r["new_balance"], "USD"),
                     ),
                 )
+                await _post_channel_referral_bonus(bot, r)
         except Exception as exc:
             logger.error("Error liberando bonos de referido pendientes: %s", exc)
         await asyncio.sleep(REFERRAL_RELEASE_INTERVAL)
+
+
+async def _post_channel_referral_bonus(bot, released: dict):
+    """
+    Publica en el canal que un referido compró y su referidor ganó
+    comisión -mismo criterio de privacidad que _post_channel_referral_signup:
+    identifica al referidor solo por @username (o genérico si no tiene), y
+    nunca menciona quién fue el comprador."""
+    if not COMMUNITY_CHANNEL_CHAT_ID:
+        return
+    try:
+        referrer = await db.get_user(released["referrer_id"])
+    except Exception:
+        referrer = None
+    who = f"@{referrer['username']}" if referrer and referrer.get("username") else "Un usuario"
+    await _safe_send(
+        bot, COMMUNITY_CHANNEL_CHAT_ID,
+        f"💰 {who} ganó {format_amount(released['bonus_usd'], 'USD')} de comisión "
+        "por la compra de uno de sus referidos.",
+    )
 
 
 async def _credit_refund_for_tx(user_id: int, tx: dict, amount_usd: float, tx_id: int, reason: str) -> float:
@@ -741,8 +792,26 @@ async def _capture_referral_text(bot, user_id: int, start_text: str | None):
         linked = await db.set_referrer(user_id, referrer["user_id"])
         if linked:
             await _safe_send(bot, referrer["user_id"], MSG_REFERRAL_NEW_SIGNUP)
+            await _post_channel_referral_signup(bot, referrer)
     except Exception as exc:
         logger.error("No se pudo procesar referido para %s: %s", user_id, exc)
+
+
+async def _post_channel_referral_signup(bot, referrer: dict):
+    """
+    Publica en el canal de comunidad que alguien consiguió un nuevo
+    referido -da fiabilidad social (el programa de referidos funciona de
+    verdad) sin exponer al nuevo usuario, que no eligió aparecer en un
+    canal público. Solo se identifica al referidor, y solo con su
+    @username si lo tiene configurado -nunca con su user_id numérico.
+    """
+    if not COMMUNITY_CHANNEL_CHAT_ID:
+        return
+    who = f"@{referrer['username']}" if referrer.get("username") else "Un usuario"
+    await _safe_send(
+        bot, COMMUNITY_CHANNEL_CHAT_ID,
+        f"🎉 {who} sumó un nuevo referido a través de su enlace de invitación.",
+    )
 
 
 async def _capture_referral(message: Message):
