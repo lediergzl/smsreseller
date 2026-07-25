@@ -4455,16 +4455,25 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
             # el depósito (ver msg cerca de create_manual_deposit). Sin este
             # aviso, el admin se queda esperando indefinidamente un
             # comprobante que nunca va a llegar.
-            dep = await db.get_manual_deposit_by_id(dep_id)
-            if dep:
-                buyer = await db.get_user(call.from_user.id)
-                await _notify_admin(
-                    call.bot,
-                    f"❌ <b>Pago CUP cancelado por el cliente</b> (depósito de saldo)\n"
-                    f"{_user_label(call.from_user.id, buyer.get('username') if buyer else None)} · "
-                    f"{format_amount(dep['amount_usd'], 'USD')}\n"
-                    f"Código: <code>{dep['reference_code']}</code>",
-                )
+            #
+            # try/except a propósito: esto es un aviso secundario -si algo
+            # falla acá (timeout de DB, Neon lento, etc.) NUNCA debe impedir
+            # que el usuario reciba su confirmación de cancelación más abajo
+            # (mismo criterio que _notify_admin ya sigue en el resto del
+            # archivo: "nunca debe tumbar el flujo del usuario si falla").
+            try:
+                dep = await db.get_manual_deposit_by_id(dep_id)
+                if dep:
+                    buyer = await db.get_user(call.from_user.id)
+                    await _notify_admin(
+                        call.bot,
+                        f"❌ <b>Pago CUP cancelado por el cliente</b> (depósito de saldo)\n"
+                        f"{_user_label(call.from_user.id, buyer.get('username') if buyer else None)} · "
+                        f"{format_amount(dep['amount_usd'], 'USD')}\n"
+                        f"Código: <code>{dep['reference_code']}</code>",
+                    )
+            except Exception as exc:
+                logger.error("No se pudo avisar al admin de la cancelación del depósito %s: %s", dep_id, exc)
         await state.clear()
         await _safe_answer(call.message, "✅ Depósito CUP cancelado.")
         return
@@ -4481,17 +4490,24 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
             # iniciado". Sin este aviso de cancelación, ese mensaje se queda
             # colgado en el canal del admin como si siguiera pendiente
             # (esperando un comprobante que ya no va a llegar).
+            #
+            # try/except a propósito: aviso secundario, nunca debe impedir
+            # que el usuario reciba su confirmación de cancelación (mismo
+            # criterio que la rama de depósito manual, arriba).
             if reference_code:
-                tx = await db.get_by_id(tx_id)
-                if tx:
-                    buyer = await db.get_user(tx["user_id"])
-                    await _notify_admin(
-                        call.bot,
-                        f"❌ <b>Pago CUP cancelado por el cliente</b> (compra)\n"
-                        f"{_user_label(tx['user_id'], buyer.get('username') if buyer else None)}\n"
-                        f"Código: <code>{reference_code}</code>\n"
-                        f"{_tx_summary_line(tx)}",
-                    )
+                try:
+                    tx = await db.get_by_id(tx_id)
+                    if tx:
+                        buyer = await db.get_user(tx["user_id"])
+                        await _notify_admin(
+                            call.bot,
+                            f"❌ <b>Pago CUP cancelado por el cliente</b> (compra)\n"
+                            f"{_user_label(tx['user_id'], buyer.get('username') if buyer else None)}\n"
+                            f"Código: <code>{reference_code}</code>\n"
+                            f"{_tx_summary_line(tx)}",
+                        )
+                except Exception as exc:
+                    logger.error("No se pudo avisar al admin de la cancelación de la tx %s: %s", tx_id, exc)
         await state.clear()
         await _safe_answer(call.message, "✅ Compra cancelada. No se generó ningún cargo.")
         return
