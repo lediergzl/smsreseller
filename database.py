@@ -1344,6 +1344,24 @@ class Database:
             )
             return [dict(r) for r in rows]
 
+    async def get_pending_manual_purchase(self, user_id: int) -> Optional[dict]:
+        """
+        Compra con pago manual en CUP todavía sin resolver (order_id
+        'cup-<tx_id>', status='pending', ver _start_manual_purchase_payment)
+        más reciente de este usuario. Fallback para cb_cancel cuando el FSM
+        se perdió (reinicio del bot, MemoryStorage) y no hay tx_id en el
+        estado -sin esto, cancelar en ese momento no encuentra nada que
+        marcar y la orden queda "pending" para siempre, resucitando en cada
+        reinicio (ver resume_transaction, Caso 3.5).
+        """
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM transactions WHERE user_id = $1 AND status = 'pending' "
+                "AND order_id LIKE 'cup-%' ORDER BY created_at DESC LIMIT 1",
+                user_id,
+            )
+            return dict(row) if row else None
+
     async def get_abuse_strikes(self, user_id: int, hours: int) -> int:
         """
         Cuenta cuántas veces este usuario recibió un número y la operación

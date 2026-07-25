@@ -4414,6 +4414,26 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     tx_id = data.get("tx_id")
 
+    if current_state is None and not tx_id:
+        # FSM perdido (reinicio reciente del bot -MemoryStorage- justo antes
+        # de que llegara este click, o antes de que resume_transaction
+        # terminara de reconstruirlo). Sin esto, ninguna rama de abajo
+        # matchea, cae al mensaje genérico del final que NO cancela nada de
+        # verdad -la orden queda 'pending' en la base para siempre y
+        # resucita en cada reinicio (ver resume_transaction, Caso 3.5).
+        # En vez de rendirnos, buscamos directo en la base si el usuario
+        # tiene una compra o depósito con pago CUP sin resolver.
+        fallback_tx = await db.get_pending_manual_purchase(call.from_user.id)
+        if fallback_tx:
+            tx_id = fallback_tx["id"]
+            current_state = PurchaseFlow.awaiting_manual_review
+            data = {**data, "tx_id": tx_id, "manual_reference_code": f"REF-{tx_id:06d}"}
+        else:
+            fallback_dep = await db.get_pending_manual_deposit(call.from_user.id)
+            if fallback_dep:
+                current_state = ManualDepositFlow.awaiting_proof
+                data = {**data, "manual_deposit_id": fallback_dep["id"]}
+
     if current_state in (
         WithdrawFlow.awaiting_amount, WithdrawFlow.selecting_currency,
         WithdrawFlow.awaiting_address, WithdrawFlow.confirming,
