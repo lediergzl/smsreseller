@@ -343,6 +343,7 @@ def currency_networks_keyboard(options: list[dict], currency: str, prefix: str) 
         label = f"🌐 {opt['network']} — {amount_str}{fee_tag}{dep_tag}"
         builder.button(text=label, callback_data=f"{prefix}:{i}")
     builder.button(text="⬅️ Volver", callback_data=f"{prefix}g_back")
+    builder.button(text="❌ Cancelar", callback_data="cancel_op")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -378,6 +379,7 @@ def currencies_keyboard(
     if manual_cup_available:
         builder.button(text="🇨🇺 Pagar con CUP", callback_data="pay_cup")
     _add_grouped_currency_buttons(builder, options, prefix="cur")
+    builder.button(text="❌ Cancelar", callback_data="cancel_op")
     builder.adjust(1)
     return builder.as_markup()
 
