@@ -201,6 +201,22 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
     logger = logging.getLogger(__name__)
     webhook_url = config.WEBHOOK_HOST.rstrip("/") + config.WEBHOOK_PATH
 
+    # `ready` se activa recién cuando _startup_sequence (conectar a Neon,
+    # recovery de transacciones/depósitos, etc.) termina. El middleware de
+    # abajo hace que cualquier update que llegue ANTES de eso simplemente
+    # espere en vez de: (a) fallar porque `db` todavía no tiene pool de
+    # conexiones, o (b) nunca llegar porque Render mató el proceso por
+    # tardar en abrir el puerto (ver por qué esto importa, más abajo en
+    # on_startup).
+    ready = asyncio.Event()
+
+    @dp.update.outer_middleware()
+    async def _wait_until_ready(handler, event, data):
+        if not ready.is_set():
+            logger.info("Update recibido antes de terminar el arranque, esperando...")
+            await ready.wait()
+        return await handler(event, data)
+
     async def on_startup(bot: Bot):
         await bot.set_webhook(
             url=webhook_url,
@@ -216,7 +232,33 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
             allowed_updates=dp.resolve_used_update_types(),
         )
         logger.info("Webhook configurado en %s", webhook_url)
-        await _startup_sequence(bot, storage)
+
+        # CLAVE: NO hacer `await _startup_sequence(...)` acá directamente.
+        # web.run_app() espera a que el signal `on_startup` termine ANTES de
+        # abrir el puerto (runner.setup() corre antes que site.start()). Si
+        # _startup_sequence (conectar a Neon, chequeo de integridad, reanudar
+        # transacciones/depósitos pendientes, etc.) tarda unos segundos -algo
+        # normal, más aún si Neon está "frío"-, el puerto tarda en abrirse y
+        # Render puede considerar el healthcheck fallido y matar el proceso
+        # a la fuerza (SIGKILL, sin ningún log de excepción) antes de que
+        # termine de arrancar. Esto es justo lo que se veía en los logs:
+        # dos "Running 'python main.py'" separados por solo 10s sin ningún
+        # error en el medio, y updates (botones) que llegaban tarde y
+        # expiraban ("query is too old").
+        #
+        # Al lanzarlo como tarea en background, on_startup retorna casi de
+        # inmediato -> el puerto se abre enseguida -> Render ve el
+        # healthcheck OK y no mata el proceso -> y mientras tanto, el
+        # middleware de arriba hace que los updates que ya estén llegando
+        # esperen a que `ready` se active en vez de procesarse con la DB
+        # todavía sin conectar.
+        async def _startup_and_signal_ready():
+            try:
+                await _startup_sequence(bot, storage)
+            finally:
+                ready.set()
+
+        asyncio.create_task(_startup_and_signal_ready())
 
     async def on_shutdown(bot: Bot):
         # NO borrar el webhook acá: Render hace rolling restart (arranca la
