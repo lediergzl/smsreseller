@@ -64,10 +64,13 @@
 
   .badge {
     display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: .75rem;
+    background: rgba(139,147,161,.15); color: var(--muted); /* respaldo genérico */
   }
   .badge.completed, .badge.approved, .badge.released { background: rgba(62,207,142,.15); color: var(--ok); }
-  .badge.pending, .badge.pending_review, .badge.awaiting_proof, .badge.requested { background: rgba(245,165,36,.15); color: var(--warn); }
-  .badge.error, .badge.denied, .badge.rejected { background: rgba(245,87,108,.15); color: var(--err); }
+  .badge.pending, .badge.pending_review, .badge.awaiting_proof, .badge.requested,
+  .badge.number_assigned, .badge.paid { background: rgba(245,165,36,.15); color: var(--warn); }
+  .badge.error, .badge.denied, .badge.rejected, .badge.sms_timeout, .badge.payment_timeout { background: rgba(245,87,108,.15); color: var(--err); }
+  .badge.refunded, .badge.cancelled { background: rgba(139,147,161,.2); color: var(--text); }
 
   .amt { font-variant-numeric: tabular-nums; }
   .muted { color: var(--muted); }
