@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard · Admin</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #181b21; --panel-2: #1f232b; --border: #2a2f3a;
+    --text: #e6e8eb; --muted: #8b93a1; --accent: #5b8cff;
+    --ok: #3ecf8e; --warn: #f5a524; --err: #f5576c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text); margin: 0;
+    font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+  }
+  header {
+    padding: 20px 28px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  header h1 { font-size: 1.1rem; font-weight: 600; margin: 0; }
+  header .live { color: var(--muted); font-size: .85rem; }
+  header .live .dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--ok); margin-right: 6px; animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  .cards {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 14px; padding: 20px 28px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px;
+  }
+  .card .value { font-size: 1.6rem; font-weight: 700; }
+  .card .label { color: var(--muted); font-size: .8rem; margin-top: 4px; }
+  .card.warn .value { color: var(--warn); }
+  .card.err .value { color: var(--err); }
+  .card.ok .value { color: var(--ok); }
+
+  nav.tabs {
+    display: flex; gap: 4px; padding: 0 28px; border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+  }
+  nav.tabs button {
+    background: none; border: none; color: var(--muted); padding: 12px 16px;
+    font-size: .9rem; cursor: pointer; border-bottom: 2px solid transparent;
+    white-space: nowrap;
+  }
+  nav.tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+
+  main { padding: 20px 28px; }
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  th, td {
+    text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  th { color: var(--muted); font-weight: 500; font-size: .78rem; text-transform: uppercase; }
+  tbody tr:hover { background: var(--panel-2); }
+  .empty { color: var(--muted); padding: 40px; text-align: center; }
+
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: .75rem;
+  }
+  .badge.completed, .badge.approved, .badge.released { background: rgba(62,207,142,.15); color: var(--ok); }
+  .badge.pending, .badge.pending_review, .badge.awaiting_proof, .badge.requested { background: rgba(245,165,36,.15); color: var(--warn); }
+  .badge.error, .badge.denied, .badge.rejected { background: rgba(245,87,108,.15); color: var(--err); }
+
+  .amt { font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📊 Panel de control</h1>
+  <div class="live"><span class="dot"></span>actualiza cada 5s</div>
+</header>
+
+<div class="cards" id="cards"></div>
+
+<nav class="tabs" id="tabs">
+  <button data-tab="transactions" class="active">Compras</button>
+  <button data-tab="manual_deposits">Depósitos</button>
+  <button data-tab="manual_withdrawals">Retiros</button>
+  <button data-tab="ledger">Acreditaciones</button>
+  <button data-tab="referrals">Referidos</button>
+  <button data-tab="errors">Errores</button>
+</nav>
+
+<main id="main"></main>
+
+<script>
+const fmtMoney = (n) => n == null ? "—" : "$" + Number(n).toFixed(2);
+const fmtDate = (s) => s ? new Date(s).toLocaleString("es", {dateStyle:"short", timeStyle:"short"}) : "—";
+const who = (row) => row.username ? "@" + row.username : (row.first_name || ("#" + row.user_id));
+const badge = (status) => `<span class="badge ${status}">${status || "—"}</span>`;
+
+const CARD_DEFS = [
+  { key: "pending_purchases",         label: "Compras en curso" },
+  { key: "pending_manual_deposits",    label: "Depósitos por revisar", cls: "warn" },
+  { key: "pending_manual_withdrawals", label: "Retiros por revisar",   cls: "warn" },
+  { key: "pending_refunds",            label: "Reembolsos pendientes", cls: "warn" },
+  { key: "errors_today",               label: "Errores (24h)",         cls: "err" },
+  { key: "revenue_today_usd",          label: "Ingresos (24h)",        cls: "ok", money: true },
+  { key: "users_total",                label: "Usuarios totales" },
+];
+
+const COLUMNS = {
+  transactions: {
+    endpoint: "transactions",
+    cols: ["Usuario","Servicio","País","Monto","Estado","Teléfono","Fecha"],
+    row: (r) => [who(r), r.service_name || r.service, r.country_name || r.country,
+                 fmtMoney(r.amount_usd), badge(r.status), r.phone_number || "—", fmtDate(r.created_at)],
+  },
+  manual_deposits: {
+    endpoint: "manual_deposits",
+    cols: ["Usuario","Método","Monto USD","Monto CUP","Estado","Código","Fecha"],
+    row: (r) => [who(r), r.method, fmtMoney(r.amount_usd), r.amount_cup ?? "—",
+                 badge(r.status), r.reference_code || "—", fmtDate(r.created_at)],
+  },
+  manual_withdrawals: {
+    endpoint: "manual_withdrawals",
+    cols: ["Usuario","Método","Monto USD","Monto CUP","Estado","Código","Fecha"],
+    row: (r) => [who(r), r.method, fmtMoney(r.amount_usd), r.amount_cup ?? "—",
+                 badge(r.status), r.reference_code || "—", fmtDate(r.created_at)],
+  },
+  ledger: {
+    endpoint: "ledger",
+    cols: ["Usuario","Monto","Origen","Motivo","Fecha"],
+    row: (r) => [who(r),
+                 `<span class="amt" style="color:${r.delta_usd >= 0 ? 'var(--ok)' : 'var(--err)'}">${r.delta_usd >= 0 ? "+" : ""}${fmtMoney(r.delta_usd)}</span>`,
+                 r.origin, r.reason || "—", fmtDate(r.created_at)],
+  },
+  referrals: {
+    endpoint: "referrals",
+    cols: ["Referente","Referido","Comisión","Estado","Fecha"],
+    row: (r) => [r.referrer_username ? "@"+r.referrer_username : "#"+r.referrer_id,
+                 r.referred_username ? "@"+r.referred_username : "#"+r.referred_id,
+                 fmtMoney(r.bonus_usd), badge(r.status), fmtDate(r.created_at)],
+  },
+  errors: {
+    endpoint: "errors",
+    cols: ["Tipo","Usuario","Detalle","Monto","Fecha"],
+    row: (r) => [r.kind === "transaction_error" ? "❌ Compra fallida" : "↩️ Reembolso pendiente",
+                 who(r), r.detail || "—", fmtMoney(r.amount_usd), fmtDate(r.at)],
+  },
+};
+
+let currentTab = "transactions";
+
+async function loadCards() {
+  const res = await fetch("/admin/api/summary");
+  if (res.status === 401) { location.href = "/admin/login"; return; }
+  const data = await res.json();
+  document.getElementById("cards").innerHTML = CARD_DEFS.map(c => `
+    <div class="card ${c.cls || ""}">
+      <div class="value">${c.money ? fmtMoney(data[c.key]) : (data[c.key] ?? "—")}</div>
+      <div class="label">${c.label}</div>
+    </div>`).join("");
+}
+
+async function loadTab(tab) {
+  const def = COLUMNS[tab];
+  const res = await fetch(`/admin/api/${def.endpoint}?limit=50`);
+  if (res.status === 401) { location.href = "/admin/login"; return; }
+  const rows = await res.json();
+  const main = document.getElementById("main");
+  if (!rows.length) {
+    main.innerHTML = `<div class="empty">Sin datos todavía.</div>`;
+    return;
+  }
+  main.innerHTML = `<table><thead><tr>${def.cols.map(c => `<th>${c}</th>`).join("")}</tr></thead>
+    <tbody>${rows.map(r => `<tr>${def.row(r).map(c => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+}
+
+document.getElementById("tabs").addEventListener("click", (e) => {
+  if (e.target.tagName !== "BUTTON") return;
+  document.querySelectorAll("nav.tabs button").forEach(b => b.classList.remove("active"));
+  e.target.classList.add("active");
+  currentTab = e.target.dataset.tab;
+  loadTab(currentTab);
+});
+
+async function refresh() {
+  await Promise.all([loadCards(), loadTab(currentTab)]);
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

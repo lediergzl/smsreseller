@@ -36,6 +36,7 @@ import herosms_api as hero
 import ccpay_api as ccpay
 import backup_task
 import outbox
+from admin_dashboard import setup_admin_dashboard
 
 
 def setup_logging():
@@ -318,6 +319,15 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
 
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+
+    # Panel de admin en /admin, sobre este mismo servidor y puerto -no es
+    # un servicio aparte, no necesita otro deploy en Render. Solo vive
+    # mientras el bot corre en modo webhook (acá adentro de _run_webhook);
+    # en modo polling (VPS sin dominio, o desarrollo local) no hay
+    # servidor HTTP corriendo, así que el dashboard simplemente no está
+    # disponible en ese modo -si en algún momento lo necesitás también en
+    # polling, avisá y se le agrega un aiohttp.web.Application aparte ahí.
+    setup_admin_dashboard(app)
 
     SimpleRequestHandler(
         dispatcher=dp, bot=bot, secret_token=config.WEBHOOK_SECRET or None,

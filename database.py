@@ -1621,6 +1621,156 @@ class Database:
             return [dict(r) for r in rows]
 
 
+    # ── Consultas para el dashboard de admin (solo lectura) ─────────────────
+    # Todo lo de acá abajo es de solo lectura -no toca balances ni statuses,
+    # a diferencia del resto de la clase. Pensado para admin_dashboard.py.
+
+    async def get_recent_transactions_admin(self, limit: int = 50, status: Optional[str] = None) -> list[dict]:
+        """
+        Compras recientes de TODOS los usuarios, con username incluido (a
+        diferencia de get_recent_sales, que solo trae 'completed'; acá se
+        puede filtrar por cualquier status o traer todas para el feed del
+        dashboard). JOIN con users vía LEFT JOIN: si por algún motivo el
+        usuario no está en `users` (no debería pasar, pero no confiamos
+        ciegamente), igual se devuelve la fila en vez de perderla.
+        """
+        sql = """
+        SELECT t.*, u.username, u.first_name
+        FROM transactions t
+        LEFT JOIN users u ON u.user_id = t.user_id
+        """
+        params: list = []
+        if status:
+            params.append(status)
+            sql += f" WHERE t.status = ${len(params)}"
+        params.append(limit)
+        sql += f" ORDER BY t.created_at DESC LIMIT ${len(params)}"
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, *params)
+            return [dict(r) for r in rows]
+
+    async def get_recent_ledger_admin(self, limit: int = 50) -> list[dict]:
+        """
+        Feed combinado de TODOS los movimientos de saldo (acreditaciones y
+        débitos): comisiones de referidos, reembolsos, retiros, pagos con
+        saldo. Es la fuente de verdad única de balance_ledger, con username
+        para mostrar "quién" sin otro join en el frontend.
+        """
+        sql = """
+        SELECT bl.*, u.username, u.first_name
+        FROM balance_ledger bl
+        LEFT JOIN users u ON u.user_id = bl.user_id
+        ORDER BY bl.created_at DESC LIMIT $1
+        """
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, limit)
+            return [dict(r) for r in rows]
+
+    async def get_recent_referrals_admin(self, limit: int = 50) -> list[dict]:
+        """Referidos recientes con username de referrer y referido (dos JOIN separados)."""
+        sql = """
+        SELECT r.*,
+               ur.username  AS referrer_username,
+               uf.username  AS referred_username
+        FROM referrals r
+        LEFT JOIN users ur ON ur.user_id = r.referrer_id
+        LEFT JOIN users uf ON uf.user_id = r.referred_id
+        ORDER BY r.created_at DESC LIMIT $1
+        """
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, limit)
+            return [dict(r) for r in rows]
+
+    async def get_recent_manual_deposits_admin(self, limit: int = 50) -> list[dict]:
+        sql = """
+        SELECT d.*, u.username, u.first_name
+        FROM manual_deposits d
+        LEFT JOIN users u ON u.user_id = d.user_id
+        ORDER BY d.created_at DESC LIMIT $1
+        """
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, limit)
+            return [dict(r) for r in rows]
+
+    async def get_recent_manual_withdrawals_admin(self, limit: int = 50) -> list[dict]:
+        sql = """
+        SELECT w.*, u.username, u.first_name
+        FROM manual_withdrawals w
+        LEFT JOIN users u ON u.user_id = w.user_id
+        ORDER BY w.created_at DESC LIMIT $1
+        """
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, limit)
+            return [dict(r) for r in rows]
+
+    async def get_recent_refund_requests_admin(self, limit: int = 50) -> list[dict]:
+        sql = """
+        SELECT rr.*, u.username, u.first_name, t.service_name, t.amount_usd
+        FROM refund_requests rr
+        LEFT JOIN users u ON u.user_id = rr.user_id
+        LEFT JOIN transactions t ON t.id = rr.tx_id
+        ORDER BY rr.created_at DESC LIMIT $1
+        """
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, limit)
+            return [dict(r) for r in rows]
+
+    async def get_recent_errors_admin(self, limit: int = 50) -> list[dict]:
+        """
+        Todo lo que representa un problema real a revisar: compras en
+        estado 'error', y solicitudes de reembolso todavía sin resolver.
+        Se combinan y ordenan por fecha para un único feed de "cosas que
+        necesitan tu atención".
+        """
+        sql = """
+        (SELECT 'transaction_error' AS kind, t.id, t.user_id, u.username,
+                t.service_name AS detail, t.amount_usd, t.updated_at AS at
+         FROM transactions t LEFT JOIN users u ON u.user_id = t.user_id
+         WHERE t.status = 'error')
+        UNION ALL
+        (SELECT 'refund_pending' AS kind, rr.id, rr.user_id, u.username,
+                rr.reason AS detail, NULL AS amount_usd, rr.created_at AS at
+         FROM refund_requests rr LEFT JOIN users u ON u.user_id = rr.user_id
+         WHERE rr.status = 'requested')
+        ORDER BY at DESC LIMIT $1
+        """
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, limit)
+            return [dict(r) for r in rows]
+
+    async def get_dashboard_summary(self) -> dict:
+        """Contadores rápidos para las tarjetas de arriba del dashboard."""
+        async with self._conn() as conn:
+            pending_purchases = await conn.fetchval(
+                "SELECT COUNT(*) FROM transactions WHERE status IN ('pending','paid','number_assigned')"
+            )
+            pending_manual_deposits = await conn.fetchval(
+                "SELECT COUNT(*) FROM manual_deposits WHERE status IN ('awaiting_proof','pending_review')"
+            )
+            pending_manual_withdrawals = await conn.fetchval(
+                "SELECT COUNT(*) FROM manual_withdrawals WHERE status = 'pending_review'"
+            )
+            pending_refunds = await conn.fetchval(
+                "SELECT COUNT(*) FROM refund_requests WHERE status = 'requested'"
+            )
+            errors_today = await conn.fetchval(
+                "SELECT COUNT(*) FROM transactions WHERE status = 'error' AND updated_at >= NOW() - INTERVAL '24 hours'"
+            )
+            revenue_today = await conn.fetchval(
+                "SELECT COALESCE(SUM(amount_usd),0) FROM transactions WHERE status = 'completed' AND updated_at >= NOW() - INTERVAL '24 hours'"
+            )
+            users_total = await conn.fetchval("SELECT COUNT(*) FROM users")
+        return {
+            "pending_purchases":           pending_purchases,
+            "pending_manual_deposits":      pending_manual_deposits,
+            "pending_manual_withdrawals":   pending_manual_withdrawals,
+            "pending_refunds":              pending_refunds,
+            "errors_today":                errors_today,
+            "revenue_today_usd":            round(float(revenue_today), 2),
+            "users_total":                  users_total,
+        }
+
+
 # Instancia global compartida. OJO: hay que llamar `await db.connect()` una
 # vez (ver main.py) antes de usar cualquier método — acá solo se arma el
 # objeto, todavía sin pool de conexiones.

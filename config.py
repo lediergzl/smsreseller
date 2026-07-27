@@ -9,6 +9,12 @@ load_dotenv()
 # ── Telegram ──────────────────────────────────────────────────────────────────
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 
+# @username del bot SIN el "@" (ej. "otpreseller_bot"). Solo lo usa
+# admin_dashboard.py para armar el botón de "Log in with Telegram" -no
+# afecta nada del funcionamiento normal del bot si queda vacío, pero el
+# dashboard no podrá mostrar el botón de login sin esto.
+BOT_USERNAME: str = os.getenv("BOT_USERNAME", "")
+
 # ── HeroSMS ───────────────────────────────────────────────────────────────────
 HEROSMS_API_KEY: str  = os.getenv("HEROSMS_API_KEY", "")
 # Base del endpoint único estilo SMS-Activate: <URL>/stubs/handler_api.php
