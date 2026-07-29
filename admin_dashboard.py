@@ -44,6 +44,7 @@ from datetime import datetime
 from aiohttp import web
 
 import config
+import handlers
 from database import db
 
 logger = logging.getLogger(__name__)
@@ -198,63 +199,237 @@ async def _dashboard_page(request: web.Request) -> web.Response:
     return web.FileResponse(_STATIC_DIR / "dashboard.html")
 
 
+def _json_response(data) -> web.Response:
+    return web.json_response(data, dumps=lambda d: json.dumps(d, default=_json_default))
+
+
 def _json_default(obj):
     if isinstance(obj, datetime):
         return obj.isoformat()
     return str(obj)
 
 
+def _query_days(request: web.Request) -> int | None:
+    raw = request.query.get("days")
+    if not raw or raw == "all":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 async def _api_summary(request: web.Request) -> web.Response:
-    data = await db.get_dashboard_summary()
-    return web.json_response(data, dumps=lambda d: json.dumps(d, default=_json_default))
+    return _json_response(await db.get_dashboard_summary())
 
 
 async def _api_transactions(request: web.Request) -> web.Response:
-    status = request.query.get("status") or None
-    limit = int(request.query.get("limit", 50))
-    data = await db.get_recent_transactions_admin(limit=limit, status=status)
-    return web.json_response(data, dumps=lambda d: json.dumps(d, default=_json_default))
+    data = await db.get_recent_transactions_admin(
+        limit=int(request.query.get("limit", 50)),
+        status=request.query.get("status") or None,
+        days=_query_days(request),
+        q=request.query.get("q") or None,
+    )
+    return _json_response(data)
 
 
 async def _api_ledger(request: web.Request) -> web.Response:
-    limit = int(request.query.get("limit", 50))
-    data = await db.get_recent_ledger_admin(limit=limit)
-    return web.json_response(data, dumps=lambda d: json.dumps(d, default=_json_default))
+    data = await db.get_recent_ledger_admin(
+        limit=int(request.query.get("limit", 50)),
+        days=_query_days(request),
+        q=request.query.get("q") or None,
+    )
+    return _json_response(data)
 
 
 async def _api_referrals(request: web.Request) -> web.Response:
-    limit = int(request.query.get("limit", 50))
-    data = await db.get_recent_referrals_admin(limit=limit)
-    return web.json_response(data, dumps=lambda d: json.dumps(d, default=_json_default))
+    data = await db.get_recent_referrals_admin(
+        limit=int(request.query.get("limit", 50)),
+        days=_query_days(request),
+        q=request.query.get("q") or None,
+    )
+    return _json_response(data)
 
 
 async def _api_manual_deposits(request: web.Request) -> web.Response:
-    limit = int(request.query.get("limit", 50))
-    data = await db.get_recent_manual_deposits_admin(limit=limit)
-    return web.json_response(data, dumps=lambda d: json.dumps(d, default=_json_default))
+    data = await db.get_recent_manual_deposits_admin(
+        limit=int(request.query.get("limit", 50)),
+        days=_query_days(request),
+        q=request.query.get("q") or None,
+    )
+    return _json_response(data)
 
 
 async def _api_manual_withdrawals(request: web.Request) -> web.Response:
-    limit = int(request.query.get("limit", 50))
-    data = await db.get_recent_manual_withdrawals_admin(limit=limit)
-    return web.json_response(data, dumps=lambda d: json.dumps(d, default=_json_default))
+    data = await db.get_recent_manual_withdrawals_admin(
+        limit=int(request.query.get("limit", 50)),
+        days=_query_days(request),
+        q=request.query.get("q") or None,
+    )
+    return _json_response(data)
 
 
 async def _api_refunds(request: web.Request) -> web.Response:
-    limit = int(request.query.get("limit", 50))
-    data = await db.get_recent_refund_requests_admin(limit=limit)
-    return web.json_response(data, dumps=lambda d: json.dumps(d, default=_json_default))
+    data = await db.get_recent_refund_requests_admin(limit=int(request.query.get("limit", 50)))
+    return _json_response(data)
 
 
 async def _api_errors(request: web.Request) -> web.Response:
-    limit = int(request.query.get("limit", 50))
-    data = await db.get_recent_errors_admin(limit=limit)
-    return web.json_response(data, dumps=lambda d: json.dumps(d, default=_json_default))
+    data = await db.get_recent_errors_admin(
+        limit=int(request.query.get("limit", 50)),
+        days=_query_days(request),
+    )
+    return _json_response(data)
 
 
-def setup_admin_dashboard(app: web.Application) -> None:
+async def _api_revenue_chart(request: web.Request) -> web.Response:
+    days = int(request.query.get("days", 14))
+    data = await db.get_daily_revenue_admin(days=days)
+    return _json_response(data)
+
+
+async def _api_user_history(request: web.Request) -> web.Response:
+    try:
+        user_id = int(request.match_info["user_id"])
+    except ValueError:
+        return web.json_response({"error": "user_id inválido"}, status=400)
+    data = await db.get_user_history_admin(user_id)
+    return _json_response(data)
+
+
+# ── Acciones (aprobar/rechazar) ──────────────────────────────────────────
+# A diferencia de todo lo de arriba (solo lectura), esto SÍ mueve saldo real.
+# La lógica de cada acción es una copia deliberada, paso a paso, de la que
+# ya usan los botones de Telegram en handlers.py (cb_admin_approve_manual,
+# cb_admin_reject_manual, cb_admin_approve_cup_withdrawal,
+# cb_admin_reject_cup_withdrawal) -mismos chequeos de estado, mismo orden
+# de operaciones, mismos mensajes al usuario (importados de handlers para
+# no duplicar el texto y que no se desincronicen). Lo único que NO se
+# replica acá es la edición del mensaje de Telegram del admin (no aplica,
+# no hay mensaje de Telegram involucrado cuando la acción se dispara desde
+# el navegador).
+
+async def _api_approve_manual_deposit(request: web.Request) -> web.Response:
+    dep_id = int(request.match_info["dep_id"])
+    force = request.query.get("force") == "1"
+    bot = request.app["bot"]
+
+    dep = await db.get_manual_deposit_by_id(dep_id)
+    if not dep:
+        return web.json_response({"error": "No encontrado"}, status=404)
+    if dep["status"] != "pending_review":
+        return web.json_response({"error": f"Ya estaba en estado '{dep['status']}'"}, status=409)
+
+    sent = dep.get("sent_amount_cup")
+    if not force and sent is not None and dep.get("amount_cup") and sent != dep["amount_cup"]:
+        return web.json_response({
+            "mismatch": True,
+            "sent_amount_cup": sent,
+            "amount_cup": dep["amount_cup"],
+            "message": f"El cliente dijo haber mandado {sent} CUP, pero se pidieron {dep['amount_cup']} CUP.",
+        }, status=409)
+
+    new_balance = await db.credit_balance(
+        dep["user_id"], dep["amount_usd"], reason=f"Depósito manual aprobado id={dep_id}", origin="cup",
+    )
+    await db.set_manual_deposit_status(dep_id, "approved", reviewed_by=request["admin_user_id"])
+
+    await handlers._safe_send(
+        bot, dep["user_id"],
+        handlers.MSG_MANUAL_DEPOSIT_APPROVED.format(
+            amount_usd  = handlers.format_amount(dep["amount_usd"], "USD"),
+            amount_cup  = f"{dep['amount_cup']:,}".replace(",", " "),
+            new_balance = handlers.format_amount(new_balance, "USD"),
+        ),
+    )
+
+    exposure = await db.get_cup_exposure()
+    if exposure["total_usd"] >= config.MANUAL_DEPOSIT_CUP_EXPOSURE_ALERT_USD:
+        cup_str = f"{exposure['total_cup']:,}".replace(",", " ")
+        await handlers._notify_admin(
+            bot,
+            f"🚨 <b>Exposición CUP sobre el umbral</b>\n"
+            f"{exposure['count']} depósito(s) sin convertir · "
+            f"{cup_str} CUP ≈ {handlers.format_amount(exposure['total_usd'], 'USD')}\n"
+            f"Revisa con /exposicion_cup.",
+        )
+
+    return web.json_response({"ok": True})
+
+
+async def _api_reject_manual_deposit(request: web.Request) -> web.Response:
+    dep_id = int(request.match_info["dep_id"])
+    bot = request.app["bot"]
+
+    dep = await db.get_manual_deposit_by_id(dep_id)
+    if not dep:
+        return web.json_response({"error": "No encontrado"}, status=404)
+    if dep["status"] != "pending_review":
+        return web.json_response({"error": f"Ya estaba en estado '{dep['status']}'"}, status=409)
+
+    await db.set_manual_deposit_status(dep_id, "rejected", reviewed_by=request["admin_user_id"])
+    await handlers._safe_send(
+        bot, dep["user_id"],
+        handlers.MSG_MANUAL_DEPOSIT_REJECTED.format(reference_code=dep["reference_code"]),
+    )
+    return web.json_response({"ok": True})
+
+
+async def _api_approve_manual_withdrawal(request: web.Request) -> web.Response:
+    wd_id = int(request.match_info["wd_id"])
+    bot = request.app["bot"]
+
+    wd = await db.get_manual_withdrawal_by_id(wd_id)
+    if not wd:
+        return web.json_response({"error": "No encontrado"}, status=404)
+    if wd["status"] != "pending_review":
+        return web.json_response({"error": f"Ya estaba en estado '{wd['status']}'"}, status=409)
+
+    await db.set_manual_withdrawal_status(wd_id, "approved", reviewed_by=request["admin_user_id"])
+    await handlers._safe_send(
+        bot, wd["user_id"],
+        handlers.MSG_CUP_WITHDRAW_APPROVED.format(
+            reference_code = wd["reference_code"],
+            amount_cup     = f"{wd['amount_cup']:,}".replace(",", " "),
+        ),
+    )
+    method_label = wd.get("method_name") or wd.get("method") or "un método CUP"
+    user = await db.get_user(wd["user_id"])
+    await handlers._post_channel_withdrawal_cup(bot, user, wd["amount_usd"], method_label)
+    return web.json_response({"ok": True})
+
+
+async def _api_reject_manual_withdrawal(request: web.Request) -> web.Response:
+    wd_id = int(request.match_info["wd_id"])
+    bot = request.app["bot"]
+
+    wd = await db.get_manual_withdrawal_by_id(wd_id)
+    if not wd:
+        return web.json_response({"error": "No encontrado"}, status=404)
+    if wd["status"] != "pending_review":
+        return web.json_response({"error": f"Ya estaba en estado '{wd['status']}'"}, status=409)
+
+    # Se había descontado el saldo CUP al confirmar (buena fe) -> revertir
+    # siempre primero, igual que hace handlers.cb_admin_reject_cup_withdrawal.
+    await db.credit_balance(
+        wd["user_id"], wd["amount_usd"], reason=f"Reversión retiro CUP rechazado wd={wd_id}", origin="cup",
+    )
+    await db.set_manual_withdrawal_status(wd_id, "rejected", reviewed_by=request["admin_user_id"])
+    await handlers._safe_send(
+        bot, wd["user_id"],
+        handlers.MSG_CUP_WITHDRAW_REJECTED.format(
+            reference_code = wd["reference_code"],
+            amount_usd     = handlers.format_amount(wd["amount_usd"], "USD"),
+        ),
+    )
+    return web.json_response({"ok": True})
+
+
+def setup_admin_dashboard(app: web.Application, bot) -> None:
     """Llamar una vez desde main.py, pasándole el mismo `app` de aiohttp
-    que ya usa el webhook del bot."""
+    que ya usa el webhook del bot, y la instancia de `bot` (la necesitan
+    las acciones de aprobar/rechazar para poder avisarle al usuario)."""
+    app["bot"] = bot
     app.middlewares.append(_require_admin_session)
     app.router.add_get("/admin/login", _login_page)
     app.router.add_get("/admin/auth/telegram", _auth_telegram)
@@ -267,4 +442,10 @@ def setup_admin_dashboard(app: web.Application) -> None:
     app.router.add_get("/admin/api/manual_withdrawals", _api_manual_withdrawals)
     app.router.add_get("/admin/api/refunds", _api_refunds)
     app.router.add_get("/admin/api/errors", _api_errors)
+    app.router.add_get("/admin/api/revenue_chart", _api_revenue_chart)
+    app.router.add_get("/admin/api/user/{user_id}", _api_user_history)
+    app.router.add_post("/admin/api/manual_deposits/{dep_id}/approve", _api_approve_manual_deposit)
+    app.router.add_post("/admin/api/manual_deposits/{dep_id}/reject", _api_reject_manual_deposit)
+    app.router.add_post("/admin/api/manual_withdrawals/{wd_id}/approve", _api_approve_manual_withdrawal)
+    app.router.add_post("/admin/api/manual_withdrawals/{wd_id}/reject", _api_reject_manual_withdrawal)
     logger.info("Dashboard de admin montado en /admin")

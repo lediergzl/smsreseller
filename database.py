@@ -1625,7 +1625,10 @@ class Database:
     # Todo lo de acá abajo es de solo lectura -no toca balances ni statuses,
     # a diferencia del resto de la clase. Pensado para admin_dashboard.py.
 
-    async def get_recent_transactions_admin(self, limit: int = 50, status: Optional[str] = None) -> list[dict]:
+    async def get_recent_transactions_admin(
+        self, limit: int = 50, status: Optional[str] = None,
+        days: Optional[int] = None, q: Optional[str] = None,
+    ) -> list[dict]:
         """
         Compras recientes de TODOS los usuarios, con username incluido (a
         diferencia de get_recent_sales, que solo trae 'completed'; acá se
@@ -1633,40 +1636,57 @@ class Database:
         dashboard). JOIN con users vía LEFT JOIN: si por algún motivo el
         usuario no está en `users` (no debería pasar, pero no confiamos
         ciegamente), igual se devuelve la fila en vez de perderla.
+
+        `days`: solo filas de los últimos N días (None = sin límite).
+        `q`: busca por @username (parcial, insensible a mayúsculas) o por
+        user_id exacto -lo que escriba el admin en el buscador del panel.
         """
         sql = """
         SELECT t.*, u.username, u.first_name
         FROM transactions t
         LEFT JOIN users u ON u.user_id = t.user_id
+        WHERE 1=1
         """
         params: list = []
         if status:
             params.append(status)
-            sql += f" WHERE t.status = ${len(params)}"
+            sql += f" AND t.status = ${len(params)}"
+        if days is not None:
+            params.append(datetime.utcnow() - timedelta(days=int(days)))
+            sql += f" AND t.created_at >= ${len(params)}"
+        if q:
+            params.append(f"%{q}%")
+            idx = len(params)
+            sql += f" AND (u.username ILIKE ${idx} OR t.user_id::text = trim(both '%' from ${idx}))"
         params.append(limit)
         sql += f" ORDER BY t.created_at DESC LIMIT ${len(params)}"
         async with self._conn() as conn:
             rows = await conn.fetch(sql, *params)
             return [dict(r) for r in rows]
 
-    async def get_recent_ledger_admin(self, limit: int = 50) -> list[dict]:
+    async def get_recent_ledger_admin(self, limit: int = 50, days: Optional[int] = None, q: Optional[str] = None) -> list[dict]:
         """
         Feed combinado de TODOS los movimientos de saldo (acreditaciones y
         débitos): comisiones de referidos, reembolsos, retiros, pagos con
         saldo. Es la fuente de verdad única de balance_ledger, con username
         para mostrar "quién" sin otro join en el frontend.
         """
-        sql = """
-        SELECT bl.*, u.username, u.first_name
-        FROM balance_ledger bl
-        LEFT JOIN users u ON u.user_id = bl.user_id
-        ORDER BY bl.created_at DESC LIMIT $1
-        """
+        sql = "SELECT bl.*, u.username, u.first_name FROM balance_ledger bl LEFT JOIN users u ON u.user_id = bl.user_id WHERE 1=1"
+        params: list = []
+        if days is not None:
+            params.append(datetime.utcnow() - timedelta(days=int(days)))
+            sql += f" AND bl.created_at >= ${len(params)}"
+        if q:
+            params.append(f"%{q}%")
+            idx = len(params)
+            sql += f" AND (u.username ILIKE ${idx} OR bl.user_id::text = trim(both '%' from ${idx}))"
+        params.append(limit)
+        sql += f" ORDER BY bl.created_at DESC LIMIT ${len(params)}"
         async with self._conn() as conn:
-            rows = await conn.fetch(sql, limit)
+            rows = await conn.fetch(sql, *params)
             return [dict(r) for r in rows]
 
-    async def get_recent_referrals_admin(self, limit: int = 50) -> list[dict]:
+    async def get_recent_referrals_admin(self, limit: int = 50, days: Optional[int] = None, q: Optional[str] = None) -> list[dict]:
         """Referidos recientes con username de referrer y referido (dos JOIN separados)."""
         sql = """
         SELECT r.*,
@@ -1675,32 +1695,56 @@ class Database:
         FROM referrals r
         LEFT JOIN users ur ON ur.user_id = r.referrer_id
         LEFT JOIN users uf ON uf.user_id = r.referred_id
-        ORDER BY r.created_at DESC LIMIT $1
+        WHERE 1=1
         """
+        params: list = []
+        if days is not None:
+            params.append(datetime.utcnow() - timedelta(days=int(days)))
+            sql += f" AND r.created_at >= ${len(params)}"
+        if q:
+            params.append(f"%{q}%")
+            idx = len(params)
+            sql += (
+                f" AND (ur.username ILIKE ${idx} OR uf.username ILIKE ${idx} "
+                f"OR r.referrer_id::text = trim(both '%' from ${idx}) "
+                f"OR r.referred_id::text = trim(both '%' from ${idx}))"
+            )
+        params.append(limit)
+        sql += f" ORDER BY r.created_at DESC LIMIT ${len(params)}"
         async with self._conn() as conn:
-            rows = await conn.fetch(sql, limit)
+            rows = await conn.fetch(sql, *params)
             return [dict(r) for r in rows]
 
-    async def get_recent_manual_deposits_admin(self, limit: int = 50) -> list[dict]:
-        sql = """
-        SELECT d.*, u.username, u.first_name
-        FROM manual_deposits d
-        LEFT JOIN users u ON u.user_id = d.user_id
-        ORDER BY d.created_at DESC LIMIT $1
-        """
+    async def get_recent_manual_deposits_admin(self, limit: int = 50, days: Optional[int] = None, q: Optional[str] = None) -> list[dict]:
+        sql = "SELECT d.*, u.username, u.first_name FROM manual_deposits d LEFT JOIN users u ON u.user_id = d.user_id WHERE 1=1"
+        params: list = []
+        if days is not None:
+            params.append(datetime.utcnow() - timedelta(days=int(days)))
+            sql += f" AND d.created_at >= ${len(params)}"
+        if q:
+            params.append(f"%{q}%")
+            idx = len(params)
+            sql += f" AND (u.username ILIKE ${idx} OR d.user_id::text = trim(both '%' from ${idx}))"
+        params.append(limit)
+        sql += f" ORDER BY d.created_at DESC LIMIT ${len(params)}"
         async with self._conn() as conn:
-            rows = await conn.fetch(sql, limit)
+            rows = await conn.fetch(sql, *params)
             return [dict(r) for r in rows]
 
-    async def get_recent_manual_withdrawals_admin(self, limit: int = 50) -> list[dict]:
-        sql = """
-        SELECT w.*, u.username, u.first_name
-        FROM manual_withdrawals w
-        LEFT JOIN users u ON u.user_id = w.user_id
-        ORDER BY w.created_at DESC LIMIT $1
-        """
+    async def get_recent_manual_withdrawals_admin(self, limit: int = 50, days: Optional[int] = None, q: Optional[str] = None) -> list[dict]:
+        sql = "SELECT w.*, u.username, u.first_name FROM manual_withdrawals w LEFT JOIN users u ON u.user_id = w.user_id WHERE 1=1"
+        params: list = []
+        if days is not None:
+            params.append(datetime.utcnow() - timedelta(days=int(days)))
+            sql += f" AND w.created_at >= ${len(params)}"
+        if q:
+            params.append(f"%{q}%")
+            idx = len(params)
+            sql += f" AND (u.username ILIKE ${idx} OR w.user_id::text = trim(both '%' from ${idx}))"
+        params.append(limit)
+        sql += f" ORDER BY w.created_at DESC LIMIT ${len(params)}"
         async with self._conn() as conn:
-            rows = await conn.fetch(sql, limit)
+            rows = await conn.fetch(sql, *params)
             return [dict(r) for r in rows]
 
     async def get_recent_refund_requests_admin(self, limit: int = 50) -> list[dict]:
@@ -1715,27 +1759,101 @@ class Database:
             rows = await conn.fetch(sql, limit)
             return [dict(r) for r in rows]
 
-    async def get_recent_errors_admin(self, limit: int = 50) -> list[dict]:
+    async def get_recent_errors_admin(self, limit: int = 50, days: Optional[int] = None) -> list[dict]:
         """
         Todo lo que representa un problema real a revisar: compras en
         estado 'error', y solicitudes de reembolso todavía sin resolver.
         Se combinan y ordenan por fecha para un único feed de "cosas que
         necesitan tu atención".
         """
-        sql = """
+        date_filter_tx = ""
+        date_filter_rr = ""
+        params: list = []
+        if days is not None:
+            params.append(datetime.utcnow() - timedelta(days=int(days)))
+            date_filter_tx = f" AND t.updated_at >= ${len(params)}"
+            date_filter_rr = f" AND rr.created_at >= ${len(params)}"
+        sql = f"""
         (SELECT 'transaction_error' AS kind, t.id, t.user_id, u.username,
                 t.service_name AS detail, t.amount_usd, t.updated_at AS at
          FROM transactions t LEFT JOIN users u ON u.user_id = t.user_id
-         WHERE t.status = 'error')
+         WHERE t.status = 'error'{date_filter_tx})
         UNION ALL
         (SELECT 'refund_pending' AS kind, rr.id, rr.user_id, u.username,
                 rr.reason AS detail, NULL AS amount_usd, rr.created_at AS at
          FROM refund_requests rr LEFT JOIN users u ON u.user_id = rr.user_id
-         WHERE rr.status = 'requested')
-        ORDER BY at DESC LIMIT $1
+         WHERE rr.status = 'requested'{date_filter_rr})
+        ORDER BY at DESC LIMIT ${len(params) + 1}
+        """
+        params.append(limit)
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, *params)
+            return [dict(r) for r in rows]
+
+    async def get_user_history_admin(self, user_id: int, limit: int = 30) -> dict:
+        """
+        Toda la actividad de UN usuario en un solo lugar, para la ficha de
+        usuario del dashboard (click en un @username). Junta lo que hoy
+        vive repartido en 5 tablas distintas.
         """
         async with self._conn() as conn:
-            rows = await conn.fetch(sql, limit)
+            user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+            balance = await conn.fetchrow("SELECT * FROM balances WHERE user_id = $1", user_id)
+            transactions = await conn.fetch(
+                "SELECT * FROM transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+                user_id, limit,
+            )
+            manual_deposits = await conn.fetch(
+                "SELECT * FROM manual_deposits WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+                user_id, limit,
+            )
+            manual_withdrawals = await conn.fetch(
+                "SELECT * FROM manual_withdrawals WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+                user_id, limit,
+            )
+            deposits = await conn.fetch(
+                "SELECT * FROM deposits WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+                user_id, limit,
+            )
+            ledger = await conn.fetch(
+                "SELECT * FROM balance_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+                user_id, limit,
+            )
+            referrals_made = await conn.fetch(
+                "SELECT r.*, u.username AS referred_username FROM referrals r "
+                "LEFT JOIN users u ON u.user_id = r.referred_id "
+                "WHERE r.referrer_id = $1 ORDER BY r.created_at DESC LIMIT $2",
+                user_id, limit,
+            )
+            referred_by = await conn.fetchrow(
+                "SELECT r.*, u.username AS referrer_username FROM referrals r "
+                "LEFT JOIN users u ON u.user_id = r.referrer_id "
+                "WHERE r.referred_id = $1 LIMIT 1",
+                user_id,
+            )
+        return {
+            "user":               dict(user) if user else None,
+            "balance":            dict(balance) if balance else None,
+            "transactions":       [dict(r) for r in transactions],
+            "manual_deposits":    [dict(r) for r in manual_deposits],
+            "manual_withdrawals": [dict(r) for r in manual_withdrawals],
+            "deposits":           [dict(r) for r in deposits],
+            "ledger":             [dict(r) for r in ledger],
+            "referrals_made":     [dict(r) for r in referrals_made],
+            "referred_by":        dict(referred_by) if referred_by else None,
+        }
+
+    async def get_daily_revenue_admin(self, days: int = 14) -> list[dict]:
+        """Ingresos por día (solo compras 'completed'), para el gráfico de arriba del dashboard."""
+        sql = """
+        SELECT DATE(updated_at) AS day, COALESCE(SUM(amount_usd), 0) AS revenue_usd, COUNT(*) AS orders
+        FROM transactions
+        WHERE status = 'completed' AND updated_at >= $1
+        GROUP BY DATE(updated_at)
+        ORDER BY day ASC
+        """
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, datetime.utcnow() - timedelta(days=days))
             return [dict(r) for r in rows]
 
     async def get_dashboard_summary(self) -> dict:

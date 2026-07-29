@@ -327,7 +327,7 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
     # servidor HTTP corriendo, así que el dashboard simplemente no está
     # disponible en ese modo -si en algún momento lo necesitás también en
     # polling, avisá y se le agrega un aiohttp.web.Application aparte ahí.
-    setup_admin_dashboard(app)
+    setup_admin_dashboard(app, bot)
 
     SimpleRequestHandler(
         dispatcher=dp, bot=bot, secret_token=config.WEBHOOK_SECRET or None,
