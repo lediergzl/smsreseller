@@ -29,7 +29,7 @@
 
   .cards {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-    gap: 14px; padding: 20px 28px;
+    gap: 14px; padding: 20px 28px 0;
   }
   .card {
     background: var(--panel); border: 1px solid var(--border);
@@ -41,9 +41,18 @@
   .card.err .value { color: var(--err); }
   .card.ok .value { color: var(--ok); }
 
+  .chart-wrap {
+    margin: 20px 28px 0; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px;
+  }
+  .chart-wrap .title { color: var(--muted); font-size: .8rem; margin-bottom: 10px; }
+  #revenueChart { width: 100%; height: 90px; display: block; }
+  #revenueChart .bar { fill: var(--accent); }
+  #revenueChart .bar:hover { fill: #7ba3ff; }
+
   nav.tabs {
     display: flex; gap: 4px; padding: 0 28px; border-bottom: 1px solid var(--border);
-    overflow-x: auto;
+    overflow-x: auto; margin-top: 16px;
   }
   nav.tabs button {
     background: none; border: none; color: var(--muted); padding: 12px 16px;
@@ -51,20 +60,37 @@
     white-space: nowrap;
   }
   nav.tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+  nav.tabs button .count {
+    display: inline-block; margin-left: 6px; background: var(--warn); color: #1a1300;
+    border-radius: 999px; padding: 1px 7px; font-size: .72rem; font-weight: 700;
+  }
 
-  main { padding: 20px 28px; }
+  .toolbar {
+    display: flex; gap: 10px; align-items: center; padding: 16px 28px 0; flex-wrap: wrap;
+  }
+  .toolbar input, .toolbar select {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 12px; border-radius: 8px; font-size: .85rem;
+  }
+  .toolbar input { min-width: 220px; }
+  .toolbar input:focus, .toolbar select:focus { outline: 1px solid var(--accent); }
+
+  main { padding: 16px 28px 40px; }
   table { width: 100%; border-collapse: collapse; font-size: .85rem; }
   th, td {
     text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border);
     white-space: nowrap;
   }
   th { color: var(--muted); font-weight: 500; font-size: .78rem; text-transform: uppercase; }
+  tbody tr { cursor: pointer; }
   tbody tr:hover { background: var(--panel-2); }
   .empty { color: var(--muted); padding: 40px; text-align: center; }
+  .user-link { color: var(--accent); cursor: pointer; }
+  .user-link:hover { text-decoration: underline; }
 
   .badge {
     display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: .75rem;
-    background: rgba(139,147,161,.15); color: var(--muted); /* respaldo genérico */
+    background: rgba(139,147,161,.15); color: var(--muted);
   }
   .badge.completed, .badge.approved, .badge.released { background: rgba(62,207,142,.15); color: var(--ok); }
   .badge.pending, .badge.pending_review, .badge.awaiting_proof, .badge.requested,
@@ -74,6 +100,33 @@
 
   .amt { font-variant-numeric: tabular-nums; }
   .muted { color: var(--muted); }
+
+  .actions button {
+    font-size: .78rem; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text); cursor: pointer; margin-right: 6px;
+  }
+  .actions button.approve { border-color: var(--ok); color: var(--ok); }
+  .actions button.approve:hover { background: rgba(62,207,142,.15); }
+  .actions button.reject { border-color: var(--err); color: var(--err); }
+  .actions button.reject:hover { background: rgba(245,87,108,.15); }
+
+  .overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none;
+    align-items: flex-start; justify-content: center; padding: 40px 20px; z-index: 50; overflow-y: auto;
+  }
+  .overlay.open { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    max-width: 720px; width: 100%; padding: 24px;
+  }
+  .modal h2 { margin: 0 0 4px; font-size: 1.05rem; }
+  .modal .sub { color: var(--muted); font-size: .82rem; margin-bottom: 16px; }
+  .modal .close { float: right; cursor: pointer; color: var(--muted); font-size: 1.2rem; }
+  .kv { display: grid; grid-template-columns: 160px 1fr; gap: 6px 12px; font-size: .85rem; margin-bottom: 18px; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  .modal h3 { font-size: .8rem; text-transform: uppercase; color: var(--muted); margin: 18px 0 8px; }
+  .mini-table { width: 100%; font-size: .8rem; border-collapse: collapse; }
+  .mini-table td, .mini-table th { padding: 6px 8px; border-bottom: 1px solid var(--border); }
 </style>
 </head>
 <body>
@@ -85,6 +138,11 @@
 
 <div class="cards" id="cards"></div>
 
+<div class="chart-wrap">
+  <div class="title">Ingresos por día (últimos 14 días)</div>
+  <svg id="revenueChart" viewBox="0 0 700 90" preserveAspectRatio="none"></svg>
+</div>
+
 <nav class="tabs" id="tabs">
   <button data-tab="transactions" class="active">Compras</button>
   <button data-tab="manual_deposits">Depósitos</button>
@@ -94,13 +152,45 @@
   <button data-tab="errors">Errores</button>
 </nav>
 
+<div class="toolbar">
+  <input id="searchBox" type="text" placeholder="Buscar por @usuario o ID...">
+  <select id="dateFilter">
+    <option value="1">Hoy</option>
+    <option value="7">Últimos 7 días</option>
+    <option value="30" selected>Últimos 30 días</option>
+    <option value="all">Todo</option>
+  </select>
+</div>
+
 <main id="main"></main>
+
+<div class="overlay" id="detailOverlay">
+  <div class="modal">
+    <span class="close" onclick="closeModal('detailOverlay')">✕</span>
+    <h2 id="detailTitle">Detalle</h2>
+    <div class="sub" id="detailSub"></div>
+    <div class="kv" id="detailKv"></div>
+  </div>
+</div>
+
+<div class="overlay" id="userOverlay">
+  <div class="modal">
+    <span class="close" onclick="closeModal('userOverlay')">✕</span>
+    <h2 id="userTitle">Usuario</h2>
+    <div class="sub" id="userSub"></div>
+    <div id="userBody"></div>
+  </div>
+</div>
 
 <script>
 const fmtMoney = (n) => n == null ? "—" : "$" + Number(n).toFixed(2);
 const fmtDate = (s) => s ? new Date(s).toLocaleString("es", {dateStyle:"short", timeStyle:"short"}) : "—";
 const who = (row) => row.username ? "@" + row.username : (row.first_name || ("#" + row.user_id));
 const badge = (status) => `<span class="badge ${status}">${status || "—"}</span>`;
+const userLink = (row) => `<span class="user-link" data-uid="${row.user_id}">${who(row)}</span>`;
+
+function openModal(id) { document.getElementById(id).classList.add("open"); }
+function closeModal(id) { document.getElementById(id).classList.remove("open"); }
 
 const CARD_DEFS = [
   { key: "pending_purchases",         label: "Compras en curso" },
@@ -112,48 +202,79 @@ const CARD_DEFS = [
   { key: "users_total",                label: "Usuarios totales" },
 ];
 
+const TAB_COUNT_KEY = {
+  transactions: "pending_purchases",
+  manual_deposits: "pending_manual_deposits",
+  manual_withdrawals: "pending_manual_withdrawals",
+  errors: "errors_today",
+};
+
+function actionButtons(kind, row) {
+  if (row.status !== "pending_review") return "—";
+  if (kind === "manual_deposits") {
+    return `<div class="actions">
+      <button class="approve" data-action="approve_dep" data-id="${row.id}">Aprobar</button>
+      <button class="reject" data-action="reject_dep" data-id="${row.id}">Rechazar</button>
+    </div>`;
+  }
+  return `<div class="actions">
+    <button class="approve" data-action="approve_wd" data-id="${row.id}">Aprobar</button>
+    <button class="reject" data-action="reject_wd" data-id="${row.id}">Rechazar</button>
+  </div>`;
+}
+
 const COLUMNS = {
   transactions: {
     endpoint: "transactions",
     cols: ["Usuario","Servicio","País","Monto","Estado","Teléfono","Fecha"],
-    row: (r) => [who(r), r.service_name || r.service, r.country_name || r.country,
+    row: (r) => [userLink(r), r.service_name || r.service, r.country_name || r.country,
                  fmtMoney(r.amount_usd), badge(r.status), r.phone_number || "—", fmtDate(r.created_at)],
   },
   manual_deposits: {
     endpoint: "manual_deposits",
-    cols: ["Usuario","Método","Monto USD","Monto CUP","Estado","Código","Fecha"],
-    row: (r) => [who(r), r.method, fmtMoney(r.amount_usd), r.amount_cup ?? "—",
-                 badge(r.status), r.reference_code || "—", fmtDate(r.created_at)],
+    cols: ["Usuario","Método","Monto USD","Monto CUP","Estado","Código","Fecha","Acción"],
+    row: (r) => [userLink(r), r.method, fmtMoney(r.amount_usd), r.amount_cup ?? "—",
+                 badge(r.status), r.reference_code || "—", fmtDate(r.created_at), actionButtons("manual_deposits", r)],
   },
   manual_withdrawals: {
     endpoint: "manual_withdrawals",
-    cols: ["Usuario","Método","Monto USD","Monto CUP","Estado","Código","Fecha"],
-    row: (r) => [who(r), r.method, fmtMoney(r.amount_usd), r.amount_cup ?? "—",
-                 badge(r.status), r.reference_code || "—", fmtDate(r.created_at)],
+    cols: ["Usuario","Método","Monto USD","Monto CUP","Estado","Código","Fecha","Acción"],
+    row: (r) => [userLink(r), r.method, fmtMoney(r.amount_usd), r.amount_cup ?? "—",
+                 badge(r.status), r.reference_code || "—", fmtDate(r.created_at), actionButtons("manual_withdrawals", r)],
   },
   ledger: {
     endpoint: "ledger",
     cols: ["Usuario","Monto","Origen","Motivo","Fecha"],
-    row: (r) => [who(r),
+    row: (r) => [userLink(r),
                  `<span class="amt" style="color:${r.delta_usd >= 0 ? 'var(--ok)' : 'var(--err)'}">${r.delta_usd >= 0 ? "+" : ""}${fmtMoney(r.delta_usd)}</span>`,
                  r.origin, r.reason || "—", fmtDate(r.created_at)],
   },
   referrals: {
     endpoint: "referrals",
     cols: ["Referente","Referido","Comisión","Estado","Fecha"],
-    row: (r) => [r.referrer_username ? "@"+r.referrer_username : "#"+r.referrer_id,
-                 r.referred_username ? "@"+r.referred_username : "#"+r.referred_id,
+    row: (r) => [`<span class="user-link" data-uid="${r.referrer_id}">${r.referrer_username ? "@"+r.referrer_username : "#"+r.referrer_id}</span>`,
+                 `<span class="user-link" data-uid="${r.referred_id}">${r.referred_username ? "@"+r.referred_username : "#"+r.referred_id}</span>`,
                  fmtMoney(r.bonus_usd), badge(r.status), fmtDate(r.created_at)],
   },
   errors: {
     endpoint: "errors",
     cols: ["Tipo","Usuario","Detalle","Monto","Fecha"],
     row: (r) => [r.kind === "transaction_error" ? "❌ Compra fallida" : "↩️ Reembolso pendiente",
-                 who(r), r.detail || "—", fmtMoney(r.amount_usd), fmtDate(r.at)],
+                 userLink(r), r.detail || "—", fmtMoney(r.amount_usd), fmtDate(r.at)],
   },
 };
 
 let currentTab = "transactions";
+let lastRows = [];
+
+function currentParams() {
+  const days = document.getElementById("dateFilter").value;
+  const q = document.getElementById("searchBox").value.trim();
+  const params = new URLSearchParams({ limit: 50 });
+  if (days !== "all") params.set("days", days);
+  if (q) params.set("q", q);
+  return params;
+}
 
 async function loadCards() {
   const res = await fetch("/admin/api/summary");
@@ -164,32 +285,157 @@ async function loadCards() {
       <div class="value">${c.money ? fmtMoney(data[c.key]) : (data[c.key] ?? "—")}</div>
       <div class="label">${c.label}</div>
     </div>`).join("");
+
+  document.querySelectorAll("nav.tabs button").forEach(btn => {
+    const key = TAB_COUNT_KEY[btn.dataset.tab];
+    const n = key ? data[key] : null;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent.trim();
+    btn.innerHTML = btn.dataset.label + (n ? ` <span class="count">${n}</span>` : "");
+  });
+}
+
+async function loadChart() {
+  const res = await fetch("/admin/api/revenue_chart?days=14");
+  if (res.status === 401) return;
+  const data = await res.json();
+  const svg = document.getElementById("revenueChart");
+  if (!data.length) { svg.innerHTML = ""; return; }
+  const max = Math.max(...data.map(d => Number(d.revenue_usd)), 1);
+  const w = 700, h = 90, gap = 4;
+  const barW = (w / data.length) - gap;
+  svg.innerHTML = data.map((d, i) => {
+    const barH = Math.max(2, (Number(d.revenue_usd) / max) * (h - 14));
+    const x = i * (barW + gap);
+    const y = h - barH;
+    const label = new Date(d.day).toLocaleDateString("es", {day:"2-digit", month:"2-digit"});
+    return `<rect class="bar" x="${x}" y="${y}" width="${barW}" height="${barH}" rx="2">
+      <title>${label}: ${fmtMoney(d.revenue_usd)} (${d.orders} órdenes)</title>
+    </rect>`;
+  }).join("");
 }
 
 async function loadTab(tab) {
   const def = COLUMNS[tab];
-  const res = await fetch(`/admin/api/${def.endpoint}?limit=50`);
+  const params = currentParams();
+  const res = await fetch(`/admin/api/${def.endpoint}?${params.toString()}`);
   if (res.status === 401) { location.href = "/admin/login"; return; }
   const rows = await res.json();
+  lastRows = rows;
   const main = document.getElementById("main");
   if (!rows.length) {
     main.innerHTML = `<div class="empty">Sin datos todavía.</div>`;
     return;
   }
   main.innerHTML = `<table><thead><tr>${def.cols.map(c => `<th>${c}</th>`).join("")}</tr></thead>
-    <tbody>${rows.map(r => `<tr>${def.row(r).map(c => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+    <tbody>${rows.map((r, idx) => `<tr data-idx="${idx}">${def.row(r).map(c => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
 }
 
+document.getElementById("main").addEventListener("click", (e) => {
+  if (e.target.closest("button") || e.target.classList.contains("user-link")) return;
+  const tr = e.target.closest("tr[data-idx]");
+  if (!tr) return;
+  const row = lastRows[Number(tr.dataset.idx)];
+  showDetail(row);
+});
+
+function showDetail(row) {
+  document.getElementById("detailTitle").textContent = who(row) + (row.id ? ` · #${row.id}` : "");
+  document.getElementById("detailSub").textContent = currentTab;
+  const kv = Object.entries(row).filter(([k]) => !["username","first_name"].includes(k))
+    .map(([k, v]) => `<div>${k}</div><div>${v == null ? "—" : (k.includes("_at") || k === "at" ? fmtDate(v) : v)}</div>`).join("");
+  document.getElementById("detailKv").innerHTML = kv;
+  openModal("detailOverlay");
+}
+
+document.addEventListener("click", async (e) => {
+  const link = e.target.closest(".user-link");
+  if (!link) return;
+  const uid = link.dataset.uid;
+  const res = await fetch(`/admin/api/user/${uid}`);
+  if (res.status === 401) { location.href = "/admin/login"; return; }
+  const data = await res.json();
+  renderUserProfile(uid, data);
+  openModal("userOverlay");
+});
+
+function renderUserProfile(uid, data) {
+  const u = data.user || {};
+  document.getElementById("userTitle").textContent = u.username ? "@" + u.username : `Usuario #${uid}`;
+  document.getElementById("userSub").textContent =
+    (data.balance ? `Saldo: ${fmtMoney(data.balance.amount_usd)}` : "") +
+    (data.referred_by ? ` · Referido por ${data.referred_by.referrer_username ? "@"+data.referred_by.referrer_username : "#"+data.referred_by.referrer_id}` : "");
+
+  const section = (title, rows, cols, mapRow) => {
+    if (!rows || !rows.length) return `<h3>${title}</h3><div class="muted" style="font-size:.85rem">Sin registros.</div>`;
+    return `<h3>${title} (${rows.length})</h3><table class="mini-table"><thead><tr>${cols.map(c=>`<th>${c}</th>`).join("")}</tr></thead>
+      <tbody>${rows.map(r => `<tr>${mapRow(r).map(c=>`<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+  };
+
+  document.getElementById("userBody").innerHTML =
+    section("Compras", data.transactions, ["Servicio","Monto","Estado","Fecha"],
+      r => [r.service_name || r.service, fmtMoney(r.amount_usd), badge(r.status), fmtDate(r.created_at)]) +
+    section("Depósitos manuales", data.manual_deposits, ["Monto","Estado","Fecha"],
+      r => [fmtMoney(r.amount_usd), badge(r.status), fmtDate(r.created_at)]) +
+    section("Retiros manuales", data.manual_withdrawals, ["Monto","Estado","Fecha"],
+      r => [fmtMoney(r.amount_usd), badge(r.status), fmtDate(r.created_at)]) +
+    section("Acreditaciones", data.ledger, ["Monto","Origen","Motivo","Fecha"],
+      r => [`<span style="color:${r.delta_usd>=0?'var(--ok)':'var(--err)'}">${r.delta_usd>=0?"+":""}${fmtMoney(r.delta_usd)}</span>`, r.origin, r.reason||"—", fmtDate(r.created_at)]) +
+    section("Referidos hechos", data.referrals_made, ["Referido","Comisión","Estado","Fecha"],
+      r => [r.referred_username ? "@"+r.referred_username : "#"+r.referred_id, fmtMoney(r.bonus_usd), badge(r.status), fmtDate(r.created_at)]);
+}
+
+document.getElementById("main").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-action]");
+  if (!btn) return;
+  e.stopPropagation();
+  const { action, id } = btn.dataset;
+  const map = {
+    approve_dep: `/admin/api/manual_deposits/${id}/approve`,
+    reject_dep:  `/admin/api/manual_deposits/${id}/reject`,
+    approve_wd:  `/admin/api/manual_withdrawals/${id}/approve`,
+    reject_wd:   `/admin/api/manual_withdrawals/${id}/reject`,
+  };
+  if (action.startsWith("reject") && !confirm("¿Seguro que querés rechazar esto?")) return;
+
+  btn.disabled = true;
+  const res = await fetch(map[action], { method: "POST" });
+  const body = await res.json();
+
+  if (res.status === 409 && body.mismatch) {
+    if (confirm(body.message + "\n\n¿Aprobar de todas formas?")) {
+      await fetch(map[action] + "?force=1", { method: "POST" });
+      refresh();
+    } else {
+      btn.disabled = false;
+    }
+    return;
+  }
+  if (!res.ok) {
+    alert(body.error || "Ocurrió un error.");
+    btn.disabled = false;
+    return;
+  }
+  refresh();
+});
+
 document.getElementById("tabs").addEventListener("click", (e) => {
-  if (e.target.tagName !== "BUTTON") return;
+  const btn = e.target.closest("button");
+  if (!btn) return;
   document.querySelectorAll("nav.tabs button").forEach(b => b.classList.remove("active"));
-  e.target.classList.add("active");
-  currentTab = e.target.dataset.tab;
+  btn.classList.add("active");
+  currentTab = btn.dataset.tab;
   loadTab(currentTab);
 });
 
+let searchDebounce;
+document.getElementById("searchBox").addEventListener("input", () => {
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(() => loadTab(currentTab), 350);
+});
+document.getElementById("dateFilter").addEventListener("change", () => loadTab(currentTab));
+
 async function refresh() {
-  await Promise.all([loadCards(), loadTab(currentTab)]);
+  await Promise.all([loadCards(), loadChart(), loadTab(currentTab)]);
 }
 refresh();
 setInterval(refresh, 5000);
