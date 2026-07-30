@@ -2255,15 +2255,101 @@ async def cb_select_country(call: CallbackQuery, state: FSMContext):
         amount_usd   = price_usd,
     )
 
+    # RESERVAR EL NÚMERO ACÁ, antes de pedir cualquier pago -- no después
+    # (como era antes, dentro de _handle_after_payment). El catálogo que
+    # el usuario vio (hero.get_countries) ya filtra stock > 0, pero entre
+    # que lo vio y llega a pagar (cripto: hasta PAYMENT_TIMEOUT_SECONDS;
+    # CUP manual: lo que tarde el admin en aprobar el comprobante) ese
+    # stock puede agotarse. El usuario pagaba, esperaba, y RECIÉN ahí se
+    # enteraba de que no había número -> abandono, no vuelve a intentar.
+    # Pidiendo el número ahora, si falla, el usuario se entera antes de
+    # pagar y sin fricción (ver hero.get_number: NO_NUMBERS no cobra nada
+    # de nuestro lado, y no le costó ni un centavo a él).
+    number_info = await hero.get_number(service_code, country_code)
+
+    if not number_info:
+        await db.set_status(tx_id, "no_stock")
+        await call.message.answer(
+            f"😔 Justo se agotó el stock de <b>{country_name}</b> para "
+            f"<b>{service_name}</b> (no se cobró nada). Elige otro país:",
+            parse_mode="HTML",
+        )
+        # Refrescar el catálogo (el país que acaba de fallar puede seguir
+        # apareciendo si no volvemos a consultar) y mostrar de nuevo.
+        countries = await hero.get_countries(service_code)
+        if not countries:
+            await call.message.answer(
+                f"😔 No quedan países disponibles para <b>{service_name}</b> "
+                "en este momento. Intenta con otro servicio.",
+                parse_mode="HTML",
+                reply_markup=services_keyboard(SERVICES),
+            )
+            await state.clear()
+            return
+        await state.update_data(countries=countries)
+        success_stats = await db.get_country_success_stats(service_code)
+        await call.message.answer(
+            MSG_SELECT_COUNTRY,
+            parse_mode="HTML",
+            reply_markup=countries_keyboard(countries, MARKUP, success_stats),
+        )
+        # Se queda en selecting_country -- el usuario elige de nuevo.
+        return
+
+    activation_id = str(number_info["id"])
+    phone_number  = format_phone(number_info["number"])
+    await db.set_activation(tx_id, activation_id, phone_number)
+
     await state.update_data(
-        country_code = country_code,
-        country_name = country_name,
-        cost_herosms = cost_herosms,
-        price_usd    = price_usd,
-        tx_id        = tx_id,
+        country_code  = country_code,
+        country_name  = country_name,
+        cost_herosms  = cost_herosms,
+        price_usd     = price_usd,
+        tx_id         = tx_id,
+        activation_id = activation_id,
+        phone_number  = phone_number,
+    )
+
+    # Red de seguridad: si el usuario reserva pero nunca llega a elegir un
+    # método de pago (cierra el chat, se distrae, etc.), nadie más iba a
+    # liberar este número -- _poll_payment / la revisión manual de CUP
+    # solo entran en juego DESPUÉS de que se elige método (ver
+    # _release_reservation_if_never_paid). Sin esto, "abandonar antes de
+    # pagar" seguiría dejando el número (y nuestro saldo en HeroSMS)
+    # ocupado indefinidamente.
+    asyncio.create_task(
+        _release_reservation_if_never_paid(
+            bot=call.bot, chat_id=call.message.chat.id, tx_id=tx_id,
+        )
     )
 
     await _quote_and_show_currency_menu(call.message, state, tx_id, call.from_user.id, price_usd)
+
+
+async def _release_reservation_if_never_paid(bot, chat_id: int, tx_id: int):
+    """
+    Cubre el único hueco que _poll_payment/la revisión manual de CUP no
+    vigilan: el usuario reservó un número (ver cb_select_country) pero
+    nunca llegó a elegir NINGÚN método de pago (tx.order_id sigue vacío).
+    Si sí eligió método -cripto o CUP manual-, tx.order_id ya no está
+    vacío y esta función no toca nada: _poll_payment (cripto) o el admin
+    (CUP manual) son quienes deciden qué pasa con esa reserva.
+    """
+    await asyncio.sleep(PAYMENT_TIMEOUT_SECONDS)
+    tx = await db.get_by_id(tx_id)
+    if not tx or tx.get("order_id") or tx["status"] != "pending":
+        return
+    activation_id = tx.get("activation_id")
+    if not activation_id:
+        return
+    await hero.cancel_number(activation_id)
+    await db.set_status(tx_id, "reservation_expired")
+    await _safe_send(
+        bot, chat_id,
+        "⏱️ Tu número reservado expiró porque no llegaste a elegir un "
+        "método de pago a tiempo. No se cobró nada. Usa /start para "
+        "intentar de nuevo.",
+    )
 
 
 async def _quote_and_show_currency_menu(
@@ -2746,6 +2832,7 @@ async def cb_admin_reject_purchase_cup(call: CallbackQuery):
         await _safe_call_answer(call, f"Ya estaba en estado '{tx['status']}'.", show_alert=True)
         return
 
+    await _release_reservation(call.bot, tx_id)
     await db.set_status(tx_id, "error")
     await _safe_call_answer(call, "Rechazado ❌")
     await _mark_admin_message_resolved(call.message, f"\n\n❌ Rechazado por {call.from_user.id}")
@@ -2827,6 +2914,40 @@ async def msg_refund_address(message: Message, state: FSMContext):
     )
 
 
+async def _release_reservation(bot, tx_id: int):
+    """
+    Libera en HeroSMS el número reservado para `tx_id` (recupera el costo a
+    nuestro saldo de HeroSMS) cuando el pago no llegó -timeout o
+    cancelación del usuario-. Respeta el mínimo de ~2 min desde que se
+    reservó el número antes de llamar a hero.cancel_number (mismo motivo y
+    mismo patrón que ya usa cb_cancel más abajo, ver
+    HEROSMS_MIN_CANCEL_WAIT_SECONDS): si todavía no pasó ese mínimo,
+    espera el resto en background en vez de arriesgarse a un rechazo.
+    No hace nada si la tx no tiene número reservado (activation_id vacío).
+    """
+    tx = await db.get_by_id(tx_id)
+    activation_id = tx.get("activation_id") if tx else None
+    if not activation_id:
+        return
+
+    elapsed_since_reserved = _elapsed_seconds(tx["updated_at"])
+    remaining_wait = max(0, HEROSMS_MIN_CANCEL_WAIT_SECONDS - elapsed_since_reserved)
+
+    async def _do_release():
+        if remaining_wait:
+            await asyncio.sleep(remaining_wait)
+        ok = await hero.cancel_number(activation_id)
+        if not ok:
+            if tx2 := await db.get_by_id(tx_id):
+                await _notify_admin(
+                    bot=bot,
+                    text=f"🚨 <b>Liberación de reserva con problemas</b>\n{_tx_summary_line(tx2)}\n"
+                         "• HeroSMS rechazó la cancelación (revisar saldo/costo no recuperado)",
+                )
+
+    asyncio.create_task(_do_release())
+
+
 async def _poll_payment(
     bot, chat_id: int, state: FSMContext, tx_id: int, order_id: str,
     elapsed_start: int = 0,
@@ -2866,6 +2987,7 @@ async def _poll_payment(
             return
 
         if status in (ccpay.ORDER_STATUS_EXPIRED, ccpay.ORDER_STATUS_CANCELLED):
+            await _release_reservation(bot, tx_id)
             await db.set_status(tx_id, "expired")
             await _safe_send(bot, chat_id, MSG_PAYMENT_TIMEOUT)
             if tx := await db.get_by_id(tx_id):
@@ -2877,6 +2999,7 @@ async def _poll_payment(
         logger.debug("Pago pendiente (tx=%s, elapsed=%ds)", tx_id, elapsed)
 
     # Tiempo agotado
+    await _release_reservation(bot, tx_id)
     await db.set_status(tx_id, "expired")
     await _safe_send(bot, chat_id, MSG_PAYMENT_TIMEOUT)
     if tx := await db.get_by_id(tx_id):
@@ -2897,6 +3020,7 @@ async def _handle_cancelled_order(bot, chat_id: int, tx_id: int, order_id: str):
     status = await ccpay.get_order_status(order_id)
     if status != ccpay.ORDER_STATUS_COMPLETED:
         logger.info("Orden %s (tx=%s) cancelada por el usuario, sin pago recibido.", order_id, tx_id)
+        await _release_reservation(bot, tx_id)
         return
 
     tx = await db.get_by_id(tx_id)
@@ -2936,8 +3060,22 @@ async def _handle_after_payment(bot, chat_id: int, state: FSMContext, tx_id: int
     network        = data["network"]
     token_id       = data["token_id"]
 
-    # Solicitar número a HeroSMS
-    number_info = await hero.get_number(service_code, country_code)
+    # El número YA se reservó al elegir país (ver cb_select_country) --acá
+    # solo lo recuperamos, no volvemos a pedirlo. Esto es justo lo que
+    # elimina la ventana de riesgo original: antes, entre elegir país y
+    # llegar a este punto pasaba todo el tiempo de espera del pago, y el
+    # stock podía agotarse en el medio.
+    #
+    # Respaldo (`hero.get_number` de nuevo) SOLO para transacciones que no
+    # tienen reserva previa -tx creadas antes de este cambio, o casos raros
+    # donde el state se perdió- para no romper compras ya en curso durante
+    # el despliegue.
+    activation_id = data.get("activation_id")
+    phone_number  = data.get("phone_number")
+    number_info = {"id": activation_id, "number": phone_number} if activation_id else None
+
+    if not number_info:
+        number_info = await hero.get_number(service_code, country_code)
 
     if not number_info:
         # Sin números disponibles → esto NO es un caso de posible abuso (el
