@@ -148,6 +148,17 @@ class CupWithdrawFlow(StatesGroup):
 # hero.cancel_number se retrasa hasta cumplir este mínimo.
 HEROSMS_MIN_CANCEL_WAIT_SECONDS = 120
 
+# Cuántos países alternativos probar automáticamente en cadena si el que
+# el usuario eligió se quedó sin stock justo al reservar (ver
+# cb_select_country). El catálogo de hero.get_countries ya filtra
+# count > 0, pero para servicios de alta demanda (ej. WhatsApp) el
+# "count" que reporta HeroSMS no siempre refleja el stock real al
+# milisegundo -- antes cada fallo obligaba al usuario a tocar de nuevo
+# la lista completa, país por país, uno tras otro (mala UX). Ahora se
+# prueban en silencio, en orden de precio, hasta este número de
+# alternativas antes de devolverle el problema al usuario.
+AUTO_RETRY_COUNTRIES = 3
+
 
 # ── Datos que guardamos en FSM (en memoria entre pasos) ───────────────────────
 # Claves usadas: service_code, service_name, country_code, country_name,
@@ -2230,30 +2241,20 @@ async def cb_select_country(call: CallbackQuery, state: FSMContext):
     await _safe_call_answer(call)
     _, country_code, cost_str = call.data.split(":", 2)
     cost_herosms = float(cost_str)
-    price_usd    = apply_markup(cost_herosms, MARKUP)
 
     data = await state.get_data()
     service_code = data["service_code"]
     service_name = data["service_name"]
+    countries    = data.get("countries", [])
 
-    country_name = country_code.upper()
-    for c in data.get("countries", []):
-        if c.get("country", c.get("code")) == country_code:
-            country_name = c.get("name", country_code.upper())
-            break
+    def _country_name(code: str, fallback_cost: float) -> tuple:
+        for c in countries:
+            if c.get("country", c.get("code")) == code:
+                return c.get("name", code.upper()), c.get("price", fallback_cost)
+        return code.upper(), fallback_cost
 
+    country_name, _ = _country_name(country_code, cost_herosms)
     await _collapse_selection(call, f"✅ País elegido: {country_name}")
-
-    # Crear registro en BD con el precio base en USD
-    tx_id = await db.create_transaction(
-        user_id      = call.from_user.id,
-        service      = service_code,
-        service_name = service_name,
-        country      = country_code,
-        country_name = country_name,
-        cost_herosms = cost_herosms,
-        amount_usd   = price_usd,
-    )
 
     # RESERVAR EL NÚMERO ACÁ, antes de pedir cualquier pago -- no después
     # (como era antes, dentro de _handle_after_payment). El catálogo que
@@ -2265,65 +2266,114 @@ async def cb_select_country(call: CallbackQuery, state: FSMContext):
     # Pidiendo el número ahora, si falla, el usuario se entera antes de
     # pagar y sin fricción (ver hero.get_number: NO_NUMBERS no cobra nada
     # de nuestro lado, y no le costó ni un centavo a él).
-    number_info = await hero.get_number(service_code, country_code)
+    #
+    # Para servicios de alta demanda (ej. WhatsApp) el "count" que
+    # reporta getPrices no siempre refleja el stock real al milisegundo
+    # -- en vez de devolverle el problema al usuario apenas falla el
+    # país elegido, se prueban en silencio hasta AUTO_RETRY_COUNTRIES
+    # alternativas del mismo catálogo (ya ordenado por precio), y solo
+    # se le avisa si TODAS fallan o si tuvo que cambiar de país.
+    remaining = [c for c in countries if c.get("country", c.get("code")) != country_code]
+    attempts = [(country_code, cost_herosms, country_name)] + [
+        (c.get("country", c.get("code")), c.get("price", cost_herosms), c.get("name", c.get("country", "")))
+        for c in remaining[:AUTO_RETRY_COUNTRIES]
+    ]
 
-    if not number_info:
-        await db.set_status(tx_id, "no_stock")
-        await call.message.answer(
-            f"😔 Justo se agotó el stock de <b>{country_name}</b> para "
-            f"<b>{service_name}</b> (no se cobró nada). Elige otro país:",
-            parse_mode="HTML",
+    failed_names = []
+    for code, cost, name in attempts:
+        price_usd = apply_markup(cost, MARKUP)
+
+        # Un registro de tx por intento (igual que antes): si falla queda
+        # marcado "no_stock" y no cuesta nada, ni de nuestro lado ni del
+        # usuario.
+        tx_id = await db.create_transaction(
+            user_id      = call.from_user.id,
+            service      = service_code,
+            service_name = service_name,
+            country      = code,
+            country_name = name,
+            cost_herosms = cost,
+            amount_usd   = price_usd,
         )
-        # Refrescar el catálogo (el país que acaba de fallar puede seguir
-        # apareciendo si no volvemos a consultar) y mostrar de nuevo.
-        countries = await hero.get_countries(service_code)
-        if not countries:
+
+        number_info = await hero.get_number(service_code, code)
+
+        if not number_info:
+            await db.set_status(tx_id, "no_stock")
+            failed_names.append(name)
+            continue
+
+        activation_id = str(number_info["id"])
+        phone_number  = format_phone(number_info["number"])
+        await db.set_activation(tx_id, activation_id, phone_number)
+
+        if failed_names:
+            # Tuvo que probar 1+ alternativas antes de conseguir número --
+            # avisar UNA sola vez, con el resultado final, en vez de un
+            # mensaje de "se agotó" por cada país intentado.
+            tried_txt = ", ".join(failed_names)
             await call.message.answer(
-                f"😔 No quedan países disponibles para <b>{service_name}</b> "
-                "en este momento. Intenta con otro servicio.",
+                f"😔 Justo se agotó el stock de <b>{tried_txt}</b> para "
+                f"<b>{service_name}</b> (no se cobró nada por esos intentos). "
+                f"Conseguimos número automáticamente en <b>{name}</b> — "
+                "seguimos con este país:",
                 parse_mode="HTML",
-                reply_markup=services_keyboard(SERVICES),
             )
-            await state.clear()
-            return
-        await state.update_data(countries=countries)
-        success_stats = await db.get_country_success_stats(service_code)
-        await call.message.answer(
-            MSG_SELECT_COUNTRY,
-            parse_mode="HTML",
-            reply_markup=countries_keyboard(countries, MARKUP, success_stats),
+
+        await state.update_data(
+            country_code  = code,
+            country_name  = name,
+            cost_herosms  = cost,
+            price_usd     = price_usd,
+            tx_id         = tx_id,
+            activation_id = activation_id,
+            phone_number  = phone_number,
         )
-        # Se queda en selecting_country -- el usuario elige de nuevo.
+
+        # Red de seguridad: si el usuario reserva pero nunca llega a
+        # elegir un método de pago (cierra el chat, se distrae, etc.),
+        # nadie más iba a liberar este número -- _poll_payment / la
+        # revisión manual de CUP solo entran en juego DESPUÉS de que se
+        # elige método (ver _release_reservation_if_never_paid). Sin
+        # esto, "abandonar antes de pagar" seguiría dejando el número (y
+        # nuestro saldo en HeroSMS) ocupado indefinidamente.
+        asyncio.create_task(
+            _release_reservation_if_never_paid(
+                bot=call.bot, chat_id=call.message.chat.id, tx_id=tx_id,
+            )
+        )
+
+        await _quote_and_show_currency_menu(call.message, state, tx_id, call.from_user.id, price_usd)
         return
 
-    activation_id = str(number_info["id"])
-    phone_number  = format_phone(number_info["number"])
-    await db.set_activation(tx_id, activation_id, phone_number)
-
-    await state.update_data(
-        country_code  = country_code,
-        country_name  = country_name,
-        cost_herosms  = cost_herosms,
-        price_usd     = price_usd,
-        tx_id         = tx_id,
-        activation_id = activation_id,
-        phone_number  = phone_number,
+    # Se agotaron el país elegido Y todas las alternativas automáticas --
+    # ahí sí hay que devolverle el problema al usuario.
+    tried_txt = ", ".join(failed_names)
+    await call.message.answer(
+        f"😔 Justo se agotó el stock de <b>{tried_txt}</b> para "
+        f"<b>{service_name}</b> (no se cobró nada). Elige otro país:",
+        parse_mode="HTML",
     )
-
-    # Red de seguridad: si el usuario reserva pero nunca llega a elegir un
-    # método de pago (cierra el chat, se distrae, etc.), nadie más iba a
-    # liberar este número -- _poll_payment / la revisión manual de CUP
-    # solo entran en juego DESPUÉS de que se elige método (ver
-    # _release_reservation_if_never_paid). Sin esto, "abandonar antes de
-    # pagar" seguiría dejando el número (y nuestro saldo en HeroSMS)
-    # ocupado indefinidamente.
-    asyncio.create_task(
-        _release_reservation_if_never_paid(
-            bot=call.bot, chat_id=call.message.chat.id, tx_id=tx_id,
+    # Refrescar el catálogo (los países que acaban de fallar pueden
+    # seguir apareciendo si no volvemos a consultar) y mostrar de nuevo.
+    fresh_countries = await hero.get_countries(service_code)
+    if not fresh_countries:
+        await call.message.answer(
+            f"😔 No quedan países disponibles para <b>{service_name}</b> "
+            "en este momento. Intenta con otro servicio.",
+            parse_mode="HTML",
+            reply_markup=services_keyboard(SERVICES),
         )
+        await state.clear()
+        return
+    await state.update_data(countries=fresh_countries)
+    success_stats = await db.get_country_success_stats(service_code)
+    await call.message.answer(
+        MSG_SELECT_COUNTRY,
+        parse_mode="HTML",
+        reply_markup=countries_keyboard(fresh_countries, MARKUP, success_stats),
     )
-
-    await _quote_and_show_currency_menu(call.message, state, tx_id, call.from_user.id, price_usd)
+    # Se queda en selecting_country -- el usuario elige de nuevo.
 
 
 async def _release_reservation_if_never_paid(bot, chat_id: int, tx_id: int):
