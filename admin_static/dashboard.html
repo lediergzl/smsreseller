@@ -150,6 +150,7 @@
   <button data-tab="ledger">Acreditaciones</button>
   <button data-tab="referrals">Referidos</button>
   <button data-tab="errors">Errores</button>
+  <button data-tab="cancel_feedback">Feedback</button>
 </nav>
 
 <div class="toolbar">
@@ -188,6 +189,14 @@ const fmtDate = (s) => s ? new Date(s).toLocaleString("es", {dateStyle:"short", 
 const who = (row) => row.username ? "@" + row.username : (row.first_name || ("#" + row.user_id));
 const badge = (status) => `<span class="badge ${status}">${status || "—"}</span>`;
 const userLink = (row) => `<span class="user-link" data-uid="${row.user_id}">${who(row)}</span>`;
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+// Los motivos de error ahora pueden ser una frase (ver status_reason), y el
+// texto libre de cancel_feedback es contenido escrito por el usuario -> se
+// trunca visualmente (title= muestra el texto completo al pasar el mouse) y
+// SIEMPRE se escapa antes de insertarlo como HTML.
+const detailCell = (s) => s
+  ? `<span title="${escapeHtml(s)}" style="display:inline-block;max-width:320px;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom;white-space:nowrap">${escapeHtml(s)}</span>`
+  : "—";
 
 function openModal(id) { document.getElementById(id).classList.add("open"); }
 function closeModal(id) { document.getElementById(id).classList.remove("open"); }
@@ -207,6 +216,24 @@ const TAB_COUNT_KEY = {
   manual_deposits: "pending_manual_deposits",
   manual_withdrawals: "pending_manual_withdrawals",
   errors: "errors_today",
+  cancel_feedback: "cancel_feedback_today",
+};
+
+// Claves crudas que guarda handlers.py (ver _perform_cancel / cb_cancel_feedback)
+// traducidas a algo legible para el admin.
+const CANCEL_CONTEXT_LABELS = {
+  manual_review:      "Pago CUP (comprobante)",
+  selecting_currency: "Eligiendo moneda de pago",
+  awaiting_sms:       "Esperando el SMS",
+  awaiting_payment:   "Esperando el pago",
+  before_payment:     "Antes de pagar",
+};
+const CANCEL_REASON_LABELS = {
+  price:        "💸 Mejor precio en otro lado",
+  slow:         "⏳ Tardó mucho",
+  changed_mind: "🤷 Cambió de opinión",
+  problem:      "⚠️ Tuvo un problema",
+  other:        "✍️ Otro (ver detalle)",
 };
 
 function actionButtons(kind, row) {
@@ -260,7 +287,14 @@ const COLUMNS = {
     endpoint: "errors",
     cols: ["Tipo","Usuario","Detalle","Monto","Fecha"],
     row: (r) => [r.kind === "transaction_error" ? "❌ Compra fallida" : "↩️ Reembolso pendiente",
-                 userLink(r), r.detail || "—", fmtMoney(r.amount_usd), fmtDate(r.at)],
+                 userLink(r), detailCell(r.detail), fmtMoney(r.amount_usd), fmtDate(r.at)],
+  },
+  cancel_feedback: {
+    endpoint: "cancel_feedback",
+    cols: ["Usuario","Paso","Motivo","Detalle","Fecha"],
+    row: (r) => [userLink(r), CANCEL_CONTEXT_LABELS[r.context] || r.context || "—",
+                 CANCEL_REASON_LABELS[r.reason_key] || r.reason_key || "—",
+                 detailCell(r.reason_text), fmtDate(r.created_at)],
   },
 };
 
@@ -381,7 +415,10 @@ function renderUserProfile(uid, data) {
     section("Acreditaciones", data.ledger, ["Monto","Origen","Motivo","Fecha"],
       r => [`<span style="color:${r.delta_usd>=0?'var(--ok)':'var(--err)'}">${r.delta_usd>=0?"+":""}${fmtMoney(r.delta_usd)}</span>`, r.origin, r.reason||"—", fmtDate(r.created_at)]) +
     section("Referidos hechos", data.referrals_made, ["Referido","Comisión","Estado","Fecha"],
-      r => [r.referred_username ? "@"+r.referred_username : "#"+r.referred_id, fmtMoney(r.bonus_usd), badge(r.status), fmtDate(r.created_at)]);
+      r => [r.referred_username ? "@"+r.referred_username : "#"+r.referred_id, fmtMoney(r.bonus_usd), badge(r.status), fmtDate(r.created_at)]) +
+    section("Feedback de cancelación", data.cancel_feedback, ["Paso","Motivo","Detalle","Fecha"],
+      r => [CANCEL_CONTEXT_LABELS[r.context] || r.context || "—", CANCEL_REASON_LABELS[r.reason_key] || r.reason_key || "—",
+            r.reason_text ? escapeHtml(r.reason_text) : "—", fmtDate(r.created_at)]);
 }
 
 document.getElementById("main").addEventListener("click", async (e) => {
