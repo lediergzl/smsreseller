@@ -2474,7 +2474,7 @@ async def _release_reservation_if_never_paid(bot, chat_id: int, tx_id: int):
     activation_id = tx.get("activation_id")
     if not activation_id:
         return
-    await hero.cancel_number(activation_id)
+    ok = await hero.cancel_number(activation_id)
     await db.set_status(tx_id, "reservation_expired")
     await _safe_send(
         bot, chat_id,
@@ -2482,6 +2482,13 @@ async def _release_reservation_if_never_paid(bot, chat_id: int, tx_id: int):
         "método de pago a tiempo. No se cobró nada. Usa /start para "
         "intentar de nuevo.",
     )
+    if not ok:
+        if tx2 := await db.get_by_id(tx_id):
+            await _notify_admin(
+                bot=bot,
+                text=f"🚨 <b>Liberación de reserva con problemas</b>\n{_tx_summary_line(tx2)}\n"
+                     "• HeroSMS rechazó la cancelación (revisar saldo/costo no recuperado)",
+            )
 
 
 async def _quote_and_show_currency_menu(
@@ -3307,6 +3314,25 @@ async def _poll_sms(
         await asyncio.sleep(SMS_POLL_INTERVAL)
         elapsed += SMS_POLL_INTERVAL
 
+        # Si otra ruta ya resolvió esta tx mientras esperábamos -típicamente
+        # el usuario canceló manual con el botón (cb_cancel), que marca la
+        # tx como "refunded" y agenda su propio hero.cancel_number- dejamos
+        # de pollear acá mismo. Sin este chequeo, este loop seguía vivo y
+        # terminaba llamando hero.cancel_number OTRA VEZ sobre el mismo
+        # activation_id al agotar el timeout (o al ver status=cancelled),
+        # que HeroSMS ya había cerrado -> 409 Conflict, y encima se
+        # duplicaba el aviso/crédito de reembolso sobre una tx que cb_cancel
+        # ya había resuelto. Mismo patrón que ya usa _poll_payment más
+        # arriba para el caso de pago.
+        tx_check = await db.get_by_id(tx_id)
+        if tx_check and tx_check["status"] != "number_assigned":
+            logger.info(
+                "_poll_sms(tx=%s): tx ya resuelta externamente (status=%s), "
+                "dejo de pollear sin volver a tocar HeroSMS.",
+                tx_id, tx_check["status"],
+            )
+            return
+
         result = await hero.get_status(activation_id)
         status = result.get("status", "")
 
@@ -3380,7 +3406,7 @@ async def _poll_sms(
     # instantáneo, y si el usuario de verdad quiere el dinero fuera del
     # bot puede pedir un retiro con /saldo (ahí sí asume él la comisión
     # de red).
-    await hero.cancel_number(activation_id)
+    ok = await hero.cancel_number(activation_id)
 
     tx = await db.get_by_id(tx_id)
     user_id = tx["user_id"] if tx else chat_id
@@ -3405,6 +3431,13 @@ async def _poll_sms(
         await _notify_admin(
             bot, f"💸 <b>Timeout de SMS</b> (acreditado a saldo)\n{_tx_summary_line(tx)}"
         )
+    if not ok:
+        if tx2 := await db.get_by_id(tx_id):
+            await _notify_admin(
+                bot=bot,
+                text=f"🚨 <b>Timeout de SMS con problemas</b>\n{_tx_summary_line(tx2)}\n"
+                     "• HeroSMS rechazó la cancelación (revisar saldo/costo no recuperado)",
+            )
     await state.clear()
 
 

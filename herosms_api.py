@@ -389,11 +389,30 @@ async def cancel_number(activation_id: str) -> bool:
     action=setStatus&status=8
     Cancela la activación y reembolsa el costo al saldo de HeroSMS.
     Respuesta esperada: "ACCESS_CANCEL"
+
+    Un HTTP 409 Conflict significa que HeroSMS ya NO considera esta
+    activación cancelable -en la práctica, casi siempre porque ya fue
+    cancelada antes por otra ruta del bot (ej. el usuario canceló manual
+    con /cancelar mientras _poll_sms seguía esperando en background, o un
+    redeploy solapó dos instancias sobre la misma tx). El resultado que
+    nos importa -que el número quede liberado en HeroSMS- YA se cumplió
+    en esos casos, así que se trata como éxito en vez de como fallo real;
+    de lo contrario el llamador reintenta/alerta al admin por algo que en
+    realidad ya está resuelto.
     """
     try:
         text = await _call("setStatus", {"id": activation_id, "status": 8})
         logger.info("cancel_number(%s) -> %s", activation_id, text)
         return text.startswith("ACCESS")
+    except aiohttp.ClientResponseError as exc:
+        if exc.status == 409:
+            logger.info(
+                "cancel_number(%s): HTTP 409 (ya estaba cancelada/cerrada en "
+                "HeroSMS, se toma como éxito)", activation_id,
+            )
+            return True
+        logger.error("cancel_number(%s) error: %s: %s", activation_id, type(exc).__name__, exc)
+        return False
     except Exception as exc:
         logger.error("cancel_number(%s) error: %s: %s", activation_id, type(exc).__name__, exc)
         return False

@@ -83,6 +83,11 @@ _DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_user_id    ON transactions(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_order_id   ON transactions(order_id)",
     "CREATE INDEX IF NOT EXISTS idx_activation ON transactions(activation_id)",
+    # status_reason se agregó al CREATE TABLE de arriba después de que ya
+    # existían bases desplegadas -CREATE TABLE IF NOT EXISTS no la crea en
+    # esas bases porque la tabla ya existe- así que hace falta este ALTER
+    # explícito (mismo patrón que sent_amount_cup/referrer_id más abajo).
+    "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS status_reason TEXT",
     """
     CREATE TABLE IF NOT EXISTS users (
         user_id           BIGINT PRIMARY KEY,
