@@ -240,6 +240,57 @@ async def _safe_send(bot, chat_id: int, text: str, **kwargs):
         await outbox.notify(bot, chat_id, text, reply_markup=kwargs.get("reply_markup"))
 
 
+def _main_menu_inline_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
+    """
+    Menú principal como botones INLINE (ver _finish_start: se manda como
+    mensaje aparte justo después de la bienvenida, porque un mensaje solo
+    puede llevar un reply_markup y el de arriba ya usa el persistente).
+
+    Reusa los MISMOS callback_data que ya manejan cb_new_purchase,
+    cb_my_balance, cb_my_profile, cb_my_txns, cb_my_country,
+    cb_my_referrals, cb_support y cb_admin_panel (ver definiciones más
+    abajo) -no duplica ninguna lógica, es solo un camino más corto hacia
+    la que ya existe.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🛒 Comprar número", callback_data="new_purchase")
+    builder.button(text="💰 Mi saldo", callback_data="my_balance")
+    builder.button(text="👤 Mi cuenta", callback_data="my_profile")
+    builder.button(text="📦 Mis pedidos", callback_data="my_txns")
+    builder.button(text="🌍 Mi país", callback_data="my_country")
+    builder.button(text="🔗 Invitar amigos", callback_data="my_referrals")
+    builder.button(text="🆘 Soporte", callback_data="support")
+    row_sizes = [1, 2, 2, 2]
+    if COMMUNITY_CHANNEL_URL:
+        builder.button(text="📢 Canal oficial", url=COMMUNITY_CHANNEL_URL)
+        row_sizes.append(1)
+    if is_admin:
+        builder.button(text="🛠️ Panel admin", callback_data="admin_panel")
+        row_sizes.append(1)
+    builder.adjust(*row_sizes)
+    return builder.as_markup()
+
+
+async def _delete_selection_message(call: CallbackQuery):
+    """
+    Como _collapse_selection, pero en vez de dejar una línea de
+    confirmación ("✅ País elegido: X"), borra el mensaje del todo. Usado
+    donde el listado ya no aporta nada útil una vez elegido (ej. la lista
+    de países: puede ser larga, y el paso siguiente ya deja claro qué se
+    eligió) -- así el chat no se llena de mensajes viejos del bot.
+
+    Fallback a _collapse_selection si el borrado falla (ej. mensajes de
+    más de 48h en grupos -no debería pasar acá, es chat privado-, o
+    cualquier otro motivo): mejor dejar una línea corta que un teclado
+    entero colgado sin razón.
+    """
+    try:
+        await call.message.delete()
+    except Exception as exc:
+        logger.debug("No se pudo borrar mensaje de selección, colapsando en su lugar: %s", exc)
+        await _collapse_selection(call, "✅ Elegido")
+
+
 async def _collapse_selection(call: CallbackQuery, text: str):
     """
     Colapsa el mensaje que tenía el teclado de opciones (monedas, redes,
@@ -923,6 +974,20 @@ async def _finish_start(bot, chat_id: int, user, state: FSMContext, message: Mes
             parse_mode="HTML",
             reply_markup=main_persistent_keyboard(is_admin=is_admin),
         )
+
+    # Un mensaje solo puede llevar UN reply_markup a la vez, y el de
+    # arriba ya usa el persistente (ReplyKeyboardMarkup) -que hay que
+    # mantener, varios handlers dependen de que siga pegado a la barra de
+    # abajo. Pero un ReplyKeyboardMarkup queda COLAPSADO hasta que el
+    # usuario toca el ícono de teclado para expandirlo: recién ahí ve las
+    # opciones. Este mensaje aparte con teclado INLINE deja las mismas
+    # acciones visibles de entrada, sin ese paso extra (ver captura real
+    # que motivó esto: usuario solo veía el texto de bienvenida y tenía
+    # que ir a la barra a expandir el menú).
+    await bot.send_message(
+        chat_id, "👇 Elegí una opción:",
+        reply_markup=_main_menu_inline_keyboard(is_admin=is_admin),
+    )
 
 
 @router.message(CommandStart())
@@ -2254,7 +2319,7 @@ async def cb_select_country(call: CallbackQuery, state: FSMContext):
         return code.upper(), fallback_cost
 
     country_name, _ = _country_name(country_code, cost_herosms)
-    await _collapse_selection(call, f"✅ País elegido: {country_name}")
+    await _delete_selection_message(call)
 
     # RESERVAR EL NÚMERO ACÁ, antes de pedir cualquier pago -- no después
     # (como era antes, dentro de _handle_after_payment). El catálogo que
@@ -2343,7 +2408,10 @@ async def cb_select_country(call: CallbackQuery, state: FSMContext):
             )
         )
 
-        await _quote_and_show_currency_menu(call.message, state, tx_id, call.from_user.id, price_usd)
+        await _quote_and_show_currency_menu(
+            call.message, state, tx_id, call.from_user.id, price_usd,
+            country_name=None if failed_names else name,
+        )
         return
 
     # Se agotaron el país elegido Y todas las alternativas automáticas --
@@ -2404,6 +2472,7 @@ async def _release_reservation_if_never_paid(bot, chat_id: int, tx_id: int):
 
 async def _quote_and_show_currency_menu(
     message: Message, state: FSMContext, tx_id: int, user_id: int, price_usd: float,
+    country_name: str = None,
 ) -> bool:
     """
     Consulta monedas soportadas + cotización actual y muestra el menú de
@@ -2414,10 +2483,19 @@ async def _quote_and_show_currency_menu(
     "servicio/país ya elegidos pero sin orden de pago aún") sin duplicar la
     lógica de cotización.
 
+    `country_name` es opcional y solo se usa para el texto de "cargando":
+    desde que cb_select_country borra el mensaje del listado de países en
+    vez de colapsarlo a una confirmación (ver _delete_selection_message),
+    este es el único lugar donde queda un rastro de qué país se eligió si
+    todo salió bien al primer intento.
+
     Devuelve True si se mostró el menú, False si no se pudo cotizar (en
     cuyo caso ya se marcó la tx como 'error' y se avisó al usuario).
     """
-    await message.answer("🔍 Consultando monedas disponibles y cotización actual...")
+    loading_txt = "🔍 Consultando monedas disponibles y cotización actual..."
+    if country_name:
+        loading_txt = f"✅ País: <b>{country_name}</b>\n{loading_txt}"
+    await message.answer(loading_txt, parse_mode="HTML")
 
     # Consultar monedas soportadas dinámicamente y calcular el equivalente
     # en cada una para el precio en USD ya calculado. Se piden todas las
@@ -2500,7 +2578,7 @@ async def cb_pay_balance(call: CallbackQuery, state: FSMContext):
         )
         return
 
-    await _collapse_selection(call, "✅ Pagando con saldo interno...")
+    await _delete_selection_message(call)
 
     order_id = f"balance-{tx_id}"
     await db.set_order_info(
@@ -2606,7 +2684,7 @@ async def cb_select_currency(call: CallbackQuery, state: FSMContext):
 
     await db.set_order_info(tx_id, order_id, pay_address, currency, network, pay_amount, token_id=token_id)
 
-    await _collapse_selection(call, f"✅ Método de pago elegido: {currency_label} (red {network})")
+    await _delete_selection_message(call)
 
     # Si esta moneda tiene una opción "nativa" (currency == network, ej.
     # TRX en la red TRX) entre lo que se le ofreció al usuario, pero eligió
@@ -2666,7 +2744,7 @@ async def cb_pay_cup(call: CallbackQuery, state: FSMContext):
         await call.message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
         return
 
-    await _collapse_selection(call, "✅ Pagando en CUP")
+    await _delete_selection_message(call)
 
     if len(methods) == 1:
         method_code = next(iter(methods))
@@ -2686,7 +2764,7 @@ async def cb_select_purchase_manual_method(call: CallbackQuery, state: FSMContex
     method_code = call.data.split(":", 1)[1]
     methods = await db.get_payment_methods()
     method_name = methods.get(method_code, {}).get("name", method_code)
-    await _collapse_selection(call, f"✅ Transferencia elegida: {method_name}")
+    await _delete_selection_message(call)
     await _start_manual_purchase_payment(call.message, state, method_code)
 
 
@@ -3784,7 +3862,7 @@ async def cb_withdraw_select_currency(call: CallbackQuery, state: FSMContext):
         withdraw_crypto_amount = opt["amount"],
     )
     await state.set_state(WithdrawFlow.awaiting_address)
-    await _collapse_selection(call, f"✅ Retiro en: {opt['currency']} (red {opt['network']})")
+    await _delete_selection_message(call)
     await call.message.answer(
         MSG_WITHDRAW_ASK_ADDRESS.format(currency=opt["currency"], network=opt["network"]),
         parse_mode="HTML",
@@ -4501,7 +4579,7 @@ async def cb_select_deposit_currency(call: CallbackQuery, state: FSMContext):
         deposit_id, order_id, pay_address, currency, network, pay_amount, token_id,
     )
 
-    await _collapse_selection(call, f"✅ Método de pago elegido: {currency_label} (red {network})")
+    await _delete_selection_message(call)
 
     await state.update_data(
         order_id       = order_id,
@@ -5172,6 +5250,27 @@ async def _perform_cancel(bot, user_id: int, state: FSMContext):
         await _safe_send(bot, user_id, "✅ Compra cancelada. No se generó ningún cargo.")
         return
 
+    if current_state == PurchaseFlow.selecting_currency and tx_id:
+        # Ya se reservó (y cobró) un número real en HeroSMS acá (ver
+        # cb_select_country), pero el usuario todavía no eligió método de
+        # pago -> _poll_payment todavía NO está corriendo para este tx_id
+        # (arranca recién después de elegir moneda), así que nadie más
+        # está vigilando para liberar la reserva si cancela justo en esta
+        # pantalla. Sin este release explícito, la tx caía en la rama
+        # genérica de abajo (marcada 'error', sin llamar a
+        # hero.cancel_number) y el número quedaba reservado/cobrado en
+        # HeroSMS para siempre -- bug real: pérdida silenciosa de saldo
+        # cada vez que alguien cancelaba en este paso exacto.
+        await _release_reservation(bot, tx_id)
+        await db.set_status(tx_id, "cancelled")
+        await state.clear()
+        await _safe_send(
+            bot, user_id,
+            "✅ Compra cancelada. No se generó ningún cargo (el número "
+            "reservado se liberó automáticamente)."
+        )
+        return
+
     if current_state == DepositFlow.awaiting_payment:
         # Ya se generó una orden. Igual que con una compra, CCPayment no
         # tiene forma de cerrar la orden de depósito -> se marca 'cancelled'
@@ -5309,7 +5408,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
 # se pide confirmar en vez de abandonarla en silencio.
 
 _RISKY_STATES = {
-    PurchaseFlow.awaiting_payment, PurchaseFlow.awaiting_sms,
+    PurchaseFlow.selecting_currency, PurchaseFlow.awaiting_payment, PurchaseFlow.awaiting_sms,
     PurchaseFlow.selecting_manual_method, PurchaseFlow.awaiting_manual_review,
     DepositFlow.awaiting_payment, ManualDepositFlow.awaiting_proof,
     ManualDepositFlow.awaiting_sent_amount,
@@ -5329,11 +5428,12 @@ def _describe_active_order(current_state, data: dict) -> str:
     price_txt = format_amount(price, "USD") if price else ""
 
     if current_state in (
-        PurchaseFlow.awaiting_payment, PurchaseFlow.selecting_manual_method,
-        PurchaseFlow.awaiting_manual_review,
+        PurchaseFlow.selecting_currency, PurchaseFlow.awaiting_payment,
+        PurchaseFlow.selecting_manual_method, PurchaseFlow.awaiting_manual_review,
     ):
         parts = [p for p in (f"compra de {order}" if order else "una compra", price_txt) if p]
-        return " — ".join(parts) + ", esperando el pago"
+        suffix = ", eligiendo método de pago" if current_state == PurchaseFlow.selecting_currency else ", esperando el pago"
+        return " — ".join(parts) + suffix
     if current_state == PurchaseFlow.awaiting_sms:
         base = f"compra de {order}" if order else "una compra"
         return f"{base} — ya tenés un número asignado, esperando el código SMS"
@@ -5390,40 +5490,85 @@ async def _warn_if_active_order(state: FSMContext, answer_func, target: str, bot
 # ── Catch-all: sesión sin estado válido ───────────────────────────────────────
 # Se registran AL FINAL a propósito: aiogram prueba los handlers en orden de
 # registro, así que estos solo se disparan cuando ningún handler de arriba
-# matcheó. Caso típico: el usuario tenía un botón/flujo abierto de ANTES de
-# un reinicio del bot. Usamos MemoryStorage, así que su FSM se perdió al
-# reiniciar -> el callback_data (svc:, cnt:, cur:...) ya no tiene el State
-# que su filtro exige, y sin esto aiogram lo descarta en silencio (se ve en
-# el log como "Update ... is not handled") dejando al usuario sin respuesta.
+# matcheó. Dos casos MUY distintos caen acá y hay que tratarlos distinto:
+#
+#   1. Sesión REALMENTE perdida (bot reiniciado -MemoryStorage- o pasó
+#      demasiado tiempo): current_state es None. Ahí sí, limpiar y avisar
+#      que hay que arrancar de nuevo, como antes.
+#   2. Sesión ACTIVA pero el botón/mensaje no es el que espera este paso
+#      (típicamente: un botón viejo de un mensaje anterior, como el menú
+#      de servicios que sigue tocable en el chat aunque ya estés varios
+#      pasos más adelante -ver captura real que motivó esto: usuario en
+#      selecting_currency con un número YA reservado en HeroSMS, toca un
+#      botón viejo de "WhatsApp" y caía acá). Antes esto hacía
+#      state.clear() en silencio, con el mismo efecto que cancelar pero
+#      SIN pasar por _perform_cancel -> ninguna reserva se liberaba, y el
+#      mensaje ("el bot se reinició") era además falso. Ahora, si hay
+#      estado real, NO lo tocamos: avisamos qué sigue esperando y
+#      dejamos el camino de ❌ Cancelar (que sí libera todo bien) como
+#      única salida.
 
 @router.callback_query()
 async def cb_fallback_expired_session(call: CallbackQuery, state: FSMContext):
-    await _safe_call_answer(call, "Sesión expirada", show_alert=True)
-    await state.clear()
+    current_state = await state.get_state()
+    if current_state is None:
+        await _safe_call_answer(call, "Sesión expirada", show_alert=True)
+        await state.clear()
+        await _safe_answer(
+            call.message,
+            "⚠️ Tu sesión anterior ya no es válida (el bot se reinició o pasó "
+            "demasiado tiempo). No se te cobró nada por esto — toca el botón "
+            "de abajo para empezar de nuevo 👇",
+            reply_markup=outbox.retry_keyboard(),
+        )
+        return
+
+    await _safe_call_answer(call, "Ese botón ya no aplica", show_alert=True)
+    data = await state.get_data()
+    label = _describe_active_order(current_state, data)
     await _safe_answer(
         call.message,
-        "⚠️ Tu sesión anterior ya no es válida (el bot se reinició o pasó "
-        "demasiado tiempo). No se te cobró nada por esto — toca el botón "
-        "de abajo para empezar de nuevo 👇",
-        reply_markup=outbox.retry_keyboard(),
+        "🤔 Ese botón es de un paso anterior y ya no aplica"
+        + (f" — seguís con <b>{label}</b>" if label else " a tu operación actual")
+        + ".\n\nSi querés salir de la operación en curso, tocá <b>❌ Cancelar</b>.",
+        parse_mode="HTML", reply_markup=cancel_keyboard(),
     )
 
 
 @router.message()
 async def msg_fallback_expired_session(message: Message, state: FSMContext):
-    # Sin esto, este catch-all responde a TODO lo que llegue como Message
-    # -incluye mensajes normales de otros usuarios en el grupo/canal, y
-    # también mensajes de servicio (ej. "Fulano agregó a OTPVIRTUAL"), ya
-    # que Telegram los manda como Message con content_type especial, no
-    # solo como my_chat_member update. El FSM de compra/retiro solo existe
-    # en el chat privado con el bot, así que en cualquier otro chat no hay
-    # "sesión" de la que hablar: mejor no contestar nada.
+    # Sin el chequeo de chat.type, este catch-all respondería a TODO lo que
+    # llegue como Message -incluye mensajes normales de otros usuarios en
+    # el grupo/canal, y también mensajes de servicio (ej. "Fulano agregó a
+    # OTPVIRTUAL"), ya que Telegram los manda como Message con
+    # content_type especial, no solo como my_chat_member update. El FSM de
+    # compra/retiro solo existe en el chat privado con el bot, así que en
+    # cualquier otro chat no hay "sesión" de la que hablar: mejor no
+    # contestar nada.
     if message.chat.type != "private":
         return
-    await state.clear()
+
+    current_state = await state.get_state()
+    if current_state is None:
+        await state.clear()
+        await _safe_answer(
+            message,
+            "🤔 No tengo una operación activa esperando ese mensaje. "
+            "Toca el botón de abajo para empezar de nuevo 👇",
+            reply_markup=outbox.retry_keyboard(),
+        )
+        return
+
+    # Igual que en cb_fallback_expired_session: hay una operación real en
+    # curso, este mensaje simplemente no es lo que este paso espera (ej.
+    # tipeó texto libre estando en selecting_currency, que solo acepta
+    # botones). No tocamos el estado ni la reserva.
+    data = await state.get_data()
+    label = _describe_active_order(current_state, data)
     await _safe_answer(
         message,
-        "🤔 No tengo una operación activa esperando ese mensaje. "
-        "Toca el botón de abajo para empezar de nuevo 👇",
-        reply_markup=outbox.retry_keyboard(),
+        "🤔 No esperaba ese mensaje en este paso"
+        + (f" — seguís con <b>{label}</b>" if label else "") + ".\n\n"
+        "Si querés salir de la operación en curso, tocá <b>❌ Cancelar</b>.",
+        parse_mode="HTML", reply_markup=cancel_keyboard(),
     )
