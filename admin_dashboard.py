@@ -282,6 +282,14 @@ async def _api_errors(request: web.Request) -> web.Response:
     return _json_response(data)
 
 
+async def _api_cancel_feedback(request: web.Request) -> web.Response:
+    data = await db.get_recent_cancel_feedback_admin(
+        limit=int(request.query.get("limit", 50)),
+        days=_query_days(request),
+    )
+    return _json_response(data)
+
+
 async def _api_revenue_chart(request: web.Request) -> web.Response:
     days = int(request.query.get("days", 14))
     data = await db.get_daily_revenue_admin(days=days)
@@ -442,6 +450,7 @@ def setup_admin_dashboard(app: web.Application, bot) -> None:
     app.router.add_get("/admin/api/manual_withdrawals", _api_manual_withdrawals)
     app.router.add_get("/admin/api/refunds", _api_refunds)
     app.router.add_get("/admin/api/errors", _api_errors)
+    app.router.add_get("/admin/api/cancel_feedback", _api_cancel_feedback)
     app.router.add_get("/admin/api/revenue_chart", _api_revenue_chart)
     app.router.add_get("/admin/api/user/{user_id}", _api_user_history)
     app.router.add_post("/admin/api/manual_deposits/{dep_id}/approve", _api_approve_manual_deposit)

@@ -5,6 +5,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timezone
+from typing import Optional
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -139,6 +140,19 @@ class CupWithdrawFlow(StatesGroup):
     awaiting_amount  = State()   # Usuario escribiendo cuánto quiere retirar (USD, de su saldo CUP)
     awaiting_account = State()   # Usuario escribiendo su cuenta/tarjeta de destino
     confirming       = State()   # Usuario confirmando antes de descontar saldo y avisar al admin
+
+
+class CancelFeedbackFlow(StatesGroup):
+    """
+    Estado corto y aislado (no forma parte de ningún flujo de plata) para
+    el "¿por qué cancelaste?" opcional que se manda DESPUÉS de que
+    _perform_cancel ya confirmó la cancelación real (ver
+    _prompt_cancel_feedback / cb_cancel_feedback). Solo se usa cuando el
+    usuario toca "✍️ Otro" en vez de una de las razones con botón fijo.
+    No responder nada acá no tiene ningún costo: la cancelación de verdad
+    ya ocurrió antes de llegar a este punto.
+    """
+    awaiting_text = State()  # Esperando el texto libre de "¿qué pasó?"
 
 
 # HeroSMS exige un mínimo de ~2 minutos desde que se asigna un número antes
@@ -2530,7 +2544,7 @@ async def _quote_and_show_currency_menu(
     options.sort(key=lambda o: not o["low_fee"])
 
     if not options:
-        await db.set_status(tx_id, "error")
+        await db.set_status(tx_id, "error", reason="CCPay: sin cotizaciones disponibles (get_estimated_amounts_batch)")
         await message.answer(
             "😔 No pudimos obtener cotizaciones de pago en este momento. "
             "Intenta de nuevo en unos minutos con /start.",
@@ -2673,7 +2687,7 @@ async def cb_select_currency(call: CallbackQuery, state: FSMContext):
     order = await ccpay.create_order(chosen["amount"], token_id, memo=memo)
 
     if not order or not order.get("orderId") or not order.get("payAddress"):
-        await db.set_status(tx_id, "error")
+        await db.set_status(tx_id, "error", reason="CCPay: create_order no devolvió orderId/payAddress")
         await call.message.answer(MSG_ERROR_GENERIC, parse_mode="HTML")
         await state.clear()
         return
@@ -2961,7 +2975,7 @@ async def cb_admin_reject_purchase_cup(call: CallbackQuery):
         return
 
     await _release_reservation(call.bot, tx_id)
-    await db.set_status(tx_id, "error")
+    await db.set_status(tx_id, "error", reason=f"Admin rechazó comprobante de pago CUP (rechazado por {call.from_user.id})")
     await _safe_call_answer(call, "Rechazado ❌")
     await _mark_admin_message_resolved(call.message, f"\n\n❌ Rechazado por {call.from_user.id}")
 
@@ -3600,7 +3614,7 @@ async def resume_transaction(bot, storage, tx: dict) -> str:
     # fila fue creada pero ni siquiera tiene país todavía, lo cual en la
     # práctica no debería pasar dado cómo se crea la fila) → no hay nada
     # seguro que recuperar automáticamente.
-    await db.set_status(tx_id, "error")
+    await db.set_status(tx_id, "error", reason=f"Reinicio del bot en estado no recuperable (status previo: {tx['status']})")
     await _safe_send(
         bot, chat_id,
         "⚠️ El bot se reinició mientras tenías una compra en curso, "
@@ -5221,7 +5235,12 @@ async def _perform_cancel(bot, user_id: int, state: FSMContext):
         # comprobante, así que cancelar acá nunca deja nada a medio tocar.
         reference_code = data.get("manual_reference_code")
         if tx_id:
-            await db.set_status(tx_id, "error")
+            # 'cancelled', NO 'error': el usuario se bajó por su cuenta antes
+            # de que un admin llegara a revisar nada, no hubo ninguna falla
+            # real (ver diagnóstico: esto antes se etiquetaba 'error' y
+            # contaminaba el feed de errores del dashboard con cancelaciones
+            # normales, indistinguibles de fallas reales de CCPay/HeroSMS).
+            await db.set_status(tx_id, "cancelled")
             # manual_reference_code solo existe una vez que se generó la
             # orden de pago CUP (ver _start_manual_purchase_payment), que es
             # justo el punto en el que ya se avisó al admin con "Pago CUP
@@ -5248,6 +5267,7 @@ async def _perform_cancel(bot, user_id: int, state: FSMContext):
                     logger.error("No se pudo avisar al admin de la cancelación de la tx %s: %s", tx_id, exc)
         await state.clear()
         await _safe_send(bot, user_id, "✅ Compra cancelada. No se generó ningún cargo.")
+        await _prompt_cancel_feedback(bot, user_id, tx_id, "manual_review")
         return
 
     if current_state == PurchaseFlow.selecting_currency and tx_id:
@@ -5269,6 +5289,7 @@ async def _perform_cancel(bot, user_id: int, state: FSMContext):
             "✅ Compra cancelada. No se generó ningún cargo (el número "
             "reservado se liberó automáticamente)."
         )
+        await _prompt_cancel_feedback(bot, user_id, tx_id, "selecting_currency")
         return
 
     if current_state == DepositFlow.awaiting_payment:
@@ -5288,7 +5309,10 @@ async def _perform_cancel(bot, user_id: int, state: FSMContext):
         )
         return
 
+    cancel_context = None
+
     if current_state == PurchaseFlow.awaiting_sms:
+        cancel_context = "awaiting_sms"
         # Ya se le había asignado un número. Antes de cancelar, chequeamos
         # UNA vez si el código ya había llegado del lado de HeroSMS (puede
         # pasar justo antes de que el poller en background lo recoja) -
@@ -5374,12 +5398,16 @@ async def _perform_cancel(bot, user_id: int, state: FSMContext):
         # habías pagado, te reembolsa automáticamente (ver
         # _handle_cancelled_order). Así evitamos que la tarea vieja siga
         # corriendo sobre datos de estado ya vaciados.
+        cancel_context = "awaiting_payment"
         await db.set_status(tx_id, "cancelled")
 
     elif tx_id:
         # Cancelado antes de generar una orden de pago (eligiendo
         # servicio/país/moneda): no hubo cargo, no hay nada que reembolsar.
-        await db.set_status(tx_id, "error")
+        # 'cancelled', NO 'error' (ver mismo fix arriba en manual_review):
+        # esto es el usuario decidiendo no seguir, no una falla del sistema.
+        cancel_context = "before_payment"
+        await db.set_status(tx_id, "cancelled")
 
     await state.clear()
     await _safe_send(
@@ -5388,6 +5416,8 @@ async def _perform_cancel(bot, user_id: int, state: FSMContext):
         "Si ya habías enviado un pago antes de cancelar, lo detectaremos "
         "y se reembolsará automáticamente. Usa /start para comenzar de nuevo."
     )
+    if cancel_context:
+        await _prompt_cancel_feedback(bot, user_id, tx_id, cancel_context)
 
 
 @router.callback_query(F.data == "cancel_op")
@@ -5395,6 +5425,85 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
     """El usuario cancela la operación en curso."""
     await _safe_call_answer(call, "Operación cancelada.")
     await _perform_cancel(call.bot, call.from_user.id, state)
+
+
+# ── Feedback opcional post-cancelación ─────────────────────────────────────────
+# Objetivo: "cancelled" en /panel hoy dice QUE el usuario se bajó, no POR QUÉ.
+# Sin esto no hay forma de distinguir "encontré mejor precio en otro lado" de
+# "algo del bot no le gustó" -y lo segundo es justo lo que se puede arreglar.
+# Se manda como mensaje APARTE, después de que _perform_cancel ya confirmó la
+# cancelación real: no responder nada acá no bloquea ni retrasa nada para el
+# usuario, es estrictamente opcional.
+
+_CANCEL_FEEDBACK_OPTIONS = [
+    ("price",        "💸 Encontré mejor precio"),
+    ("slow",         "⏳ Tardó mucho"),
+    ("changed_mind", "🤷 Cambié de opinión"),
+    ("problem",      "⚠️ Tuve un problema"),
+]
+
+
+def _cancel_feedback_keyboard(tx_id: int, context: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for key, label in _CANCEL_FEEDBACK_OPTIONS:
+        kb.button(text=label, callback_data=f"cfb:{tx_id}:{context}:{key}")
+    kb.button(text="✍️ Otro (escribir)", callback_data=f"cfb:{tx_id}:{context}:other")
+    kb.button(text="Prefiero no decir", callback_data=f"cfb:{tx_id}:{context}:skip")
+    kb.adjust(2, 2, 1, 1)
+    return kb.as_markup()
+
+
+async def _prompt_cancel_feedback(bot, user_id: int, tx_id: Optional[int], context: str) -> None:
+    """Manda el prompt de feedback. `tx_id` puede ser None (ej. sesión
+    perdida sin fallback encontrado) -en ese caso no hay nada que asociar
+    en `cancel_feedback` y directamente no se manda nada."""
+    if not tx_id:
+        return
+    try:
+        await _safe_send(
+            bot, user_id,
+            "Por cierto — ¿nos contás por qué cancelaste? Nos ayuda a mejorar (es opcional):",
+            reply_markup=_cancel_feedback_keyboard(tx_id, context),
+        )
+    except Exception as exc:
+        logger.error("No se pudo mandar el prompt de feedback de cancelación (tx=%s): %s", tx_id, exc)
+
+
+@router.callback_query(F.data.startswith("cfb:"))
+async def cb_cancel_feedback(call: CallbackQuery, state: FSMContext):
+    _, tx_id_s, context, key = call.data.split(":", 3)
+    tx_id = int(tx_id_s)
+
+    if key == "skip":
+        await _safe_call_answer(call)
+        await call.message.edit_text("Entendido, gracias igual 🙌")
+        return
+
+    if key == "other":
+        await _safe_call_answer(call)
+        await state.set_state(CancelFeedbackFlow.awaiting_text)
+        await state.update_data(cfb_tx_id=tx_id, cfb_context=context)
+        await call.message.edit_text("Contanos brevemente qué pasó (un mensaje de texto):")
+        return
+
+    label = next((lbl for k, lbl in _CANCEL_FEEDBACK_OPTIONS if k == key), key)
+    await db.create_cancel_feedback(call.from_user.id, tx_id=tx_id, context=context, reason_key=key)
+    await _safe_call_answer(call, "¡Gracias!")
+    await call.message.edit_text(f"Gracias por contarnos: {label}")
+
+
+@router.message(CancelFeedbackFlow.awaiting_text)
+async def msg_cancel_feedback_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    tx_id = data.get("cfb_tx_id")
+    context = data.get("cfb_context")
+    text = (message.text or "").strip()[:500]  # tope razonable, esto no es un formulario de soporte
+
+    await db.create_cancel_feedback(
+        message.from_user.id, tx_id=tx_id, context=context, reason_key="other", reason_text=text or None,
+    )
+    await state.clear()
+    await message.answer("¡Gracias por contarnos, lo vamos a tener en cuenta! 🙌")
 
 
 # ── Aviso al navegar con una operación riesgosa en curso ───────────────────────

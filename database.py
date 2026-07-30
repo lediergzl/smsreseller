@@ -72,6 +72,7 @@ _DDL_STATEMENTS = [
         phone_number         TEXT,
         sms_code             TEXT,
         status               TEXT DEFAULT 'pending',
+        status_reason        TEXT,
         proof_file_id        TEXT,
         proof_file_unique_id TEXT,
         proof_text           TEXT,
@@ -289,6 +290,26 @@ _DDL_STATEMENTS = [
     CREATE UNIQUE INDEX IF NOT EXISTS idx_refund_requests_one_open
     ON refund_requests(tx_id) WHERE status = 'requested'
     """,
+    # Feedback opcional que se le pide al usuario después de cancelar una
+    # compra (ver handlers._prompt_cancel_feedback / cb_cancel_feedback).
+    # Objetivo: hoy "cancelled"/"error" en `transactions` solo dice QUÉ pasó,
+    # no POR QUÉ el usuario se bajó -esto le da al dashboard una razón en
+    # sus propias palabras (o al menos una categoría) sin bloquear el flujo
+    # de cancelación (el mensaje de confirmación ya se mandó antes de pedir
+    # esto, así que no responder no tiene ningún costo para el usuario).
+    """
+    CREATE TABLE IF NOT EXISTS cancel_feedback (
+        id          BIGSERIAL PRIMARY KEY,
+        tx_id       BIGINT,
+        user_id     BIGINT NOT NULL,
+        context     TEXT,
+        reason_key  TEXT,
+        reason_text TEXT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_cancel_feedback_tx   ON cancel_feedback(tx_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cancel_feedback_user ON cancel_feedback(user_id)",
 ]
 
 
@@ -611,8 +632,17 @@ class Database:
     async def set_sms_code(self, tx_id: int, sms_code: str):
         await self._update(tx_id, sms_code=sms_code)
 
-    async def set_status(self, tx_id: int, status: str):
-        await self._update(tx_id, status=status)
+    async def set_status(self, tx_id: int, status: str, reason: str = None):
+        """`reason` es opcional y solo tiene sentido para status='error' (o
+        cualquier otro que valga la pena explicar en el dashboard): un texto
+        corto y específico de la causa real (ej. "CCPay: sin cotizaciones
+        disponibles"), no solo el nombre del servicio. Si no se pasa, no se
+        toca status_reason (evita pisar un motivo previo con NULL en updates
+        posteriores que no tienen uno nuevo que ofrecer)."""
+        if reason is not None:
+            await self._update(tx_id, status=status, status_reason=reason)
+        else:
+            await self._update(tx_id, status=status)
 
     async def _update(self, tx_id: int, **kwargs):
         kwargs["updated_at"] = datetime.utcnow()
@@ -923,6 +953,38 @@ class Database:
                 return int(row["id"])
             except asyncpg.UniqueViolationError:
                 return None
+
+    # ── Feedback de cancelación ───────────────────────────────────────────────
+    # Ver comentario en _DDL_STATEMENTS (tabla cancel_feedback) y
+    # handlers._prompt_cancel_feedback / cb_cancel_feedback: captura opcional
+    # de POR QUÉ el usuario canceló, no solo que canceló.
+
+    async def create_cancel_feedback(
+        self, user_id: int, tx_id: int = None, context: str = None,
+        reason_key: str = None, reason_text: str = None,
+    ) -> int:
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO cancel_feedback (tx_id, user_id, context, reason_key, reason_text) "
+                "VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                tx_id, user_id, context, reason_key, reason_text,
+            )
+            return int(row["id"])
+
+    async def get_recent_cancel_feedback_admin(self, limit: int = 50, days: Optional[int] = None) -> list[dict]:
+        sql = (
+            "SELECT cf.*, u.username, u.first_name FROM cancel_feedback cf "
+            "LEFT JOIN users u ON u.user_id = cf.user_id WHERE 1=1"
+        )
+        params: list = []
+        if days is not None:
+            params.append(datetime.utcnow() - timedelta(days=int(days)))
+            sql += f" AND cf.created_at >= ${len(params)}"
+        params.append(limit)
+        sql += f" ORDER BY cf.created_at DESC LIMIT ${len(params)}"
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, *params)
+            return [dict(r) for r in rows]
 
     async def get_open_refund_request_for_tx(self, tx_id: int) -> Optional[dict]:
         async with self._conn() as conn:
@@ -1775,7 +1837,7 @@ class Database:
             date_filter_rr = f" AND rr.created_at >= ${len(params)}"
         sql = f"""
         (SELECT 'transaction_error' AS kind, t.id, t.user_id, u.username,
-                t.service_name AS detail, t.amount_usd, t.updated_at AS at
+                COALESCE(t.status_reason, t.service_name) AS detail, t.amount_usd, t.updated_at AS at
          FROM transactions t LEFT JOIN users u ON u.user_id = t.user_id
          WHERE t.status = 'error'{date_filter_tx})
         UNION ALL
@@ -1831,6 +1893,10 @@ class Database:
                 "WHERE r.referred_id = $1 LIMIT 1",
                 user_id,
             )
+            cancel_feedback = await conn.fetch(
+                "SELECT * FROM cancel_feedback WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+                user_id, limit,
+            )
         return {
             "user":               dict(user) if user else None,
             "balance":            dict(balance) if balance else None,
@@ -1841,6 +1907,7 @@ class Database:
             "ledger":             [dict(r) for r in ledger],
             "referrals_made":     [dict(r) for r in referrals_made],
             "referred_by":        dict(referred_by) if referred_by else None,
+            "cancel_feedback":    [dict(r) for r in cancel_feedback],
         }
 
     async def get_daily_revenue_admin(self, days: int = 14) -> list[dict]:
@@ -1874,6 +1941,9 @@ class Database:
             errors_today = await conn.fetchval(
                 "SELECT COUNT(*) FROM transactions WHERE status = 'error' AND updated_at >= NOW() - INTERVAL '24 hours'"
             )
+            cancel_feedback_today = await conn.fetchval(
+                "SELECT COUNT(*) FROM cancel_feedback WHERE created_at >= NOW() - INTERVAL '24 hours'"
+            )
             revenue_today = await conn.fetchval(
                 "SELECT COALESCE(SUM(amount_usd),0) FROM transactions WHERE status = 'completed' AND updated_at >= NOW() - INTERVAL '24 hours'"
             )
@@ -1884,6 +1954,7 @@ class Database:
             "pending_manual_withdrawals":   pending_manual_withdrawals,
             "pending_refunds":              pending_refunds,
             "errors_today":                errors_today,
+            "cancel_feedback_today":        cancel_feedback_today,
             "revenue_today_usd":            round(float(revenue_today), 2),
             "users_total":                  users_total,
         }
