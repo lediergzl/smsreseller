@@ -5840,7 +5840,7 @@ async def cb_fallback_expired_session(call: CallbackQuery, state: FSMContext):
         "🤔 Ese botón es de un paso anterior y ya no aplica"
         + (f" — seguís con <b>{label}</b>" if label else " a tu operación actual")
         + ".\n\nSi querés salir de la operación en curso, tocá <b>❌ Cancelar</b>.",
-        parse_mode="HTML", reply_markup=cancel_keyboard(),
+        reply_markup=cancel_keyboard(),
     )
 
 
@@ -5879,5 +5879,5 @@ async def msg_fallback_expired_session(message: Message, state: FSMContext):
         "🤔 No esperaba ese mensaje en este paso"
         + (f" — seguís con <b>{label}</b>" if label else "") + ".\n\n"
         "Si querés salir de la operación en curso, tocá <b>❌ Cancelar</b>.",
-        parse_mode="HTML", reply_markup=cancel_keyboard(),
+        reply_markup=cancel_keyboard(),
     )
