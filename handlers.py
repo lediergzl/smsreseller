@@ -2665,6 +2665,28 @@ async def _quote_and_show_currency_menu(
         await state.clear()
         return False
 
+    # Red de seguridad contra una carrera con _perform_cancel: las dos
+    # llamadas de red de arriba (get_supported_currencies +
+    # get_estimated_amounts_batch) pueden tardar varios segundos, y en ese
+    # lapso el usuario puede haber cancelado esta MISMA tx desde otra tarea
+    # (ver resume_transaction, Caso 4: la cotización se relanza tras un
+    # reinicio, pero el estado no queda en selecting_currency hasta acá
+    # abajo -así que un cancel que llega justo en el medio no lo detecta
+    # como tal y sigue su propio camino, liberando la reserva y marcando
+    # la tx 'cancelled'). Sin este chequeo, seguíamos igual y le
+    # mostrábamos al usuario un menú de moneda para una compra que YA
+    # estaba cancelada -confuso y, peor, si llegaba a pagar ese menú
+    # fantasma el número ya no existía del lado de HeroSMS.
+    current_tx = await db.get_by_id(tx_id)
+    if not current_tx or current_tx["status"] != "pending":
+        logger.info(
+            "_quote_and_show_currency_menu(tx=%s): tx ya no está 'pending' "
+            "(status=%s) -probablemente cancelada mientras se cotizaba; "
+            "no se muestra el menú.",
+            tx_id, current_tx["status"] if current_tx else "no encontrada",
+        )
+        return False
+
     await state.update_data(currency_options=options)
     await state.set_state(PurchaseFlow.selecting_currency)
 
@@ -3737,6 +3759,17 @@ async def resume_transaction(bot, storage, tx: dict) -> str:
     # muestra de nuevo el menú de monedas.
     if tx["status"] == "pending" and not tx.get("order_id"):
         await state.set_data(base_data)
+        # Se fija selecting_currency ACÁ, antes de arrancar la recotización
+        # (que puede tardar varios segundos en red, ver
+        # _quote_and_show_currency_menu) -y no recién al final de esa
+        # función, como quedaba antes. Así, si el usuario cancela justo en
+        # esta ventana, _perform_cancel lo reconoce de entrada como
+        # "selecting_currency" (libera la reserva correctamente) en vez de
+        # depender de qué tarea gane la carrera. El chequeo de status
+        # 'pending' agregado al final de _quote_and_show_currency_menu es
+        # el complemento: si ese cancel ya pasó, la cotización en vuelo no
+        # sobrescribe el estado ya limpiado.
+        await state.set_state(PurchaseFlow.selecting_currency)
         await _safe_send(
             bot, chat_id,
             f"🔄 El bot se reinició, pero ya tenías elegido "
