@@ -174,36 +174,97 @@ HEROSMS_MIN_CANCEL_WAIT_SECONDS = 120
 # alternativas antes de devolverle el problema al usuario.
 AUTO_RETRY_COUNTRIES = 3
 
+# Umbral mínimo de "stock_rate" (fracción de compras recientes en las que
+# el país SÍ tenía número real al momento de reservar) para seguir
+# OFRECIENDO ese país en la lista. Por debajo de esto, el país no se
+# muestra -no tiene sentido dejar elegir algo que sabemos, por datos
+# propios, que falla la mayoría de las veces; solo genera el mensaje de
+# "se agotó" que se ve poco profesional. Solo aplica a países con
+# suficientes muestras (ver COUNTRY_STOCK_STATS_MIN_SAMPLES) -a los que
+# todavía no tienen historial no se los penaliza, se los deja pasar.
+# IMPORTANTE: database.get_country_stock_stats devuelve stock_rate en
+# escala 0-100 (porcentaje), no 0-1 -este umbral debe estar en la MISMA
+# escala.
+MIN_COUNTRY_STOCK_RELIABILITY = 50
 
-def _sort_countries_by_stock_reliability(countries: list[dict], stock_stats: dict) -> list[dict]:
+
+def _filter_and_sort_countries_by_stock_reliability(
+    countries: list[dict], stock_stats: dict, hero_quality: dict = None,
+) -> list[dict]:
     """
-    Reordena el catálogo de países (ya viene ordenado por precio, ver
-    hero.get_countries) usando database.get_country_stock_stats: los
-    países con suficientes compras recientes se reordenan por qué tan
-    seguido su stock reportado resultó ser REAL al momento de comprar
-    (stock_rate desc), y entre ellos por precio como desempate. Los que
-    todavía no tienen suficientes muestras (país nuevo, poca demanda) se
-    dejan al final, en su orden original por precio -no se los penaliza
-    por falta de datos, solo no se los prioriza todavía; con las próximas
-    compras el propio sistema junta muestras y empiezan a competir igual
-    que el resto.
+    Filtra y reordena el catálogo de países (ya viene ordenado por precio,
+    ver hero.get_countries) combinando dos fuentes de confiabilidad:
+
+    1. stock_stats (database.get_country_stock_stats): nuestro propio
+       historial de compras -el dato más específico, porque refleja
+       exactamente nuestro flujo y nuestros clientes, pero sufre "cold
+       start" en países de poco movimiento (pocas muestras propias
+       todavía).
+    2. hero_quality (hero.get_top_countries_quality): el "rate" de
+       calidad que el propio HeroSMS calcula agregando TODAS sus ventas
+       para ese país/servicio (no solo las nuestras) -mucho más volumen,
+       así que sirve de respaldo justo para los países donde (1) todavía
+       no tiene suficientes muestras propias.
+
+    Reglas:
+    - Un país se DESCARTA de la lista si alguna de las dos fuentes lo
+      marca por debajo de MIN_COUNTRY_STOCK_RELIABILITY -no vale la pena
+      ofrecerlo si sabemos, por datos propios O por datos de HeroSMS, que
+      casi siempre falla. Esto evita que el usuario llegue a ver el
+      mensaje de "se agotó el stock".
+    - El resto se ordena por confiabilidad descendente, PRIORIZANDO
+      nuestro propio dato cuando existe (es más específico a nuestro
+      caso) y cayendo al dato de HeroSMS cuando no; los países sin
+      ninguna de las dos fuentes van al final, en su orden original por
+      precio -no se los penaliza por falta de datos, solo no se los
+      prioriza todavía.
+    - Salvedad: si el filtro dejaría la lista vacía, se prefiere mostrar
+      la lista completa sin filtrar antes que dejar al usuario sin
+      ninguna opción.
 
     Mismo patrón que ya usa utils.countries_keyboard con
     get_country_success_stats (datos-primero, sin-datos-después) pero acá
-    afecta el ORDEN REAL del catálogo -no solo qué botón se ve primero-,
-    así que también determina en qué orden prueba el reintento automático
-    de cb_select_country (ver `remaining` ahí abajo).
+    afecta el catálogo REAL -no solo qué botón se ve primero-, así que
+    también determina en qué orden prueba el reintento automático de
+    cb_select_country (ver `remaining` ahí abajo).
     """
-    if not stock_stats:
+    stock_stats = stock_stats or {}
+    hero_quality = hero_quality or {}
+    if not stock_stats and not hero_quality:
         return countries
 
-    def _key(c):
-        code = c.get("country", c.get("code", "??"))
-        stat = stock_stats.get(code)
-        price = c.get("price", c.get("cost", 0))
-        return (0, -stat["stock_rate"], price) if stat else (1, 0, price)
+    def _code(c):
+        return c.get("country", c.get("code", "??"))
 
-    return sorted(countries, key=_key)
+    def _local_rate(c):
+        stat = stock_stats.get(_code(c))
+        return stat["stock_rate"] if stat else None
+
+    def _hero_rate(c):
+        return hero_quality.get(_code(c))
+
+    def _is_unreliable(c):
+        local = _local_rate(c)
+        hero_r = _hero_rate(c)
+        return (local is not None and local < MIN_COUNTRY_STOCK_RELIABILITY) or (
+            hero_r is not None and hero_r < MIN_COUNTRY_STOCK_RELIABILITY
+        )
+
+    filtered = [c for c in countries if not _is_unreliable(c)]
+    if not filtered:
+        filtered = countries
+
+    def _key(c):
+        price = c.get("price", c.get("cost", 0))
+        local = _local_rate(c)
+        if local is not None:
+            return (0, -local, price)
+        hero_r = _hero_rate(c)
+        if hero_r is not None:
+            return (1, -hero_r, price)
+        return (2, 0, price)
+
+    return sorted(filtered, key=_key)
 
 
 # ── Datos que guardamos en FSM (en memoria entre pasos) ───────────────────────
@@ -2307,10 +2368,13 @@ async def cb_select_service(call: CallbackQuery, state: FSMContext):
         )
         return
 
-    stock_stats = await db.get_country_stock_stats(
-        service_code, days=COUNTRY_STOCK_STATS_WINDOW_DAYS, min_samples=COUNTRY_STOCK_STATS_MIN_SAMPLES,
+    stock_stats, hero_quality = await asyncio.gather(
+        db.get_country_stock_stats(
+            service_code, days=COUNTRY_STOCK_STATS_WINDOW_DAYS, min_samples=COUNTRY_STOCK_STATS_MIN_SAMPLES,
+        ),
+        hero.get_top_countries_quality(service_code),
     )
-    countries = _sort_countries_by_stock_reliability(countries, stock_stats)
+    countries = _filter_and_sort_countries_by_stock_reliability(countries, stock_stats, hero_quality)
 
     await state.update_data(
         service_code=service_code,
@@ -2424,18 +2488,15 @@ async def cb_select_country(call: CallbackQuery, state: FSMContext):
         phone_number  = format_phone(number_info["number"])
         await db.set_activation(tx_id, activation_id, phone_number)
 
-        if failed_names:
-            # Tuvo que probar 1+ alternativas antes de conseguir número --
-            # avisar UNA sola vez, con el resultado final, en vez de un
-            # mensaje de "se agotó" por cada país intentado.
-            tried_txt = ", ".join(failed_names)
-            await call.message.answer(
-                f"😔 Justo se agotó el stock de <b>{tried_txt}</b> para "
-                f"<b>{service_name}</b> (no se cobró nada por esos intentos). "
-                f"Conseguimos número automáticamente en <b>{name}</b> — "
-                "seguimos con este país:",
-                parse_mode="HTML",
-            )
+        # Nota: si tuvo que probar 1+ alternativas antes de conseguir
+        # número (failed_names no vacío), NO se le informa al usuario --
+        # ver hero.get_number: esos intentos fallidos no le costaron nada
+        # ni a él ni a nosotros, así que exponer el detalle interno del
+        # reintento ("se agotó X, probamos Y automáticamente") no aporta
+        # nada y se lee como improvisado. Simplemente se continúa como si
+        # `name` hubiera sido el país elegido desde el principio -mismo
+        # texto de "✅ País: <name>" que ve cualquier usuario que acierta
+        # a la primera (ver _quote_and_show_currency_menu).
 
         await state.update_data(
             country_code  = code,
@@ -2462,7 +2523,7 @@ async def cb_select_country(call: CallbackQuery, state: FSMContext):
 
         await _quote_and_show_currency_menu(
             call.message, state, tx_id, call.from_user.id, price_usd,
-            country_name=None if failed_names else name,
+            country_name=name,
         )
         return
 
@@ -2486,10 +2547,13 @@ async def cb_select_country(call: CallbackQuery, state: FSMContext):
         )
         await state.clear()
         return
-    stock_stats = await db.get_country_stock_stats(
-        service_code, days=COUNTRY_STOCK_STATS_WINDOW_DAYS, min_samples=COUNTRY_STOCK_STATS_MIN_SAMPLES,
+    stock_stats, hero_quality = await asyncio.gather(
+        db.get_country_stock_stats(
+            service_code, days=COUNTRY_STOCK_STATS_WINDOW_DAYS, min_samples=COUNTRY_STOCK_STATS_MIN_SAMPLES,
+        ),
+        hero.get_top_countries_quality(service_code),
     )
-    fresh_countries = _sort_countries_by_stock_reliability(fresh_countries, stock_stats)
+    fresh_countries = _filter_and_sort_countries_by_stock_reliability(fresh_countries, stock_stats, hero_quality)
     await state.update_data(countries=fresh_countries)
     success_stats = await db.get_country_success_stats(service_code)
     await call.message.answer(

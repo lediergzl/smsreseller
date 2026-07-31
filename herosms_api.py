@@ -51,9 +51,15 @@ COUNTRIES_CACHE_TTL = 3600   # 1 hora (los países casi no cambian)
 FAILURE_BACKOFF_TTL = 60     # si falla la consulta, no reintentar antes de 60s
                               # (evita que CADA compra pague un timeout de 15s
                               # completo mientras el endpoint esté caído/lento)
+TOP_COUNTRIES_CACHE_TTL = 900  # 15 minutos: el "rate" de calidad que reporta
+                                # HeroSMS agrega TODAS sus ventas (no solo las
+                                # nuestras), así que se mueve mucho más lento
+                                # que nuestro stock_rate local -no hace falta
+                                # refrescarlo tan seguido como getPrices.
 
 _services_cache: dict = {"data": [], "ts": 0.0}
 _countries_cache: dict = {"data": {}, "ts": 0.0}  # {country_id: name}
+_top_countries_cache: dict = {}  # {service: {"data": [...], "ts": float}}
 
 
 # ── Llamada base al endpoint único ─────────────────────────────────────────
@@ -315,6 +321,79 @@ async def get_countries(service: str) -> list[dict]:
     except Exception as exc:
         logger.error("get_countries(%s) error: %s: %s", service, type(exc).__name__, exc)
         return []
+
+
+async def get_top_countries_quality(service: str, force_refresh: bool = False) -> dict:
+    """
+    action=getListOfTopCountriesByService
+    Devuelve, por país, el "rate" de calidad que reporta el propio HeroSMS:
+    porcentaje de activaciones EXITOSAS sobre el total de activaciones en
+    ese país -el mismo dato que se ve en su panel web (Estadísticas ->
+    Top 10 países, columna "% del total" ordenado "Por calidad").
+
+    A diferencia de database.get_country_stock_stats (que mide SOLO
+    nuestras propias compras), esto agrega TODAS las ventas de HeroSMS
+    para ese servicio/país -muchísimo más volumen, así que no sufre el
+    problema de "recién arrancamos, todavía no tenemos muestras propias"
+    que sí tiene nuestra tabla local para países de poco movimiento.
+    Se usa como respaldo quando db.get_country_stock_stats no tiene
+    datos suficientes todavía para un país (ver handlers
+    ._filter_and_sort_countries_by_stock_reliability).
+
+    Respuesta esperada (JSON):
+        [{"country": 2, "share": 50, "rate": 50}, ...]
+    "rate" ya viene en escala 0-100.
+
+    Se pide length=100 para cubrir el catálogo completo de países en una
+    sola llamada -no solo el Top 10 que muestra el panel web por
+    defecto- ya que acá se usa para filtrar/decidir, no para mostrar un
+    ranking corto.
+
+    Devuelve: {"2": 50.0, ...}  (country_id -> rate, ambos como str/float)
+    Devuelve {} si falla o el servicio/país no tiene datos -en ese caso
+    el llamador debe tratarlo igual que "sin historial" (no penalizar).
+    """
+    now = time.time()
+    cached = _top_countries_cache.get(service)
+    if not force_refresh and cached and (now - cached["ts"] < TOP_COUNTRIES_CACHE_TTL):
+        return cached["data"]
+
+    try:
+        data = await _call_json(
+            "getListOfTopCountriesByService", {"service": service, "length": 100}
+        )
+        # La doc de SMS-Activate (protocolo que HeroSMS hereda, ver
+        # docstring del módulo) muestra la respuesta como una lista
+        # directa; por las dudas se tolera también un dict envolvente
+        # tipo {"status": "success", "result": [...]}.
+        rows = data if isinstance(data, list) else (data or {}).get("result", [])
+
+        mapping = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            country_id = row.get("country")
+            rate = row.get("rate")
+            if country_id is None or rate is None:
+                continue
+            try:
+                mapping[str(country_id)] = float(rate)
+            except (TypeError, ValueError):
+                continue
+
+        _top_countries_cache[service] = {"data": mapping, "ts": now}
+        return mapping
+    except Exception as exc:
+        logger.error(
+            "get_top_countries_quality(%s) error: %s: %s", service, type(exc).__name__, exc
+        )
+        # Backoff corto, mismo criterio que el resto de la caché.
+        prev = _top_countries_cache.get(service, {"data": {}, "ts": 0.0})
+        _top_countries_cache[service] = {
+            "data": prev["data"],
+            "ts": now - TOP_COUNTRIES_CACHE_TTL + FAILURE_BACKOFF_TTL,
+        }
+        return prev["data"]
 
 
 # ── Números / activaciones ────────────────────────────────────────────────────
