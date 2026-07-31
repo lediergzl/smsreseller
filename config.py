@@ -50,6 +50,33 @@ PAYMENT_POLL_INTERVAL: int = int(os.getenv("PAYMENT_POLL_INTERVAL", "8"))
 # Intervalo de polling para verificar SMS (segundos)
 SMS_POLL_INTERVAL: int = int(os.getenv("SMS_POLL_INTERVAL", "5"))
 
+# ── Confiabilidad dinámica de stock por país ────────────────────────────────
+# Problema que cubre: getPrices reporta un "count" por país que NO refleja
+# disponibilidad en tiempo real (ver herosms_api.get_countries) -es un
+# número compartido entre TODOS los revendedores que compran de la misma
+# bolsa, así que el país más barato suele aparecer "agotado" justo al
+# intentar comprarlo (ver hero.get_number -> NO_NUMBERS y el reintento
+# automático en handlers.cb_select_country).
+#
+# En vez de hardcodear un stock mínimo (un número fijo que HeroSMS ni
+# siquiera expone de forma confiable, y que quedaría desactualizado apenas
+# cambie la demanda de un país), el bot aprende de sus propios intentos de
+# compra reales -ver database.get_country_stock_stats y
+# handlers._sort_countries_by_stock_reliability-: cuenta, país por país,
+# cuántos de sus getNumber recientes consiguieron número de verdad vs.
+# NO_NUMBERS, y reordena el catálogo priorizando los que EN LA PRÁCTICA
+# entregan, no solo los más baratos. Se autoajusta solo, sin tocar código
+# ni estas constantes, cada vez que la disponibilidad real de un país
+# cambia -estos dos valores solo controlan la VENTANA de aprendizaje, no
+# ningún umbral de stock:
+#   - días hacia atrás que se consideran "recientes" (la disponibilidad
+#     fluctúa día a día, así que una ventana corta responde rápido a
+#     cambios reales sin arrastrar datos viejos ya no vigentes).
+#   - intentos mínimos antes de confiar en la tasa de un país (evita sacar
+#     conclusiones de 1-2 compras sueltas que pudieron ser mala suerte).
+COUNTRY_STOCK_STATS_WINDOW_DAYS: int = int(os.getenv("COUNTRY_STOCK_STATS_WINDOW_DAYS", "7"))
+COUNTRY_STOCK_STATS_MIN_SAMPLES: int = int(os.getenv("COUNTRY_STOCK_STATS_MIN_SAMPLES", "5"))
+
 # ── Antiabuso / reembolsos ─────────────────────────────────────────────────────
 # Problema que cubre este bloque: un usuario puede pedir un número, pagarlo,
 # NO usarlo nunca (o cancelarlo manualmente ni bien lo recibe) y esperar el
@@ -451,10 +478,10 @@ WHITE       = (255, 255, 255)
 TEXT_DARK   = (30, 41, 59)
 TEXT_MUTED  = (90, 100, 115)
 
-# account_type todavía no existe como columna en la base de datos (ver
-# database.py, tabla users) — este mapeo queda listo para cuando se agregue
-# un sistema de tipos de cuenta/reseller; hoy simplemente no se usa y la
-# tarjeta no muestra la fila "Tipo" (ver welcome_card.UserStats.account_type).
+# account_type sí existe como columna real en la base de datos (ver
+# database.py, tabla users, y database.set_account_type / handlers./set_tipo)
+# — este mapeo es el que usa welcome_card.py para mostrar la fila "Nivel"
+# con una etiqueta legible en vez del código crudo ("vip" -> "VIP").
 ACCOUNT_TYPE_LABELS: dict[str, str] = {
     "cliente":  "Cliente",
     "reseller": "Reseller",

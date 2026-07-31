@@ -27,6 +27,7 @@ from config import REFUND_FEE_PCT, ABUSE_MAX_STRIKES, ABUSE_WINDOW_HOURS, ABUSE_
 from config import WITHDRAWAL_FEE_PCT, WITHDRAWAL_ALLOWED_CURRENCIES, DEPOSIT_MIN_USD, WITHDRAWAL_MIN_USD, CUP_WITHDRAWAL_MIN_USD
 from config import MANUAL_DEPOSIT_MIN_USD, MANUAL_DEPOSIT_MAX_USD, MANUAL_DEPOSIT_CUP_RATE
 from config import MANUAL_DEPOSIT_CUP_MARGIN_PCT, MANUAL_DEPOSIT_CUP_EXPOSURE_ALERT_USD, MANUAL_PURCHASE_MIN_USD
+from config import COUNTRY_STOCK_STATS_WINDOW_DAYS, COUNTRY_STOCK_STATS_MIN_SAMPLES
 from config import ACCOUNT_TYPE_LABELS
 from config import REFERRAL_BONUS_PCT, REFERRAL_MIN_PURCHASE_USD, REFERRAL_HOLD_HOURS, REFERRAL_RELEASE_INTERVAL
 from config import COMMUNITY_CHANNEL_CHAT_ID, COMMUNITY_CHANNEL_URL, COMMUNITY_GROUP_URL, COMMUNITY_GROUP_CHAT_ID
@@ -172,6 +173,37 @@ HEROSMS_MIN_CANCEL_WAIT_SECONDS = 120
 # prueban en silencio, en orden de precio, hasta este número de
 # alternativas antes de devolverle el problema al usuario.
 AUTO_RETRY_COUNTRIES = 3
+
+
+def _sort_countries_by_stock_reliability(countries: list[dict], stock_stats: dict) -> list[dict]:
+    """
+    Reordena el catálogo de países (ya viene ordenado por precio, ver
+    hero.get_countries) usando database.get_country_stock_stats: los
+    países con suficientes compras recientes se reordenan por qué tan
+    seguido su stock reportado resultó ser REAL al momento de comprar
+    (stock_rate desc), y entre ellos por precio como desempate. Los que
+    todavía no tienen suficientes muestras (país nuevo, poca demanda) se
+    dejan al final, en su orden original por precio -no se los penaliza
+    por falta de datos, solo no se los prioriza todavía; con las próximas
+    compras el propio sistema junta muestras y empiezan a competir igual
+    que el resto.
+
+    Mismo patrón que ya usa utils.countries_keyboard con
+    get_country_success_stats (datos-primero, sin-datos-después) pero acá
+    afecta el ORDEN REAL del catálogo -no solo qué botón se ve primero-,
+    así que también determina en qué orden prueba el reintento automático
+    de cb_select_country (ver `remaining` ahí abajo).
+    """
+    if not stock_stats:
+        return countries
+
+    def _key(c):
+        code = c.get("country", c.get("code", "??"))
+        stat = stock_stats.get(code)
+        price = c.get("price", c.get("cost", 0))
+        return (0, -stat["stock_rate"], price) if stat else (1, 0, price)
+
+    return sorted(countries, key=_key)
 
 
 # ── Datos que guardamos en FSM (en memoria entre pasos) ───────────────────────
@@ -2275,6 +2307,11 @@ async def cb_select_service(call: CallbackQuery, state: FSMContext):
         )
         return
 
+    stock_stats = await db.get_country_stock_stats(
+        service_code, days=COUNTRY_STOCK_STATS_WINDOW_DAYS, min_samples=COUNTRY_STOCK_STATS_MIN_SAMPLES,
+    )
+    countries = _sort_countries_by_stock_reliability(countries, stock_stats)
+
     await state.update_data(
         service_code=service_code,
         service_name=service_name,
@@ -2287,6 +2324,7 @@ async def cb_select_service(call: CallbackQuery, state: FSMContext):
         reply_markup=countries_keyboard(countries, MARKUP, success_stats),
     )
     await state.set_state(PurchaseFlow.selecting_country)
+
 
 
 @router.message(PurchaseFlow.selecting_service)
@@ -2448,6 +2486,10 @@ async def cb_select_country(call: CallbackQuery, state: FSMContext):
         )
         await state.clear()
         return
+    stock_stats = await db.get_country_stock_stats(
+        service_code, days=COUNTRY_STOCK_STATS_WINDOW_DAYS, min_samples=COUNTRY_STOCK_STATS_MIN_SAMPLES,
+    )
+    fresh_countries = _sort_countries_by_stock_reliability(fresh_countries, stock_stats)
     await state.update_data(countries=fresh_countries)
     success_stats = await db.get_country_success_stats(service_code)
     await call.message.answer(

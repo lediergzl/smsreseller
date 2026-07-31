@@ -1551,6 +1551,52 @@ class Database:
             for r in rows
         }
 
+    async def get_country_stock_stats(
+        self, service: str, days: int = 7, min_samples: int = 5,
+    ) -> dict:
+        """
+        Tasa REAL de "conseguir número" por país, para un servicio dado, en
+        una ventana móvil de los últimos `days` días. Distinta de
+        get_country_success_stats (esa mide si LLEGÓ el SMS después de
+        conseguir número) -esta mide algo anterior: sobre TODOS los
+        intentos de compra reales (incluidos los que HeroSMS respondió
+        NO_NUMBERS, ver herosms_api.get_number), qué fracción sí obtuvo un
+        activation_id. Es decir: qué tan confiable resultó ser en la
+        PRÁCTICA el stock que getPrices reporta para ese país -algo que
+        HeroSMS no expone de forma fiable en tiempo real (ver discusión que
+        motivó esto: el país más barato salía "sin stock" casi siempre).
+
+        Es la base de la reordenación dinámica de países (ver
+        handlers._sort_countries_by_stock_reliability): en vez de un
+        umbral fijo de stock mínimo hardcodeado -que quedaría desactualizado
+        apenas cambie la demanda de un país-, el propio bot aprende de sus
+        compras reales y se autoajusta solo, ventana a ventana, sin tocar
+        código ni config. `days` acota la ventana a la demanda RECIENTE (la
+        disponibilidad de estos países fluctúa día a día), y `min_samples`
+        evita sacar conclusiones de 1-2 intentos sueltos.
+        """
+        since = datetime.utcnow() - timedelta(days=days)
+        sql = """
+        SELECT country,
+               COUNT(*) AS attempts,
+               SUM(CASE WHEN activation_id IS NOT NULL THEN 1 ELSE 0 END) AS got_number
+        FROM transactions
+        WHERE service = $1 AND created_at >= $2
+        GROUP BY country
+        HAVING COUNT(*) >= $3
+        """
+        async with self._conn() as conn:
+            rows = await conn.fetch(sql, service, since, min_samples)
+
+        return {
+            r["country"]: {
+                "attempts": r["attempts"],
+                "got_number": r["got_number"],
+                "stock_rate": round(100 * r["got_number"] / r["attempts"], 1),
+            }
+            for r in rows
+        }
+
     # ── Outbox de notificaciones (ver outbox.py) ──────────────────────────────
 
     async def enqueue_outbox(self, chat_id: int, text: str, reply_markup: Optional[str] = None) -> int:
