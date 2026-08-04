@@ -5,6 +5,7 @@ import asyncio
 import io
 import logging
 import math
+import re
 from typing import Callable, Awaitable
 import qrcode
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -194,6 +195,89 @@ def is_wrapped_token(currency: str, network: str) -> bool:
     if not currency or not network:
         return False
     return currency.strip().upper() != network.strip().upper()
+
+
+# Familias de formato de dirección agrupadas por las redes que las usan
+# (varias redes EVM comparten el mismo formato 0x+40 hex, así que se listan
+# juntas). Los nombres son los que aparecen como `network` en las opciones
+# de CCPayment (ver currency_networks_keyboard) -en mayúsculas para
+# comparar sin importar cómo venga la red.
+_EVM_NETWORKS = {
+    "ETH", "ETHEREUM", "BSC", "BEP20", "BNB", "POLYGON", "MATIC",
+    "BASE", "OPTIMISM", "ARBITRUM", "AVALANCHE", "AVAX", "FANTOM", "FTM",
+}
+_ADDRESS_PATTERNS = {
+    # EVM: 0x + 40 hex chars (no se valida checksum EIP-55, alcanza con el
+    # formato -exigir checksum exacto rechazaría direcciones válidas en
+    # minúsculas, que son igual de válidas para la red).
+    "evm": re.compile(r"^0x[0-9a-fA-F]{40}$"),
+    # TRON/TRC20: base58, empieza con "T", 34 caracteres.
+    "tron": re.compile(r"^T[1-9A-HJ-NP-Za-km-z]{33}$"),
+    # Bitcoin: legacy (1...), P2SH (3...) en base58, o bech32 (bc1...).
+    "btc_legacy": re.compile(r"^[13][1-9A-HJ-NP-Za-km-z]{25,34}$"),
+    "btc_bech32": re.compile(r"^(bc1)[0-9a-z]{25,62}$", re.IGNORECASE),
+    # Solana: base58, 32-44 caracteres (sin 0, O, I, l).
+    "solana": re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$"),
+}
+
+
+def validate_crypto_address(address: str, network: str) -> tuple[bool, str]:
+    """
+    Validación de FORMATO (no de existencia real en la blockchain) de una
+    dirección para una red dada. Pensada para descartar basura obvia antes
+    de guardar una dirección de reembolso/retiro -typos, direcciones de
+    otra red, texto copiado mal, campos vacíos- no para confirmar que la
+    dirección sea la correcta (eso solo lo sabe el usuario).
+
+    Devuelve (is_valid, reason). `reason` es un texto corto pensado para
+    mostrarse al usuario/admin cuando is_valid es False; con is_valid=True
+    puede venir vacío.
+    """
+    address = (address or "").strip()
+    network = (network or "").strip()
+
+    if not address:
+        return False, "dirección vacía"
+    if " " in address or "\n" in address or "\t" in address:
+        return False, "contiene espacios o saltos de línea"
+    if len(address) < 20:
+        return False, "muy corta para ser una dirección válida"
+    if len(address) > 100:
+        return False, "muy larga para ser una dirección válida"
+
+    net_upper = network.upper()
+
+    if net_upper in _EVM_NETWORKS:
+        if _ADDRESS_PATTERNS["evm"].match(address):
+            return True, ""
+        return False, f"debería empezar con 0x y tener 42 caracteres en total (red {network})"
+
+    if net_upper in ("TRX", "TRON", "TRC20"):
+        if _ADDRESS_PATTERNS["tron"].match(address):
+            return True, ""
+        return False, f"debería empezar con T y tener 34 caracteres (red {network})"
+
+    if net_upper in ("BTC", "BITCOIN"):
+        if _ADDRESS_PATTERNS["btc_legacy"].match(address) or _ADDRESS_PATTERNS["btc_bech32"].match(address):
+            return True, ""
+        return False, f"no tiene formato de dirección Bitcoin válida (red {network})"
+
+    if net_upper in ("SOL", "SOLANA"):
+        if _ADDRESS_PATTERNS["solana"].match(address) and not address.startswith("0x"):
+            return True, ""
+        return False, f"no tiene formato de dirección Solana válida (red {network})"
+
+    # Red no reconocida entre las anteriores: no hay un formato específico
+    # contra el cual validar (ej. red nueva agregada en CCPayment que este
+    # código todavía no conoce). En vez de bloquear al usuario/admin por
+    # una limitación nuestra, se deja pasar con el chequeo genérico de
+    # "basura obvia" que ya se hizo arriba (vacío, con espacios, largo
+    # fuera de rango) y se avisa igual que la red no fue verificada.
+    logger.warning(
+        "validate_crypto_address: red '%s' no reconocida, se aplica solo "
+        "el chequeo genérico de formato.", network,
+    )
+    return True, ""
 
 
 def format_phone(number: str) -> str:
