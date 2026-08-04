@@ -318,6 +318,25 @@ async def get_countries(service: str) -> list[dict]:
                 "count": count,
             })
 
+        # DIAGNÓSTICO TEMPORAL (sacar una vez confirmada la causa): países
+        # con stock confirmado en el panel web (ver captura 2026-08-04,
+        # EE.UU. 550 uds, Brasil 601, Filipinas 4574, Portugal 685, etc.)
+        # pero que no aparecen en el catálogo del bot. Logueamos tal cual
+        # lo devuelve getPrices para esos IDs -sea que falten del todo del
+        # dict, o vengan presentes con count=0- para saber si es un tema
+        # de catálogo restringido para resellers o de parseo.
+        if service == "wa":
+            _debug_expected = {
+                "187": "USA", "73": "Brazil", "36": "Canada",
+                "4": "Philippines", "117": "Portugal", "15": "Poland",
+                "52": "Thailand",
+            }
+            for cid, cname in _debug_expected.items():
+                logger.warning(
+                    "DEBUG getPrices(wa) país esperado %s (%s): %r",
+                    cid, cname, prices.get(cid),
+                )
+
         result.sort(key=lambda c: c["price"])
         return result
     except asyncio.TimeoutError:
