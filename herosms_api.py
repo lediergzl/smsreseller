@@ -51,15 +51,9 @@ COUNTRIES_CACHE_TTL = 3600   # 1 hora (los países casi no cambian)
 FAILURE_BACKOFF_TTL = 60     # si falla la consulta, no reintentar antes de 60s
                               # (evita que CADA compra pague un timeout de 15s
                               # completo mientras el endpoint esté caído/lento)
-TOP_COUNTRIES_CACHE_TTL = 900  # 15 minutos: el "rate" de calidad que reporta
-                                # HeroSMS agrega TODAS sus ventas (no solo las
-                                # nuestras), así que se mueve mucho más lento
-                                # que nuestro stock_rate local -no hace falta
-                                # refrescarlo tan seguido como getPrices.
 
 _services_cache: dict = {"data": [], "ts": 0.0}
 _countries_cache: dict = {"data": {}, "ts": 0.0}  # {country_id: name}
-_top_countries_cache: dict = {}  # {service: {"data": [...], "ts": float}}
 
 
 # ── Llamada base al endpoint único ─────────────────────────────────────────
@@ -277,9 +271,22 @@ async def get_countries(service: str) -> list[dict]:
     llamada, en vez de consultar país por país).
 
     Respuesta de ejemplo esperada de getPrices:
-        {"0": {"tg": {"cost": 0.10, "count": 123}}, "6": {"tg": {...}}, ...}
+        {"0": {"tg": {"cost": 0.10, "count": 123, "physicalCount": 45}}, ...}
 
-    Devuelve: [{"country": "0", "name": "Russia", "price": 0.10, "count": 123}, ...]
+    IMPORTANTE -físico vs virtual: "count" incluye TODO el stock (virtual +
+    físico), mientras que "physicalCount" es solo el stock de SIMs físicas
+    reales. Un país puede tener "count" enorme y "physicalCount": 0 -son
+    números 100% virtuales (VOIP). HeroSMS mismo los marca "Solo virtuales"
+    en su panel web (ver captura 2026-08-04, Canadá). Servicios como
+    WhatsApp rechazan números VOIP para verificación con bastante
+    frecuencia -es política de Meta, no algo que dependa de HeroSMS. Por
+    eso se descartan acá directamente los países sin NINGÚN número físico:
+    es la señal de confiabilidad más simple y directa que tenemos, y a
+    diferencia de nuestro propio historial (stock_stats/success_stats) no
+    sufre "cold start" -está disponible desde la primera consulta.
+
+    Devuelve: [{"country": "0", "name": "Russia", "price": 0.10,
+                "count": 123, "physical_count": 45}, ...]
     """
     try:
         try:
@@ -309,33 +316,18 @@ async def get_countries(service: str) -> list[dict]:
             if not info:
                 continue
             count = int(info.get("count", 0) or 0)
+            physical_count = int(info.get("physicalCount", 0) or 0)
             if count <= 0:
                 continue  # sin stock, no ofrecer
+            if physical_count <= 0:
+                continue  # solo virtuales (VOIP) -alto riesgo de rechazo en verificación
             result.append({
                 "country": str(country_id),
                 "name": country_names.get(str(country_id), f"País {country_id}"),
                 "price": float(info.get("cost", 0) or 0),
                 "count": count,
+                "physical_count": physical_count,
             })
-
-        # DIAGNÓSTICO TEMPORAL (sacar una vez confirmada la causa): países
-        # con stock confirmado en el panel web (ver captura 2026-08-04,
-        # EE.UU. 550 uds, Brasil 601, Filipinas 4574, Portugal 685, etc.)
-        # pero que no aparecen en el catálogo del bot. Logueamos tal cual
-        # lo devuelve getPrices para esos IDs -sea que falten del todo del
-        # dict, o vengan presentes con count=0- para saber si es un tema
-        # de catálogo restringido para resellers o de parseo.
-        if service == "wa":
-            _debug_expected = {
-                "187": "USA", "73": "Brazil", "36": "Canada",
-                "4": "Philippines", "117": "Portugal", "15": "Poland",
-                "52": "Thailand",
-            }
-            for cid, cname in _debug_expected.items():
-                logger.warning(
-                    "DEBUG getPrices(wa) país esperado %s (%s): %r",
-                    cid, cname, prices.get(cid),
-                )
 
         result.sort(key=lambda c: c["price"])
         return result
@@ -352,75 +344,52 @@ async def get_countries(service: str) -> list[dict]:
 
 async def get_top_countries_quality(service: str, force_refresh: bool = False) -> dict:
     """
-    action=getListOfTopCountriesByService
-    Devuelve, por país, el "rate" de calidad que reporta el propio HeroSMS:
-    porcentaje de activaciones EXITOSAS sobre el total de activaciones en
-    ese país -el mismo dato que se ve en su panel web (Estadísticas ->
-    Top 10 países, columna "% del total" ordenado "Por calidad").
+    HeroSMS NO expone esta acción para resellers vía API -confirmado en
+    logs de producción 2026-08-04: action=getListOfTopCountriesByService
+    devuelve HTTP 404 con body {"title":"BAD_ACTION","details":"Method
+    Not Found"}. El endpoint del protocolo SMS-Activate que HeroSMS dice
+    heredar simplemente no está implementado de su lado.
 
-    A diferencia de database.get_country_stock_stats (que mide SOLO
-    nuestras propias compras), esto agrega TODAS las ventas de HeroSMS
-    para ese servicio/país -muchísimo más volumen, así que no sufre el
-    problema de "recién arrancamos, todavía no tenemos muestras propias"
-    que sí tiene nuestra tabla local para países de poco movimiento.
-    Se usa como respaldo quando db.get_country_stock_stats no tiene
-    datos suficientes todavía para un país (ver handlers
-    ._filter_and_sort_countries_by_stock_reliability).
+    Ante eso, esta función devuelve una SEMILLA ESTÁTICA cargada a mano
+    con los valores reales del panel web de HeroSMS (Estadísticas -> Top
+    10 países, ordenado "Por calidad", ventana de intervalo 24h, umbral
+    >500 activaciones exitosas -ver captura 2026-08-04). Es la misma
+    métrica que la API debía darnos ("% de activaciones exitosas"), solo
+    que cargada manualmente en vez de por request.
 
-    Respuesta esperada (JSON):
-        [{"country": 2, "share": 50, "rate": 50}, ...]
-    "rate" ya viene en escala 0-100.
+    IMPORTANTE -mantenimiento manual:
+    - Solo cubre "wa" (WhatsApp) por ahora; para cualquier otro service
+      devuelve {} (mismo comportamiento que "sin datos", no penaliza).
+    - Estos números se van a desactualizar -no hay forma de refrescarlos
+      automáticamente mientras el endpoint siga caído. Revisar a mano en
+      hero-sms.com/es/statistics/top10?service=wa cada tanto y actualizar
+      _QUALITY_SEED_WA. Si HeroSMS habilita el endpoint real más
+      adelante, reemplazar esta función por la llamada a _call_json de
+      vuelta (ver implementación anterior en el historial de git).
 
-    Se pide length=100 para cubrir el catálogo completo de países en una
-    sola llamada -no solo el Top 10 que muestra el panel web por
-    defecto- ya que acá se usa para filtrar/decidir, no para mostrar un
-    ranking corto.
-
-    Devuelve: {"2": 50.0, ...}  (country_id -> rate, ambos como str/float)
-    Devuelve {} si falla o el servicio/país no tiene datos -en ese caso
-    el llamador debe tratarlo igual que "sin historial" (no penalizar).
+    Devuelve: {"country_id": rate_0_a_100, ...}
     """
-    now = time.time()
-    cached = _top_countries_cache.get(service)
-    if not force_refresh and cached and (now - cached["ts"] < TOP_COUNTRIES_CACHE_TTL):
-        return cached["data"]
+    if service != "wa":
+        return {}
+    return dict(_QUALITY_SEED_WA)
 
-    try:
-        data = await _call_json(
-            "getListOfTopCountriesByService", {"service": service, "length": 100}
-        )
-        # La doc de SMS-Activate (protocolo que HeroSMS hereda, ver
-        # docstring del módulo) muestra la respuesta como una lista
-        # directa; por las dudas se tolera también un dict envolvente
-        # tipo {"status": "success", "result": [...]}.
-        rows = data if isinstance(data, list) else (data or {}).get("result", [])
 
-        mapping = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            country_id = row.get("country")
-            rate = row.get("rate")
-            if country_id is None or rate is None:
-                continue
-            try:
-                mapping[str(country_id)] = float(rate)
-            except (TypeError, ValueError):
-                continue
-
-        _top_countries_cache[service] = {"data": mapping, "ts": now}
-        return mapping
-    except Exception as exc:
-        logger.error(
-            "get_top_countries_quality(%s) error: %s: %s", service, type(exc).__name__, exc
-        )
-        # Backoff corto, mismo criterio que el resto de la caché.
-        prev = _top_countries_cache.get(service, {"data": {}, "ts": 0.0})
-        _top_countries_cache[service] = {
-            "data": prev["data"],
-            "ts": now - TOP_COUNTRIES_CACHE_TTL + FAILURE_BACKOFF_TTL,
-        }
-        return prev["data"]
+# Semilla manual -panel web HeroSMS, Estadísticas > Top 10 países > Whatsapp,
+# ordenado por calidad, intervalo 24h, umbral >500 activaciones exitosas.
+# Capturado 2026-08-04. IDs de país confirmados contra getPrices en logs
+# de producción (mismo día). Actualizar a mano periódicamente -ver
+# docstring de get_top_countries_quality.
+_QUALITY_SEED_WA = {
+    "187": 58.02,  # USA
+    "73": 29.81,   # Brazil
+    "36": 29.39,   # Canada
+    "4": 25.02,    # Philippines
+    "117": 21.81,  # Portugal
+    "15": 17.62,   # Poland
+    "52": 15.78,   # Thailand
+    "6": 14.2,     # Indonesia
+    "62": 13.52,   # Turkey
+}
 
 
 # ── Números / activaciones ────────────────────────────────────────────────────
