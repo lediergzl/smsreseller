@@ -1530,6 +1530,11 @@ async def _hero_live_status_line(tx: dict) -> str:
             "ready": f"✅ Código ya disponible: {hero_status.get('code')}",
             "pending": "⏳ Esperando que llegue el SMS",
             "cancelled": "❌ Activación cancelada en HeroSMS",
+            "not_found": (
+                "ℹ️ HeroSMS ya no tiene esta activación en su historial "
+                "consultable (normal en activaciones viejas/ya resueltas; "
+                "no afecta el estado guardado acá)."
+            ),
             "error": f"⚠️ Error al consultar: {hero_status.get('error')}",
         }.get(hero_status.get("status"), f"❓ {hero_status.get('status')}")
         return f"📟 <b>HeroSMS ahora mismo:</b> {hero_desc}"

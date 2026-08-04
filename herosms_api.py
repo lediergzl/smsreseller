@@ -443,6 +443,26 @@ async def get_status(activation_id: str) -> dict:
             return {"status": "cancelled"}
 
         return {"status": text}
+    except aiohttp.ClientResponseError as exc:
+        if exc.status == 404:
+            # A diferencia del resto del protocolo (que responde 200 con
+            # texto plano incluso para ids inválidos/viejos, ej.
+            # NO_ACTIVATION), HeroSMS devuelve un 404 HTTP real cuando la
+            # activación ya salió de su ventana de consulta -típicamente
+            # porque ya está resuelta (completed/cancelled/timeout) hace
+            # rato. Esto NO es un fallo de nuestro lado ni algo que
+            # _poll_sms necesite reintentar (esa función ya deja de
+            # pollear en cuanto la tx sale de number_assigned); se
+            # distingue como "not_found" para que _hero_live_status_line
+            # pueda mostrar algo útil al admin en vez de un error crudo.
+            logger.info(
+                "get_status(%s): HTTP 404 (activación ya no disponible en "
+                "el historial de HeroSMS, probablemente expiró).",
+                activation_id,
+            )
+            return {"status": "not_found"}
+        logger.error("get_status(%s) error: %s: %s", activation_id, type(exc).__name__, exc)
+        return {"status": "error", "error": str(exc)}
     except Exception as exc:
         logger.error("get_status(%s) error: %s: %s", activation_id, type(exc).__name__, exc)
         return {"status": "error", "error": str(exc)}
