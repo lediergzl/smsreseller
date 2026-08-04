@@ -37,6 +37,7 @@ from utils import (
     usd_to_cup, effective_cup_rate, effective_cup_rate_payout,
     generate_payment_qr,
     is_wrapped_token,
+    validate_crypto_address,
     services_keyboard, countries_keyboard, currencies_keyboard, currency_networks_keyboard,
     cancel_keyboard, main_persistent_keyboard, admin_menu_keyboard, search_results_keyboard,
     top_services_keyboard,
@@ -1974,6 +1975,300 @@ async def cmd_detalle(message: Message):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+@router.message(Command("set_reembolso"))
+async def cmd_set_reembolso(message: Message):
+    """
+    /set_reembolso <tx_id> <direccion> - ADMIN: guarda (o corrige) la
+    dirección de reembolso de una compra a mano.
+
+    Cubre el caso en que el usuario usó /skip al comprar (msg_refund_address
+    la dejó vacía) y ahora, al querer reembolsarle con /pagar_reembolso, no
+    hay dirección guardada -el admin la consigue por fuera (chat directo con
+    el usuario) y la carga acá antes de poder pagarle. También sirve para
+    corregir una dirección mal tipeada que YA pasó la validación de formato
+    pero el usuario avisa que está mal (validate_crypto_address solo
+    descarta basura obvia, no confirma que la dirección sea la correcta).
+
+    Usa la MISMA validación de formato que msg_refund_address
+    (validate_crypto_address contra tx.network) -si la tx no tiene network
+    guardada (compra vieja, pagada en CUP, etc.) no hay contra qué validar
+    el formato y se guarda tal cual, dejando la responsabilidad en el admin.
+    """
+    if not _is_admin_dm(message):
+        return
+
+    args = (message.text or "").split(maxsplit=2)
+    if len(args) != 3 or not args[1].isdigit():
+        await message.answer(
+            "Uso: <code>/set_reembolso &lt;tx_id&gt; &lt;dirección&gt;</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    tx_id = int(args[1])
+    address = args[2].strip()
+
+    tx = await db.get_by_id(tx_id)
+    if not tx:
+        await message.answer(f"No existe ninguna transacción con id {tx_id}.")
+        return
+
+    network = tx.get("network") or ""
+    if network:
+        is_valid, reason = validate_crypto_address(address, network)
+        if not is_valid:
+            await message.answer(
+                f"⚠️ Esa dirección no parece válida para <b>{network}</b> "
+                f"({reason}):\n<code>{address}</code>\n\n"
+                "No se guardó. Si estás seguro de que es correcta igual, "
+                "revisa con el usuario antes de forzarla.",
+                parse_mode="HTML",
+            )
+            return
+    else:
+        await message.answer(
+            "ℹ️ Esta tx no tiene una red (network) guardada -no hay contra "
+            "qué validar el formato, se guarda tal cual la escribiste.",
+        )
+
+    await db.set_refund_address(tx_id, address)
+    await message.answer(
+        f"✅ Dirección de reembolso guardada para TX #{tx_id}:\n<code>{address}</code>\n\n"
+        f"Ahora puedes correr <code>/pagar_reembolso {tx_id}</code>.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("pagar_reembolso"))
+async def cmd_pagar_reembolso(message: Message):
+    """
+    /pagar_reembolso <tx_id> [monto_usd] - ADMIN: paga de vuelta al usuario,
+    ON-CHAIN, a la dirección que dejó como refund_address para esa compra
+    (ver msg_refund_address).
+
+    Cubre DOS casos:
+    1. La compra ya se resolvió sola (sms_timeout/cancelled/refunded/
+       reservation_expired, ya tiene saldo interno acreditado) -> este
+       comando solo lo convierte en un envío real.
+    2. La compra sigue en 'number_assigned' (usuario pagó, tiene número,
+       está esperando el código y el admin no quiere esperar a que
+       _poll_sms agote SMS_TIMEOUT_SECONDS solo) -> el comando la resuelve
+       PRIMERO como un timeout normal (cancela en HeroSMS, reembolso
+       completo sin cargo) y recién después manda el pago on-chain. Este es
+       el caso típico: "un usuario pagó y no recibió código, reembólsalo".
+
+    `monto_usd` es opcional: sin indicarlo se usa tx.amount_usd (el precio
+    completo). Se puede pasar otro monto para un reembolso parcial.
+
+    NO acredita nada nuevo más allá de lo ya descrito arriba: descuenta de
+    la bolsa 'crypto' del saldo interno del usuario y la convierte en un
+    envío real vía ccpay.refund_user -mismo patrón defensivo que
+    cb_withdraw_confirm (descontar ANTES de llamar a CCPayment, revertir si
+    falla). Se niega si: la tx está en un estado que no corresponde a un
+    reembolso (ej. 'completed' con código sí entregado), no hay
+    refund_address guardada, la tx no tiene token_id (compra en CUP, no
+    cripto), la dirección no pasa validate_crypto_address para la red de la
+    compra, no alcanza el saldo, o esta tx ya se pagó antes (ver
+    refund_paid_at / db.mark_refund_paid, evita pagar dos veces por un
+    segundo /pagar_reembolso accidental).
+    """
+    if not _is_admin_dm(message):
+        return
+
+    args = (message.text or "").split()
+    if len(args) not in (2, 3) or not args[1].isdigit():
+        await message.answer(
+            "Uso: <code>/pagar_reembolso &lt;tx_id&gt; [monto_usd]</code>\n"
+            "Sin monto_usd se usa el precio completo de la compra.",
+            parse_mode="HTML",
+        )
+        return
+
+    tx_id = int(args[1])
+    tx = await db.get_by_id(tx_id)
+    if not tx:
+        await message.answer(f"No existe ninguna transacción con id {tx_id}.")
+        return
+
+    if tx.get("refund_paid_at"):
+        await message.answer(
+            f"⚠️ TX #{tx_id} ya se pagó ON-CHAIN el {tx['refund_paid_at']} "
+            f"(recordId: <code>{tx.get('refund_paid_record_id') or '—'}</code>). "
+            "No se envía de nuevo.",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── Caso "todavía está esperando el código" (el más común: usuario pagó,
+    # el número se asignó, y no quiere/puede esperar a que _poll_sms agote
+    # SMS_TIMEOUT_SECONDS solo) -> se resuelve ACÁ MISMO, con el mismo
+    # criterio que un timeout normal: se cancela la activación en HeroSMS y
+    # se acredita el reembolso COMPLETO (sin cargo, no fue culpa del
+    # usuario -mismo texto que _poll_sms). Cambiar tx.status alcanza para
+    # que cualquier _poll_sms corriendo en background para esta misma tx se
+    # detenga solo en su próximo ciclo (ver el chequeo tx_check al inicio
+    # del loop) sin volver a tocar HeroSMS por su cuenta.
+    if tx["status"] == "number_assigned":
+        activation_id = tx.get("activation_id")
+        if activation_id:
+            cancel_ok = await hero.cancel_number(activation_id)
+            if not cancel_ok:
+                logger.warning(
+                    "cmd_pagar_reembolso(tx=%s): HeroSMS no confirmó la "
+                    "cancelación de activation_id=%s -se sigue igual con el "
+                    "reembolso (probablemente ya estaba cerrada del otro lado).",
+                    tx_id, activation_id,
+                )
+        await _credit_refund_for_tx(
+            tx["user_id"], tx, float(tx.get("amount_usd") or 0), tx_id,
+            reason=f"Reembolso manual forzado por admin tx={tx_id} (código nunca llegó)",
+        )
+        await db.set_status(
+            tx_id, "sms_timeout",
+            reason=f"Reembolso forzado manualmente por admin {message.from_user.id} vía /pagar_reembolso",
+        )
+        tx = await db.get_by_id(tx_id)
+        await _safe_send(
+            message.bot, tx["user_id"],
+            f"⚠️ Tu compra #{tx_id} no llegó a recibir el código a tiempo. "
+            f"Se te reembolsó el monto completo a tu saldo interno, sin cargo.",
+        )
+    elif tx["status"] not in ("sms_timeout", "cancelled", "refunded", "reservation_expired"):
+        # Cualquier otro estado (completed con código SÍ entregado, pending,
+        # error, etc.) no corresponde a "nunca llegó el código" -no forzar
+        # nada a ciegas; que el admin confirme con /detalle qué pasa antes
+        # de mover plata real.
+        await message.answer(
+            f"⚠️ TX #{tx_id} está en estado '<code>{tx['status']}</code>', no en "
+            "uno que corresponda a un reembolso (código nunca llegó / "
+            "cancelado / ya reembolsado). Revisa con /detalle antes de forzar "
+            "un pago.",
+            parse_mode="HTML",
+        )
+        return
+
+    refund_address = (tx.get("refund_address") or "").strip()
+    token_id = tx.get("token_id")
+    network = tx.get("network") or ""
+
+    if not refund_address:
+        await message.answer(
+            f"⚠️ TX #{tx_id} no tiene dirección de reembolso guardada (el "
+            "usuario usó /skip al comprar). Consíguela por fuera y guárdala "
+            f"con <code>/set_reembolso {tx_id} &lt;dirección&gt;</code>, "
+            "después vuelve a correr este comando.",
+            parse_mode="HTML",
+        )
+        return
+
+    if not token_id:
+        await message.answer(
+            f"⚠️ TX #{tx_id} no tiene token_id -no fue una compra pagada en "
+            "cripto vía CCPayment (ej. fue pagada en CUP). Este comando solo "
+            "paga reembolsos en cripto.",
+        )
+        return
+
+    is_valid, reason = validate_crypto_address(refund_address, network)
+    if not is_valid:
+        await message.answer(
+            f"⚠️ La dirección guardada para TX #{tx_id} no parece válida para "
+            f"<b>{network}</b> ({reason}):\n<code>{refund_address}</code>\n\n"
+            "No se envía nada por seguridad. Confirma la dirección correcta "
+            "con el usuario antes de reintentar.",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        amount_usd = float(args[2]) if len(args) == 3 else float(tx.get("amount_usd") or 0)
+    except ValueError:
+        await message.answer("El monto debe ser un número (ej. 4.50).")
+        return
+    if amount_usd <= 0:
+        await message.answer("El monto a pagar debe ser mayor a 0.")
+        return
+
+    user_id = tx["user_id"]
+
+    # Descontar saldo ANTES de llamar a CCPayment (mismo motivo que
+    # cb_withdraw_confirm): si el proceso muere justo después del POST,
+    # preferimos haber descontado ya y re-acreditar si falla, en vez de
+    # arriesgarnos a pagar dos veces por un reintento manual.
+    ok = await db.debit_balance(
+        user_id, amount_usd, tx_id,
+        reason=f"Pago manual de reembolso (tx={tx_id})", origin="crypto",
+    )
+    if not ok:
+        current = await db.get_balance_breakdown(user_id)
+        await message.answer(
+            f"⚠️ El usuario no tiene saldo 'crypto' suficiente: necesita "
+            f"{format_amount(amount_usd, 'USD')} y tiene "
+            f"{format_amount(current['crypto'], 'USD')} en esa bolsa "
+            f"(saldo CUP no es retirable a cripto). No se envió nada.",
+        )
+        return
+
+    crypto_amount = await ccpay.get_estimated_amount(amount_usd, token_id)
+    if crypto_amount is None:
+        await db.credit_balance(
+            user_id, amount_usd, tx_id,
+            reason=f"Reversión: no se pudo cotizar (tx={tx_id})", origin="crypto",
+        )
+        await message.answer(
+            f"⚠️ No se pudo cotizar {format_amount(amount_usd, 'USD')} en la "
+            "moneda de esta compra ahora mismo (CCPayment no devolvió "
+            "precio). Saldo NO tocado -intenta de nuevo en un momento.",
+        )
+        return
+
+    # Desempaquetado defensivo: si ccpay_api.refund_user llega a devolver
+    # un tercer valor (recordId) más adelante, se toma; hoy devuelve
+    # (ok, error_code) nomás -ver mismo patrón en cb_withdraw_confirm.
+    result = await ccpay.refund_user(
+        to_address=refund_address, amount=crypto_amount, token_id=token_id,
+        memo=f"Reembolso manual tx={tx_id}",
+    )
+    sent, err_code = result[0], result[1]
+    record_id = result[2] if len(result) > 2 else None
+
+    if not sent:
+        await db.credit_balance(
+            user_id, amount_usd, tx_id,
+            reason=f"Reversión pago de reembolso fallido (tx={tx_id})", origin="crypto",
+        )
+        extra = (
+            " (sin liquidez del merchant en esa moneda/red puntual — "
+            "considera Auto-Swap a stablecoin en el dashboard de CCPayment)"
+            if err_code == ccpay.CCPAY_ERR_INSUFFICIENT_MERCHANT_BALANCE else ""
+        )
+        await message.answer(
+            f"❌ CCPayment rechazó el envío{extra} (código {err_code}). "
+            "Saldo del usuario NO se tocó (se revirtió el descuento).",
+        )
+        await _notify_admin(
+            message.bot,
+            f"🚨 <b>Pago manual de reembolso falló</b>\n{_tx_summary_line(tx)}\n"
+            f"Dirección: <code>{refund_address}</code> · código CCPay: {err_code}",
+        )
+        return
+
+    await db.mark_refund_paid(tx_id, record_id=str(record_id) if record_id else None)
+
+    await message.answer(
+        f"✅ Reembolso pagado: {format_amount(amount_usd, 'USD')} "
+        f"(~{crypto_amount} {tx.get('currency') or ''}) a\n<code>{refund_address}</code>\n"
+        f"TX #{tx_id} · usuario <code>{user_id}</code>.",
+        parse_mode="HTML",
+    )
+    await _safe_send(
+        message.bot, user_id,
+        f"💸 Te reembolsamos {format_amount(amount_usd, 'USD')} a la dirección "
+        f"que dejaste para tu compra #{tx_id}. Debería verse reflejado en tu "
+        "wallet en unos minutos.",
+    )
+
+
 @router.message(Command("exposicion_cup"))
 async def cmd_exposicion_cup(message: Message):
     """
@@ -3164,6 +3459,26 @@ async def msg_refund_address(message: Message, state: FSMContext):
     refund_address = ""
     if message.text and message.text.strip().lower() != "/skip":
         refund_address = message.text.strip()
+
+        # Validar el FORMATO contra la red que el usuario ya eligió unos
+        # segundos antes (network sigue en el state). Antes esto se
+        # guardaba tal cual, sin ningún chequeo -a diferencia de
+        # msg_withdraw_address, que sí filtra basura obvia. El riesgo real
+        # no es un error visible al guardar: es que semanas después, al
+        # reembolsar de verdad a esta dirección (ver cmd_pagar_reembolso),
+        # recién ahí se descubra que estaba mal tipeada -y en cripto eso
+        # es plata perdida sin forma de recuperarla.
+        network = data.get("network", "")
+        is_valid, reason = validate_crypto_address(refund_address, network)
+        if not is_valid:
+            await message.answer(
+                f"⚠️ Esa dirección no parece válida para <b>{network}</b> "
+                f"({reason}). Revísala y envíala de nuevo, o usa /skip si "
+                "prefieres no indicarla.",
+                parse_mode="HTML",
+                reply_markup=cancel_keyboard(),
+            )
+            return
 
     await db.set_refund_address(data["tx_id"], refund_address)
 
