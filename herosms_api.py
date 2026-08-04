@@ -81,8 +81,16 @@ async def _call(action: str, params: dict = None) -> str:
     headers = {"Accept-Encoding": "gzip, deflate"}
     session = await _get_session()
     async with session.get(url, params=params, headers=headers) as resp:
-        resp.raise_for_status()
         text = await resp.text()
+        if resp.status >= 400:
+            # Leemos el body ANTES de reventar: si HeroSMS devuelve algo
+            # (BAD_ACTION, un mensaje de error, etc.) en el cuerpo de un
+            # 4xx/5xx, raise_for_status() lo tiraba sin loguearlo -quedaba
+            # solo el código HTTP, sin pista de la causa real.
+            logger.error(
+                "HeroSMS action=%s -> HTTP %s, body=%s", action, resp.status, text[:300]
+            )
+        resp.raise_for_status()
         logger.debug("HeroSMS action=%s -> %s", action, text[:300])
         return text.strip()
 
