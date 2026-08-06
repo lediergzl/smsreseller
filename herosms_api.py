@@ -323,35 +323,37 @@ async def get_countries(service: str) -> list[dict]:
         return []
 
 
-async def get_top_countries_quality(service: str, force_refresh: bool = False) -> dict:
+async def get_top_countries_volume(service: str, force_refresh: bool = False) -> dict:
     """
-    action=getListOfTopCountriesByService
-    Devuelve, por país, el "rate" de calidad que reporta el propio HeroSMS:
-    porcentaje de activaciones EXITOSAS sobre el total de activaciones en
-    ese país -el mismo dato que se ve en su panel web (Estadísticas ->
-    Top 10 países, columna "% del total" ordenado "Por calidad").
+    action=getTopCountriesByService
+    Devuelve, por país, el VOLUMEN de activaciones vendidas recientemente
+    por HeroSMS para ese servicio (campo "count") -NO un % de éxito.
 
-    A diferencia de database.get_country_stock_stats (que mide SOLO
-    nuestras propias compras), esto agrega TODAS las ventas de HeroSMS
-    para ese servicio/país -muchísimo más volumen, así que no sufre el
-    problema de "recién arrancamos, todavía no tenemos muestras propias"
-    que sí tiene nuestra tabla local para países de poco movimiento.
-    Se usa como respaldo quando db.get_country_stock_stats no tiene
-    datos suficientes todavía para un país (ver handlers
-    ._filter_and_sort_countries_by_stock_reliability).
+    HISTORIAL: esta función se llamaba get_top_countries_quality y usaba
+    action=getListOfTopCountriesByService, que NO EXISTE en el protocolo
+    real (heredado de SMS-Activate) -devolvía 404 en CADA llamada desde
+    que se escribió, silenciado por el except de abajo, así que esta
+    fuente nunca aportó ningún dato al filtro de países (ver
+    handlers._filter_and_sort_countries_by_stock_reliability). El nombre
+    de acción correcto es getTopCountriesByService, y su respuesta real
+    (ver doc de SMS-Activate) es:
+        {"0": {"country": 2, "count": 43575, "price": 15.00,
+                "retail_price": 30.00}, ...}
+    "count" es cuántas activaciones se vendieron ahí recientemente
+    (volumen/popularidad), no una tasa de éxito 0-100 -por eso esto ya
+    NO se usa para DESCARTAR países (un país con poco volumen no es lo
+    mismo que un país donde falla la entrega del SMS), solo como señal
+    secundaria de desempate cuando no hay datos propios (ver
+    stock_stats/success_stats en database.py, que sí miden éxito real y
+    son la fuente principal ahora).
 
-    Respuesta esperada (JSON):
-        [{"country": 2, "share": 50, "rate": 50}, ...]
-    "rate" ya viene en escala 0-100.
+    Se pide length=100 para cubrir la mayor cantidad de países posible
+    en una sola llamada.
 
-    Se pide length=100 para cubrir el catálogo completo de países en una
-    sola llamada -no solo el Top 10 que muestra el panel web por
-    defecto- ya que acá se usa para filtrar/decidir, no para mostrar un
-    ranking corto.
-
-    Devuelve: {"2": 50.0, ...}  (country_id -> rate, ambos como str/float)
-    Devuelve {} si falla o el servicio/país no tiene datos -en ese caso
-    el llamador debe tratarlo igual que "sin historial" (no penalizar).
+    Devuelve: {"2": 43575.0, ...}  (country_id -> count, como float por
+    consistencia con el resto del módulo)
+    Devuelve {} si falla o el servicio no tiene datos -el llamador debe
+    tratarlo igual que "sin historial" (no penalizar).
     """
     now = time.time()
     cached = _top_countries_cache.get(service)
@@ -360,24 +362,23 @@ async def get_top_countries_quality(service: str, force_refresh: bool = False) -
 
     try:
         data = await _call_json(
-            "getListOfTopCountriesByService", {"service": service, "length": 100}
+            "getTopCountriesByService", {"service": service, "length": 100}
         )
-        # La doc de SMS-Activate (protocolo que HeroSMS hereda, ver
-        # docstring del módulo) muestra la respuesta como una lista
-        # directa; por las dudas se tolera también un dict envolvente
-        # tipo {"status": "success", "result": [...]}.
-        rows = data if isinstance(data, list) else (data or {}).get("result", [])
+        # Respuesta real: dict indexado "0", "1", ... -no una lista. Se
+        # tolera también una lista directa por si acaso, mismo criterio
+        # defensivo que el resto del módulo.
+        rows = data.values() if isinstance(data, dict) else (data or [])
 
         mapping = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
             country_id = row.get("country")
-            rate = row.get("rate")
-            if country_id is None or rate is None:
+            count = row.get("count")
+            if country_id is None or count is None:
                 continue
             try:
-                mapping[str(country_id)] = float(rate)
+                mapping[str(country_id)] = float(count)
             except (TypeError, ValueError):
                 continue
 
@@ -385,7 +386,7 @@ async def get_top_countries_quality(service: str, force_refresh: bool = False) -
         return mapping
     except Exception as exc:
         logger.error(
-            "get_top_countries_quality(%s) error: %s: %s", service, type(exc).__name__, exc
+            "get_top_countries_volume(%s) error: %s: %s", service, type(exc).__name__, exc
         )
         # Backoff corto, mismo criterio que el resto de la caché.
         prev = _top_countries_cache.get(service, {"data": {}, "ts": 0.0})

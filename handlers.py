@@ -175,9 +175,9 @@ HEROSMS_MIN_CANCEL_WAIT_SECONDS = 120
 # alternativas antes de devolverle el problema al usuario.
 AUTO_RETRY_COUNTRIES = 3
 
-# Umbral mínimo de "stock_rate"/"hero_quality" (ver abajo) para seguir
-# OFRECIENDO ese país en la lista. Por debajo de esto, el país no se
-# muestra -no tiene sentido dejar elegir algo que sabemos, por datos
+# Umbral mínimo de "stock_rate" propio (database.get_country_stock_stats)
+# para seguir OFRECIENDO ese país en la lista. Por debajo de esto, el país
+# no se muestra -no tiene sentido dejar elegir algo que sabemos, por datos
 # propios, que falla la mayoría de las veces; solo genera el mensaje de
 # "se agotó" que se ve poco profesional. Solo aplica a países con
 # suficientes muestras (ver COUNTRY_STOCK_STATS_MIN_SAMPLES) -a los que
@@ -194,43 +194,60 @@ MIN_COUNTRY_STOCK_RELIABILITY = 50
 # si no ❌") -a propósito, para que un país que el usuario vería marcado
 # ❌ directamente no aparezca en la lista, en vez de mostrarlo igual con
 # la advertencia y dejar que lo elija de todos modos.
+#
+# NOTA: hero.get_top_countries_volume (ex get_top_countries_quality) YA
+# NO participa de este umbral. Se descubrió que la acción original de la
+# API que usaba (getListOfTopCountriesByService) no existe en el
+# protocolo real -devolvía 404 en cada llamada desde siempre, silenciado
+# por el except, así que nunca aportó ningún dato al filtro (ver git
+# history de herosms_api.py). La acción correcta (getTopCountriesByService)
+# devuelve VOLUMEN de ventas ("count"), no una tasa de éxito, así que no
+# es comparable con este umbral 0-100 y ya no se usa para descartar
+# países -solo como desempate débil cuando no hay datos propios (ver
+# `_key` más abajo). El filtro ahora depende de datos propios
+# (stock_stats/success_stats), que van a tener más peso real conforme se
+# acumulen más compras.
 MIN_COUNTRY_SUCCESS_RATE = 50
 
 
 def _filter_and_sort_countries_by_stock_reliability(
-    countries: list[dict], stock_stats: dict, hero_quality: dict = None,
+    countries: list[dict], stock_stats: dict, hero_volume: dict = None,
     success_stats: dict = None,
 ) -> list[dict]:
     """
     Filtra y reordena el catálogo de países (ya viene ordenado por precio,
-    ver hero.get_countries) combinando TRES fuentes de confiabilidad:
+    ver hero.get_countries) combinando nuestras propias fuentes de
+    confiabilidad, con el volumen de HeroSMS como desempate débil:
 
     1. stock_stats (database.get_country_stock_stats): nuestro propio
        historial de "¿conseguimos número al reservar?" -el dato más
        específico, porque refleja exactamente nuestro flujo y nuestros
        clientes, pero sufre "cold start" en países de poco movimiento
        (pocas muestras propias todavía).
-    2. hero_quality (hero.get_top_countries_quality): el mismo tipo de
-       dato ("¿hay número?") pero calculado por HeroSMS agregando TODAS
-       sus ventas -mucho más volumen, sirve de respaldo justo para los
-       países donde (1) todavía no tiene suficientes muestras propias.
-    3. success_stats (database.get_country_success_stats): mide algo
+    2. success_stats (database.get_country_success_stats): mide algo
        DISTINTO y posterior -de los números que SÍ se consiguieron,
        ¿cuántos recibieron el código SMS? Un país puede tener stock
        perfecto (siempre hay número) y aun así ser inservible si el SMS
-       nunca llega -eso es justo lo que este dato detecta y las otras dos
-       fuentes no. Es el mismo dato que ya se le muestra al usuario como
+       nunca llega -eso es justo lo que este dato detecta y la otra
+       fuente no. Es el mismo dato que ya se le muestra al usuario como
        badge ✅/⚠️/❌ junto al precio (ver utils.countries_keyboard); sin
        este filtro, un país aparecía marcado ❌ y aun así como opción
        elegible -confuso y poco profesional.
+    3. hero_volume (hero.get_top_countries_volume): volumen de ventas
+       reportado por HeroSMS (TODAS sus ventas, no solo las nuestras).
+       NO es una tasa de éxito -solo indica popularidad/movimiento- así
+       que NUNCA descarta un país por sí solo, únicamente desempata
+       cuando (1) y (2) no tienen datos todavía para ese país (cold
+       start total). Ver nota en MIN_COUNTRY_SUCCESS_RATE.
 
     Reglas:
-    - Un país se DESCARTA de la lista si CUALQUIERA de las tres fuentes
-      lo marca por debajo de su umbral -no vale la pena ofrecerlo si
-      sabemos, por cualquiera de los tres ángulos, que casi siempre falla
-      (ni consigue número, o consigue número pero no llega el código).
+    - Un país se DESCARTA de la lista si stock_stats o success_stats
+      (nuestros propios datos) lo marcan por debajo de su umbral -no
+      vale la pena ofrecerlo si sabemos, por experiencia propia, que
+      casi siempre falla (ni consigue número, o consigue número pero no
+      llega el código). hero_volume nunca descarta, solo ordena.
     - El resto se ordena por confiabilidad descendente, PRIORIZANDO
-      stock_stats propio > success_stats propio > hero_quality, y cayendo
+      stock_stats propio > success_stats propio > hero_volume, y cayendo
       al siguiente cuando el anterior no tiene datos; los países sin
       ninguna de las tres fuentes van al final, en su orden original por
       precio -no se los penaliza por falta de datos, solo no se los
@@ -243,9 +260,9 @@ def _filter_and_sort_countries_by_stock_reliability(
     cb_select_country (ver `remaining` ahí abajo).
     """
     stock_stats = stock_stats or {}
-    hero_quality = hero_quality or {}
+    hero_volume = hero_volume or {}
     success_stats = success_stats or {}
-    if not stock_stats and not hero_quality and not success_stats:
+    if not stock_stats and not hero_volume and not success_stats:
         return countries
 
     def _code(c):
@@ -255,20 +272,20 @@ def _filter_and_sort_countries_by_stock_reliability(
         stat = stock_stats.get(_code(c))
         return stat["stock_rate"] if stat else None
 
-    def _hero_rate(c):
-        return hero_quality.get(_code(c))
+    def _hero_volume(c):
+        return hero_volume.get(_code(c))
 
     def _success_rate(c):
         stat = success_stats.get(_code(c))
         return stat["rate"] if stat else None
 
     def _is_unreliable(c):
+        # Solo datos PROPIOS descartan un país -hero_volume es volumen,
+        # no tasa de éxito, así que nunca entra acá (ver docstring).
         local = _local_rate(c)
-        hero_r = _hero_rate(c)
         success = _success_rate(c)
         return (
             (local is not None and local < MIN_COUNTRY_STOCK_RELIABILITY)
-            or (hero_r is not None and hero_r < MIN_COUNTRY_STOCK_RELIABILITY)
             or (success is not None and success < MIN_COUNTRY_SUCCESS_RATE)
         )
 
@@ -284,9 +301,9 @@ def _filter_and_sort_countries_by_stock_reliability(
         success = _success_rate(c)
         if success is not None:
             return (1, -success, price)
-        hero_r = _hero_rate(c)
-        if hero_r is not None:
-            return (2, -hero_r, price)
+        volume = _hero_volume(c)
+        if volume is not None:
+            return (2, -volume, price)
         return (3, 0, price)
 
     return sorted(filtered, key=_key)
@@ -2692,15 +2709,15 @@ async def cb_select_service(call: CallbackQuery, state: FSMContext):
         )
         return
 
-    stock_stats, hero_quality, success_stats = await asyncio.gather(
+    stock_stats, hero_volume, success_stats = await asyncio.gather(
         db.get_country_stock_stats(
             service_code, days=COUNTRY_STOCK_STATS_WINDOW_DAYS, min_samples=COUNTRY_STOCK_STATS_MIN_SAMPLES,
         ),
-        hero.get_top_countries_quality(service_code),
+        hero.get_top_countries_volume(service_code),
         db.get_country_success_stats(service_code),
     )
     countries = _filter_and_sort_countries_by_stock_reliability(
-        countries, stock_stats, hero_quality, success_stats,
+        countries, stock_stats, hero_volume, success_stats,
     )
 
     await state.update_data(
@@ -2873,15 +2890,15 @@ async def cb_select_country(call: CallbackQuery, state: FSMContext):
         )
         await state.clear()
         return
-    stock_stats, hero_quality, success_stats = await asyncio.gather(
+    stock_stats, hero_volume, success_stats = await asyncio.gather(
         db.get_country_stock_stats(
             service_code, days=COUNTRY_STOCK_STATS_WINDOW_DAYS, min_samples=COUNTRY_STOCK_STATS_MIN_SAMPLES,
         ),
-        hero.get_top_countries_quality(service_code),
+        hero.get_top_countries_volume(service_code),
         db.get_country_success_stats(service_code),
     )
     fresh_countries = _filter_and_sort_countries_by_stock_reliability(
-        fresh_countries, stock_stats, hero_quality, success_stats,
+        fresh_countries, stock_stats, hero_volume, success_stats,
     )
     await state.update_data(countries=fresh_countries)
     await call.message.answer(

@@ -45,7 +45,6 @@ from aiohttp import web
 
 import config
 import handlers
-import herosms_api as hero
 from database import db
 
 logger = logging.getLogger(__name__)
@@ -306,50 +305,6 @@ async def _api_user_history(request: web.Request) -> web.Response:
     return _json_response(data)
 
 
-async def _api_debug_top_countries(request: web.Request) -> web.Response:
-    """
-    TEMPORAL - endpoint de diagnóstico, no forma parte del dashboard
-    normal. Sirve para confirmar en producción (Render, sin acceso a
-    Shell) si hero.get_top_countries_quality() devuelve el catálogo
-    completo de países o solo un "Top N" recortado por HeroSMS -
-    independientemente del length=100 que se le pide.
-
-    Uso: GET /admin/api/debug/top_countries?service=tg
-    (protegido por la misma sesión de admin que el resto de /admin/api/*)
-
-    Se puede borrar esta función y su ruta en setup_admin_dashboard() una
-    vez confirmado el diagnóstico.
-    """
-    service = request.query.get("service", "tg")
-    country_id = request.query.get("country")  # ej. "31" para Sudáfrica
-
-    raw_text = await hero._call(
-        "getListOfTopCountriesByService", {"service": service, "length": 100}
-    )
-    data = await hero.get_top_countries_quality(service, force_refresh=True)
-    names = await hero._get_countries_map()
-
-    sorted_rows = sorted(
-        ({"id": cid, "name": names.get(cid, "??"), "rate": rate} for cid, rate in data.items()),
-        key=lambda r: r["rate"], reverse=True,
-    )
-
-    result = {
-        "service": service,
-        "raw_response_texto_crudo": raw_text,
-        "total_paises_devueltos": len(data),
-        "paises": sorted_rows,
-    }
-    if country_id:
-        result["consulta_pais"] = {
-            "id": country_id,
-            "nombre": names.get(country_id, "??"),
-            "presente_en_respuesta": country_id in data,
-            "rate": data.get(country_id),
-        }
-    return _json_response(result)
-
-
 # ── Acciones (aprobar/rechazar) ──────────────────────────────────────────
 # A diferencia de todo lo de arriba (solo lectura), esto SÍ mueve saldo real.
 # La lógica de cada acción es una copia deliberada, paso a paso, de la que
@@ -498,9 +453,6 @@ def setup_admin_dashboard(app: web.Application, bot) -> None:
     app.router.add_get("/admin/api/cancel_feedback", _api_cancel_feedback)
     app.router.add_get("/admin/api/revenue_chart", _api_revenue_chart)
     app.router.add_get("/admin/api/user/{user_id}", _api_user_history)
-    # TEMPORAL - ver docstring de _api_debug_top_countries. Borrar esta
-    # línea y la función una vez confirmado el diagnóstico de países.
-    app.router.add_get("/admin/api/debug/top_countries", _api_debug_top_countries)
     app.router.add_post("/admin/api/manual_deposits/{dep_id}/approve", _api_approve_manual_deposit)
     app.router.add_post("/admin/api/manual_deposits/{dep_id}/reject", _api_reject_manual_deposit)
     app.router.add_post("/admin/api/manual_withdrawals/{wd_id}/approve", _api_approve_manual_withdrawal)
