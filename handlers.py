@@ -21,6 +21,7 @@ import ccpay_api as ccpay
 import telegram_sender
 import outbox
 from config import MARKUP, SERVICES, PAYMENT_TIMEOUT_SECONDS, SMS_TIMEOUT_SECONDS
+from config import SMS_RESEND_INTERVAL_SECONDS
 from config import PAYMENT_POLL_INTERVAL, SMS_POLL_INTERVAL
 from config import ADMIN_CHAT_ID, ADMIN_IDS
 from config import REFUND_FEE_PCT, ABUSE_MAX_STRIKES, ABUSE_WINDOW_HOURS, ABUSE_BLOCK_HOURS
@@ -3797,28 +3798,31 @@ async def _poll_sms(
 ):
     """
     Tarea asyncio: verifica el código OTP cada SMS_POLL_INTERVAL segundos
-    durante un máximo de SMS_TIMEOUT_SECONDS.
+    durante un máximo de SMS_TIMEOUT_SECONDS (alineado con la ventana de
+    garantía real de HeroSMS, ver config.SMS_TIMEOUT_SECONDS).
 
     `elapsed_start`: igual que en _poll_payment, para reanudar tras reinicio
     sin resetear el timeout.
 
-    A mitad de camino del timeout (SMS_TIMEOUT_SECONDS // 2) se pide UN
-    reenvío del SMS sobre la misma activación (hero.request_resend, action
+    Cada config.SMS_RESEND_INTERVAL_SECONDS se pide un reenvío del SMS
+    sobre la misma activación (hero.request_resend, action
     setStatus&status=3 -no cuesta nada extra, es la misma acción que
-    ofrece el panel web de HeroSMS). Varios casos de "nunca llegó el
-    código" se resuelven así del lado del proveedor; antes el bot se
-    quedaba pasivo esperando los SMS_TIMEOUT_SECONDS completos y recién
-    ahí cancelaba/reembolsaba, sin haber intentado nada. Si el reenvío
+    ofrece el panel web de HeroSMS). Antes esto se pedía UNA sola vez, a
+    mitad del timeout; ahora se repite periódicamente durante toda la
+    espera -no hay motivo para no insistir con algo gratis que aumenta
+    la chance real de que el código termine llegando. Si el reenvío
     falla (BAD_STATUS, NO_ACTIVATION, etc.) no pasa nada especial: el
-    polling sigue igual hasta el timeout normal, como si no se hubiera
-    pedido -hero.request_resend nunca lanza hacia arriba.
+    polling sigue igual, como si no se hubiera pedido -hero.request_resend
+    nunca lanza hacia arriba.
     """
     elapsed = elapsed_start
-    resend_at = SMS_TIMEOUT_SECONDS // 2
-    # Si se reanuda tras un reinicio ya pasado el punto medio, no tiene
-    # sentido pedir el reenvío recién ahora (podría caer justo cuando el
-    # código ya está por llegar solo) -se toma como ya "gastado".
-    resend_requested = elapsed_start >= resend_at
+    # Si se reanuda tras un reinicio, el próximo reenvío cae en el primer
+    # múltiplo de SMS_RESEND_INTERVAL_SECONDS que todavía no se cumplió -
+    # no se repite uno que ya se pidió antes del reinicio, pero tampoco se
+    # pierde toda la cadencia futura.
+    next_resend_at = (
+        (elapsed_start // SMS_RESEND_INTERVAL_SECONDS) + 1
+    ) * SMS_RESEND_INTERVAL_SECONDS
     while elapsed < SMS_TIMEOUT_SECONDS:
         await asyncio.sleep(SMS_POLL_INTERVAL)
         elapsed += SMS_POLL_INTERVAL
@@ -3842,13 +3846,13 @@ async def _poll_sms(
             )
             return
 
-        if not resend_requested and elapsed >= resend_at:
-            resend_requested = True
+        if elapsed >= next_resend_at:
             resent_ok = await hero.request_resend(activation_id)
             logger.info(
-                "_poll_sms(tx=%s): pedido de reenvío a mitad de timeout -> %s",
-                tx_id, "aceptado" if resent_ok else "rechazado/no disponible",
+                "_poll_sms(tx=%s): reenvío pedido en elapsed=%ds -> %s",
+                tx_id, elapsed, "aceptado" if resent_ok else "rechazado/no disponible",
             )
+            next_resend_at += SMS_RESEND_INTERVAL_SECONDS
 
         result = await hero.get_status(activation_id)
         status = result.get("status", "")

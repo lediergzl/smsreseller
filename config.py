@@ -41,8 +41,22 @@ MARKUP: float = float(os.getenv("MARKUP", "2.0"))
 # Tiempo máximo (segundos) que el usuario tiene para pagar
 PAYMENT_TIMEOUT_SECONDS: int = int(os.getenv("PAYMENT_TIMEOUT_SECONDS", "900"))   # 15 min
 
-# Tiempo máximo (segundos) para esperar el SMS después de obtener el número
-SMS_TIMEOUT_SECONDS: int = int(os.getenv("SMS_TIMEOUT_SECONDS", "600"))           # 10 min
+# Tiempo máximo (segundos) para esperar el SMS después de obtener el número.
+# HeroSMS mismo declara 20 minutos como su ventana de garantía ("You have
+# 20 minutes to receive the code" -ver hero-sms.com/rules): si el código
+# no llega en ese plazo, ELLOS lo consideran fallo real y reembolsan del
+# lado suyo. Antes esto estaba en 600s (10 min) -la mitad de esa ventana-
+# así que el bot venía cancelando y reembolsando números que todavía
+# tenían chance real de recibir el código del lado de HeroSMS, solo un
+# poco más tarde. Ahora coincide con la ventana real del proveedor.
+SMS_TIMEOUT_SECONDS: int = int(os.getenv("SMS_TIMEOUT_SECONDS", "1200"))          # 20 min
+
+# Cada cuánto pedir un reenvío del SMS (action=setStatus&status=3, gratis,
+# no cuesta nada extra) mientras se espera el código. Antes solo se pedía
+# UNA vez, a mitad del timeout -sin razón para no pedirlo más seguido,
+# ya que no tiene costo y cada intento adicional es una chance más real
+# de que el proveedor reenvíe con éxito (ver handlers._poll_sms).
+SMS_RESEND_INTERVAL_SECONDS: int = int(os.getenv("SMS_RESEND_INTERVAL_SECONDS", "180"))  # cada 3 min
 
 # Intervalo de polling para verificar pago (segundos)
 PAYMENT_POLL_INTERVAL: int = int(os.getenv("PAYMENT_POLL_INTERVAL", "8"))
