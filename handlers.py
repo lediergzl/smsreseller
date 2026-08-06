@@ -3790,6 +3790,83 @@ async def _handle_after_payment(bot, chat_id: int, state: FSMContext, tx_id: int
     )
 
 
+async def _complete_sms_success(
+    bot, chat_id: int, state: FSMContext,
+    tx_id: int, activation_id: str, code: str,
+    source: str = "poll",
+) -> bool:
+    """
+    Lógica compartida para cuando llega el código OTP, sin importar el
+    canal que lo trajo: polling contra hero.get_status (_poll_sms, más
+    abajo) o el webhook de SMS entrantes de HeroSMS (ver
+    webhooks_herosms.py y complete_sms_from_webhook, más abajo). Ambos
+    caminos corren en paralelo a propósito -el webhook entrega más rápido,
+    pero el polling se deja como red de seguridad por si el webhook nunca
+    llega o HeroSMS lo entrega mal- así que esta función es idempotente:
+    vuelve a leer la tx y solo actúa si sigue en 'number_assigned'. Sin
+    este chequeo, una carrera entre ambos caminos podía duplicar el aviso
+    al usuario, el crédito de bono de referido y la llamada a
+    hero.set_status_done.
+
+    Devuelve True si esta llamada fue la que efectivamente completó la tx,
+    False si otra vía ya se había adelantado (no se repite ningún efecto).
+    """
+    tx_check = await db.get_by_id(tx_id)
+    if not tx_check or tx_check["status"] != "number_assigned":
+        logger.info(
+            "_complete_sms_success(tx=%s, source=%s): tx ya resuelta (status=%s), "
+            "no se repite el efecto.",
+            tx_id, source, tx_check["status"] if tx_check else "no existe",
+        )
+        return False
+
+    await db.set_sms_code(tx_id, code)
+    await db.set_status(tx_id, "completed")
+
+    # Confirmar recepción a HeroSMS (evita que siga contando esta
+    # activación como "esperando" del lado del proveedor).
+    await hero.set_status_done(activation_id)
+
+    await _safe_send(bot, chat_id, MSG_CODE_RECEIVED.format(code=code))
+    if tx := await db.get_by_id(tx_id):
+        await _notify_admin(
+            bot,
+            f"✅ <b>Venta completada</b>\n{_tx_summary_line(tx)}\n"
+            f"📱 {tx.get('phone_number') or '—'}"
+            + (" (vía webhook)" if source == "webhook" else ""),
+        )
+    await _maybe_credit_referral_bonus(bot, tx_id)
+    await _maybe_prompt_channel_join(bot, tx_id)
+    await state.clear()
+    return True
+
+
+async def complete_sms_from_webhook(bot, storage, tx: dict, code: str) -> str:
+    """
+    Punto de entrada para webhooks_herosms.py. `tx` ya viene resuelta
+    (buscada por activation_id con db.get_by_activation_id) y `code` ya
+    viene extraído del payload del webhook.
+
+    Arma el FSMContext del usuario a partir de `storage` -mismo patrón que
+    resume_transaction, más abajo, para reconstruir el estado de un chat
+    sin depender de que el handler original siga "vivo"- y delega en
+    _complete_sms_success la parte que comparte con el polling.
+
+    Devuelve una etiqueta corta para loguear en el handler del webhook.
+    """
+    tx_id = tx["id"]
+    user_id = tx["user_id"]
+    chat_id = user_id  # este bot solo opera en chats privados 1:1
+    key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
+    state = FSMContext(storage=storage, key=key)
+
+    completed = await _complete_sms_success(
+        bot, chat_id, state, tx_id, tx.get("activation_id") or "", code,
+        source="webhook",
+    )
+    return "completed" if completed else f"already_resolved:{tx['status']}"
+
+
 async def _poll_sms(
     bot, chat_id: int, state: FSMContext,
     tx_id: int, activation_id: str,
@@ -3858,23 +3935,10 @@ async def _poll_sms(
         status = result.get("status", "")
 
         if status == "ready" and result.get("code"):
-            code = result["code"]
-            await db.set_sms_code(tx_id, code)
-            await db.set_status(tx_id, "completed")
-
-            # Confirmar recepción a HeroSMS
-            await hero.set_status_done(activation_id)
-
-            await _safe_send(bot, chat_id, MSG_CODE_RECEIVED.format(code=code))
-            if tx := await db.get_by_id(tx_id):
-                await _notify_admin(
-                    bot,
-                    f"✅ <b>Venta completada</b>\n{_tx_summary_line(tx)}\n"
-                    f"📱 {tx.get('phone_number') or '—'}",
-                )
-            await _maybe_credit_referral_bonus(bot, tx_id)
-            await _maybe_prompt_channel_join(bot, tx_id)
-            await state.clear()
+            await _complete_sms_success(
+                bot, chat_id, state, tx_id, activation_id, result["code"],
+                source="poll",
+            )
             return
 
         if status == "cancelled":

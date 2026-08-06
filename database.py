@@ -1426,6 +1426,16 @@ class Database:
             row = await conn.fetchrow("SELECT * FROM transactions WHERE order_id = $1", order_id)
             return dict(row) if row else None
 
+    async def get_by_activation_id(self, activation_id: str) -> Optional[dict]:
+        """Usado por el webhook de HeroSMS (ver webhooks_herosms.py) para
+        encontrar la tx que corresponde a un `activationId` entrante. Ya
+        existe un índice sobre esta columna (idx_activation, ver arriba)."""
+        async with self._conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM transactions WHERE activation_id = $1", activation_id
+            )
+            return dict(row) if row else None
+
     async def get_user_transactions(self, user_id: int, limit: int = 10) -> list[dict]:
         async with self._conn() as conn:
             rows = await conn.fetch(

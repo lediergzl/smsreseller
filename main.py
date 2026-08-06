@@ -37,6 +37,7 @@ import ccpay_api as ccpay
 import backup_task
 import outbox
 from admin_dashboard import setup_admin_dashboard
+from webhooks_herosms import setup_herosms_webhook
 
 
 def setup_logging():
@@ -328,6 +329,16 @@ def _run_webhook(bot: Bot, dp: Dispatcher, storage):
     # disponible en ese modo -si en algún momento lo necesitás también en
     # polling, avisá y se le agrega un aiohttp.web.Application aparte ahí.
     setup_admin_dashboard(app, bot)
+
+    # Webhook de SMS entrantes de HeroSMS: entrega en tiempo real como
+    # complemento del polling de siempre (ver docstring de
+    # webhooks_herosms.py). Se registra acá mismo, sobre este mismo
+    # servidor/puerto -no es un servicio aparte. `storage` es el mismo
+    # MemoryStorage que ya usa el dispatcher, así que el FSMContext que
+    # arma el webhook para "cerrar" una compra es el mismo estado que ve
+    # el resto del bot. Si HEROSMS_WEBHOOK_SECRET no está configurado,
+    # esta función no registra ninguna ruta (ver su propio warning).
+    setup_herosms_webhook(app, bot, storage)
 
     SimpleRequestHandler(
         dispatcher=dp, bot=bot, secret_token=config.WEBHOOK_SECRET or None,

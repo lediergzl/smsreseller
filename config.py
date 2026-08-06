@@ -21,6 +21,18 @@ HEROSMS_API_KEY: str  = os.getenv("HEROSMS_API_KEY", "")
 # NO incluir /api ni /stubs aquí, herosms_api.py ya lo agrega.
 HEROSMS_API_URL: str  = os.getenv("HEROSMS_API_URL", "https://hero-sms.com")
 
+# Path secreto del webhook de SMS entrantes (ver webhooks_herosms.py). La
+# documentación de HeroSMS NO especifica ningún mecanismo de autenticación
+# (sin header de firma, sin secreto en el body), así que -a diferencia del
+# webhook de Telegram, que sí manda `secret_token` (ver WEBHOOK_SECRET más
+# abajo)- lo único que impide que cualquiera en internet mande eventos
+# falsos de "SMS recibido" es que la URL no sea adivinable. Por eso el
+# secreto va COMO PARTE DEL PATH (no como query param: los query params
+# quedan más fácil en logs de proxies/analytics) y se compara con
+# hmac.compare_digest (evita timing attacks) en vez de `==`.
+# Generar uno largo y random, ej.: python -c "import secrets; print(secrets.token_urlsafe(32))"
+HEROSMS_WEBHOOK_SECRET: str = os.getenv("HEROSMS_WEBHOOK_SECRET", "")
+
 # ── CCPay (CCPayment) ─────────────────────────────────────────────────────────
 # IMPORTANTE (API v2, obligatoria desde que la cuenta quedó en "solo v2"):
 # - Credenciales Appid/AppSecret, igual que antes.
