@@ -323,6 +323,9 @@ async def _api_debug_top_countries(request: web.Request) -> web.Response:
     service = request.query.get("service", "tg")
     country_id = request.query.get("country")  # ej. "31" para Sudáfrica
 
+    raw_text = await hero._call(
+        "getListOfTopCountriesByService", {"service": service, "length": 100}
+    )
     data = await hero.get_top_countries_quality(service, force_refresh=True)
     names = await hero._get_countries_map()
 
@@ -333,6 +336,7 @@ async def _api_debug_top_countries(request: web.Request) -> web.Response:
 
     result = {
         "service": service,
+        "raw_response_texto_crudo": raw_text,
         "total_paises_devueltos": len(data),
         "paises": sorted_rows,
     }
